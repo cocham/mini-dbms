@@ -28,7 +28,7 @@ BIN = build/minidb$(EXE)
 TEST_BIN = build/test_unit$(EXE)
 DEMO_BIN = build/bpt_demo$(EXE)
 
-.PHONY: all test unit cli sanitize clean
+.PHONY: all test unit cli sanitize bench clean
 
 all: $(BIN) $(DEMO_BIN)
 
@@ -62,6 +62,12 @@ sanitize:
 	ASAN_OPTIONS=detect_leaks=1 $(PYTHON) tests/cli_test.py build/san/minidb
 	$(CC) $(CFLAGS) $(SAN_FLAGS) -Isrc -o build/san/bpt_demo src/bptree.c tools/bpt_demo.c
 	ASAN_OPTIONS=detect_leaks=1 build/san/bpt_demo --shuffle 5 500 1 250 500 999 > /dev/null
+
+# 100만 건 생성·삽입 후 인덱스 조회 vs 선형 탐색 측정 (P2-04). 느리므로 test에 넣지 않는다.
+#   make bench BENCH_ROWS=100000 처럼 건수를 줄여 볼 수 있다. 결과는 docs/phase2/benchmark.md로 옮긴다.
+BENCH_ROWS ?= 1000000
+bench: $(BIN)
+	$(PYTHON) tools/bench.py --rows $(BENCH_ROWS) --bin $(BIN)
 
 clean:
 	$(RMDIR)

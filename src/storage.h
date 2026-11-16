@@ -1,6 +1,7 @@
 #ifndef MINIDB_STORAGE_H
 #define MINIDB_STORAGE_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "common.h"
@@ -51,6 +52,17 @@ int table_find_id_range(Table *t, int64_t lo, int64_t hi, RowFn fn, void *ctx, D
  */
 int table_index_height(const Table *t); /* B+ 트리 높이 = id 조회 한 번이 방문하는 노드 수. 빈 테이블도 1 */
 int64_t table_row_count(const Table *t); /* 전체 행 수 = 인덱스 키 수 = 선형 탐색이 읽는 줄 수 */
+
+/* 인덱스 모양과 메모리 실측 (P2-04 측정 보고용). 노드를 모두 훑으므로 O(노드 수). 파일은 읽지 않는다. */
+typedef struct {
+    int height;
+    int64_t keys;
+    size_t leaves;
+    size_t internals;
+    size_t bytes; /* 트리에 요청한 바이트 합 (malloc 관리 오버헤드 제외) */
+} IndexStats;
+
+void table_index_stats(const Table *t, IndexStats *out);
 
 /* 파일을 닫고 메모리를 해제한다. 실패해도 t는 해제된다. t가 NULL이면 0. */
 int table_close(Table *t, DbError *err);

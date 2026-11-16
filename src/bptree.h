@@ -52,6 +52,16 @@ typedef int (*BptVisitFn)(int64_t key, int64_t value, void *ctx);
  */
 int bpt_range(const BpTree *t, int64_t lo, int64_t hi, BptVisitFn fn, void *ctx);
 
+/* 트리가 차지한 노드와 메모리 (측정·보고용) */
+typedef struct {
+    size_t leaves;    /* 리프 노드 수 */
+    size_t internals; /* 내부 노드 수 */
+    size_t bytes;     /* 트리·노드·배열에 요청한 바이트 합. malloc 자체의 관리 오버헤드는 제외 */
+} BptMemStats;
+
+/* 모든 노드를 한 번 훑어 센다: O(노드 수). */
+void bpt_mem_stats(const BpTree *t, BptMemStats *out);
+
 size_t bpt_size(const BpTree *t);   /* 저장된 키 개수 */
 int bpt_height(const BpTree *t);    /* 루트에서 리프까지 노드 수. 빈 트리도 리프 하나라 1 */
 int bpt_order(const BpTree *t);

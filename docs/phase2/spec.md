@@ -13,20 +13,24 @@
 
 ## 최종 결과 — Phase 2가 끝나면 보이는 것
 
-아래는 완성 시점의 모습이다. 수치는 형식 예시이며 실제 값은 P2-04에서 측정해 benchmark.md(P2-04에서 생성)에 기록한다.
+아래는 완성 시점의 모습이다. 수치는 2026-11-16 Windows 측정값이며 전체 표는 [benchmark.md](benchmark.md)에 있다.
 
 ```text
-$ python3 tools/gen_sql.py 1000000 > build/million.sql        # 100만 건 INSERT 문 생성
-$ build/minidb --data-dir bench build/million.sql > /dev/null  # Phase 1 처리기로 그대로 실행
+$ python3 tools/gen_sql.py 1000000 > build/million.sql          # 100만 건 INSERT 문 생성
+$ build/minidb --data-dir bench build/million.sql > build/ins.out # Phase 1 처리기로 그대로 실행
 
-$ build/minidb --data-dir bench --timing q.sql
-EXPLAIN SELECT * FROM users WHERE id = 777777;
-INDEX LOOKUP (id = 777777, B+ 트리 높이 4)          ← P2-02 형식(확정)
-EXPLAIN SELECT * FROM users WHERE age = 30;
-FULL SCAN (age = 30, 전체 행 수 1000000)            ← P2-02 형식(확정)
-EXPLAIN SELECT * FROM users WHERE id BETWEEN 10 AND 12;
-INDEX RANGE SCAN (id BETWEEN 10 AND 12, B+ 트리 높이 4)   ← P2-03 형식(확정). 결과 건수는 실행 측정값이라 넣지 않음
-  조회 시간 0.00x ms / 2xx ms                         ← 실제 실행 측정값, --timing 형식은 P2-04에서 확정
+$ build/minidb --data-dir bench plan.sql                          # EXPLAIN: 계획 시점 통계 (stdout)
+INDEX LOOKUP (id = 777777, B+ 트리 높이 4)
+FULL SCAN (age = 30, 전체 행 수 1000000)
+INDEX RANGE SCAN (id BETWEEN 10 AND 12, B+ 트리 높이 4)
+
+$ build/minidb --data-dir bench --timing q.sql > build/q.out      # 실제 실행 측정값 (stderr)
+[측정] 시작: 917.5 ms (파일 전체 읽기 + 인덱스 구축, 1000000행)
+[측정] 인덱스: 높이 4, 리프 31250개, 내부 노드 976개, 약 32.7 MB
+[측정] 문장 1: 0.0197 ms, 결과 1행          ← WHERE id = 500000
+[측정] 문장 2: 838.8 ms, 결과 6623행        ← WHERE age = 30
+
+$ make bench                                                      # 위 비교를 자동으로, 표로
 ```
 
 | 조회 | 경로 | 읽는 양 | 시간 복잡도 |
@@ -70,7 +74,7 @@ flowchart TD
 | 파일 손상 검출 | 시작 시 전체 검증 + 조회 시 전체 읽기 | 시작 시 전체 검증(인덱스 구축과 함께). id 조회는 읽은 줄의 id를 다시 확인해, 다르면 "인덱스와 데이터 파일이 일치하지 않습니다" 오류 |
 | `EXPLAIN SELECT ...` | 없음 | 실행 계획 한 줄 출력, 조회는 실행하지 않음 (P2-02, 아래 "EXPLAIN 계약") |
 | `WHERE id BETWEEN a AND b`, `id <`, `<=`, `>`, `>=` | 오류 | 인덱스 범위 조회 (P2-03, 아래 "id 범위 조회 계약"). age는 계속 `=`만 |
-| 대량 데이터 생성 · 시간 측정 | 없음 | `tools/gen_sql.py`, `--timing` 등 (P2-04에서 확정) |
+| 대량 데이터 생성 · 시간 측정 | 없음 | `tools/gen_sql.py`, `--timing`, `tools/bench.py`·`make bench` (P2-04, 아래 "측정 계약") |
 
 ### EXPLAIN 계약 (P2-02 확정, 2026-11-16 사용자)
 
@@ -104,6 +108,31 @@ WHERE id < v | id <= v | id > v | id >= v
 - EXPLAIN: `INDEX RANGE SCAN (조건, B+ 트리 높이 h)`. 조건은 사용자가 쓴 형태 그대로(`id BETWEEN 10 AND 20`, `id >= 5`). 결과 건수는 넣지 않는다(실행해야 아는 값).
 - `id = v`는 그대로 `INDEX LOOKUP`.
 - 오류: `id <>`·`!=`·`NOT BETWEEN` → "id 조건은 =, <, <=, >, >=, BETWEEN만 지원합니다", age의 비교·BETWEEN → "age 조건은 '=' 비교만 지원합니다", `BETWEEN a` 뒤 AND 누락 → 구문 오류, `BETWEEN a AND b` 뒤의 AND/OR → 복합 조건 미지원.
+
+### 측정 계약 (P2-04 확정, 2026-11-16 사용자)
+
+```text
+minidb [--data-dir 디렉터리] [--timing] SQL파일        -- 옵션 순서는 자유
+```
+
+`--timing`이면 stderr에 측정 줄을 쓴다. **stdout은 옵션이 없을 때와 바이트 단위로 같다.**
+
+```text
+[측정] 시작: 917.500 ms (파일 전체 읽기 + 인덱스 구축, 1000000행)
+[측정] 인덱스: 높이 4, 리프 31250개, 내부 노드 976개, 약 32.7 MB
+[측정] 문장 1: 0.0210 ms, 결과 1행          ← SELECT
+[측정] 문장 2: 0.0120 ms, 추가 1행          ← INSERT
+[측정] 문장 3: 0.0010 ms, 계획만            ← EXPLAIN
+```
+
+- 모두 **실제 실행 측정값**(`ExecStats`)이다. EXPLAIN 괄호 안의 계획 시점 통계(`PlanStats`)와 다른 값이다.
+- 시작 = `table_open`(파일 전체 검증 + 인덱스 구축). 문장 = 파싱 뒤 `executor_run` 한 번(결과 출력 포함). 단조 증가 시계로 잰다.
+- 인덱스 메모리는 트리가 요청한 바이트 합이다(malloc 관리 오버헤드 제외).
+- 실패한 문장은 측정 줄 없이 기존 오류 줄만 쓴다.
+- 결과 출력 비용을 줄이려면 stdout을 일반 파일로 보낸다. Windows의 `NUL`은 문자 장치라 C 런타임이 버퍼링 없이 줄마다 써서 출력 비용이 부풀려진다.
+
+`tools/gen_sql.py N`: INSERT N개를 stdout에 LF로 쓴다. i번째는 `name = 'user%06d'`, `age = i % 151`이며 실행마다 같다.
+`tools/bench.py`(`make bench`, 기본 100만 건): 생성 → 삽입 → 같은 조회 묶음을 프로세스 7회 `--timing`으로 실행 → 문장별 중앙값 표(마크다운)를 stdout에. 결과는 [benchmark.md](benchmark.md)에 기록한다. 100만 건은 느리므로 `make test`에 넣지 않는다.
 
 SQL 문법, 출력 형식, 저장 파일 형식(users.tsv), 오류 규칙은 위 표 외에는 Phase 1과 같다. 결과 순서도 그대로 저장 순서(= id 오름차순)다.
 

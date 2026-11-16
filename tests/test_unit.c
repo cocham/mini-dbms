@@ -1580,6 +1580,59 @@ static void test_storage_index_many_records(void) {
     CHECK(table_close(t, &err) == 0);
 }
 
+/* ---------- B+ 트리·Storage: 메모리 실측 (P2-04) ---------- */
+
+static void test_bpt_mem_stats(void) {
+    BptMemStats m0;
+    BptMemStats m3;
+    BptMemStats m7;
+    BpTree *t = bpt_create(3);
+    int i;
+
+    CHECK(t != NULL);
+    if (t == NULL) {
+        return;
+    }
+    bpt_mem_stats(t, &m0); /* 빈 트리: 빈 리프 하나 */
+    CHECK(m0.leaves == 1 && m0.internals == 0 && m0.bytes > 0);
+    for (i = 1; i <= 3; i++) {
+        bpt_insert(t, i, i);
+    }
+    bpt_mem_stats(t, &m3); /* [3] / [1 2] [3] */
+    CHECK(m3.leaves == 2 && m3.internals == 1 && m3.bytes > m0.bytes);
+    for (i = 4; i <= 7; i++) {
+        bpt_insert(t, i, i);
+    }
+    bpt_mem_stats(t, &m7); /* [5] / [3] [7] / [1 2] [3 4] [5 6] [7] */
+    CHECK(m7.leaves == 4 && m7.internals == 3);
+    /* 리프·내부 노드 하나의 크기는 일정하므로, 늘어난 바이트는 늘어난 노드 수로 설명된다 */
+    {
+        size_t leaf_plus_internal = m3.bytes - m0.bytes; /* 리프 1 + 내부 1 */
+        CHECK(m7.bytes - m3.bytes == 2 * leaf_plus_internal);
+    }
+    bpt_destroy(t);
+}
+
+static void test_storage_index_stats(void) {
+    const char *dir = fresh_dir("index_stats");
+    Table *t = NULL;
+    DbError err = {{0}};
+    IndexStats ix;
+    int64_t id;
+    int i;
+
+    CHECK(table_open(dir, &t, &err) == 0);
+    table_index_stats(t, &ix);
+    CHECK(ix.height == 1 && ix.keys == 0 && ix.leaves == 1 && ix.internals == 0 && ix.bytes > 0);
+    for (i = 0; i < 64; i++) { /* 기본 차수 64: 64번째 키에서 첫 분할 */
+        CHECK(table_append(t, "a", 1, &id, &err) == 0);
+    }
+    table_index_stats(t, &ix);
+    CHECK(ix.height == 2 && ix.keys == 64 && ix.leaves == 2 && ix.internals == 1);
+    CHECK(ix.height == table_index_height(t) && ix.keys == table_row_count(t));
+    CHECK(table_close(t, &err) == 0);
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "사용법: test_unit <임시 디렉터리>\n");
@@ -1636,6 +1689,8 @@ int main(int argc, char **argv) {
     test_storage_index_lookup();
     test_storage_index_rebuilt_on_open();
     test_storage_index_many_records();
+    test_bpt_mem_stats();
+    test_storage_index_stats();
 
     printf("단위 테스트: %d개 검사 중 %d개 실패\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

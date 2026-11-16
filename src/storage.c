@@ -389,6 +389,17 @@ int table_index_height(const Table *t) { return bpt_height(t->index); }
 /* 모든 레코드가 인덱스에 등록되므로(table_open·table_append) 키 수가 곧 행 수다. */
 int64_t table_row_count(const Table *t) { return (int64_t)bpt_size(t->index); }
 
+void table_index_stats(const Table *t, IndexStats *out) {
+    BptMemStats m;
+
+    bpt_mem_stats(t->index, &m);
+    out->height = bpt_height(t->index);
+    out->keys = (int64_t)bpt_size(t->index);
+    out->leaves = m.leaves;
+    out->internals = m.internals;
+    out->bytes = m.bytes;
+}
+
 int table_close(Table *t, DbError *err) {
     int rc;
 

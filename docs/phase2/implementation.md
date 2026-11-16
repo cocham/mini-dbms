@@ -1,6 +1,6 @@
 # Phase 2 구현설명서
 
-위에서 아래로 읽는 지도. 기능이 하나 끝날 때마다 절이 늘어난다. 지금은 **P2-03(id 범위 조회)**까지 있다.
+위에서 아래로 읽는 지도. 기능이 하나 끝날 때마다 절이 늘어난다. 지금은 **P2-04(100만 건과 측정)**까지 있다.
 
 ## 1. 무엇이 바뀌었나 — 한 장 요약
 
@@ -86,9 +86,9 @@ pos = lower_bound(n, key);                  /* 리프 안에서 이진 탐색 �
 | 리프 | 오른쪽 리프의 첫 키를 **복사** | 데이터(키·값)는 리프에 남아 있어야 한다 |
 | 내부 | 가운데 키를 **이동** | 내부 키는 길 안내용이라 한 곳에만 있으면 된다 |
 
-## 6. 다음 기능에서 이어질 절
+## 6. 이후 절
 
-- 9절 100만 건과 측정 — 시작 비용 vs 조회 비용 (P2-04)
+7절 EXPLAIN, 8절 범위 조회, 9절 100만 건과 측정이 아래에 이어진다.
 
 ## 7. EXPLAIN — 경로 선택을 바깥에서 보기 (P2-02)
 
@@ -146,3 +146,28 @@ Storage   bpt_range(2, 4, range_visit)
 **왜 파일에서도 한 번만 이동하나:** id는 증가 순서로만 저장되고(append 전용, 자동 증가) 모든 줄이 인덱스에 있으므로, 연속된 키는 파일에서도 바로 이웃한 줄이다. 줄마다 fseek하면 stdio 버퍼를 매번 버리게 된다.
 
 **넘침 주의:** `id < v`를 `[.., v-1]`로 바꿀 때 v가 INT64_MIN이면 `v-1`이 넘친다. 이때는 빈 범위로 처리한다(`id_range_of`).
+
+## 9. 100만 건과 측정 — 시작 비용 vs 조회 비용 (P2-04)
+
+```text
+tools/gen_sql.py 1000000 > insert.sql          i번째: ('user%06d', i % 151)
+minidb --data-dir D insert.sql                  Phase 1 처리기 그대로: 100만 번 parser_next → executor_run(INSERT)
+minidb --data-dir D --timing query.sql > out    측정 줄은 stderr
+
+main
+  t0 = now_ms(); table_open(...)                ← [측정] 시작: 파일 전체 검증 + 줄마다 bpt_insert
+  print_timing_start → table_index_stats        ← [측정] 인덱스: bpt_mem_stats가 노드를 훑어 셈
+  문장마다: es.rows_returned = 0; t0 = now_ms()
+            executor_run(...)                   ← print_row가 es.rows_returned++
+            es.elapsed_ms = now_ms() - t0       ← [측정] 문장 k: ... ms, 결과 n행
+```
+
+| 값 | 타입 | 언제 정해지나 | 어디서 보나 |
+|---|---|---|---|
+| 트리 높이, 전체 행 수 | `PlanStats` | 계획 시점(실행 전) | `EXPLAIN` stdout |
+| 시작 시간, 문장 시간, 결과 행 수 | `ExecStats` | 실행 후 | `--timing` stderr |
+| 노드 수, 인덱스 메모리 | `IndexStats` | 시작 직후 | `--timing` stderr |
+
+**왜 시작과 문장을 나눠 재나:** CLI는 실행할 때마다 `table_open`이 파일 전체를 읽는다(O(N)). 프로세스 전체 시간으로 비교하면 id 조회도 이 비용에 묻혀 선형 탐색과 비슷해 보인다. 인덱스의 효과는 "시작한 뒤 조회 한 번"에서 드러난다. 측정값은 [benchmark.md](benchmark.md).
+
+**`tools/bench.py`:** 생성·삽입 후 같은 조회 묶음(id 처음/가운데/끝/없음, id 범위 1,000건, age 일치 많음/없음)을 프로세스 7번 실행해 문장별 중앙값을 낸다. 계획 열은 같은 조건의 EXPLAIN 출력이라 측정값이 아니다.

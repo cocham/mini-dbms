@@ -7,6 +7,7 @@
 사용법: python tests/cli_test.py <minidb 실행 파일>
 """
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -606,6 +607,111 @@ def p2_range_errors(env):
                     "문장 2", needle, stdout=b"INSERT 1\n")
     eq(env.data(), b"".join(u("%d\ta\t1\n" % (i + 1)) for i in range(len(RANGE_ERROR_CASES))),
        "실패한 문장 뒤 INSERT는 실행되지 않음")
+
+
+# ---------- Phase 2 / P2-04: --timing, 대량 생성, 벤치마크 ----------
+
+TOOLS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools")
+TIMING_START = re.compile(u(r"^\[측정\] 시작: [0-9]+\.[0-9]{3} ms \(파일 전체 읽기 \+ 인덱스 구축, ([0-9]+)행\)$"))
+TIMING_INDEX = re.compile(u(r"^\[측정\] 인덱스: 높이 ([0-9]+), 리프 ([0-9]+)개, 내부 노드 ([0-9]+)개, 약 [0-9]+\.[0-9] MB$"))
+TIMING_STMT = re.compile(u(r"^\[측정\] 문장 ([0-9]+): [0-9]+\.[0-9]{4} ms, (결과 ([0-9]+)행|추가 1행|계획만)$"))
+
+
+def timing_lines(err):
+    lines = err.split(b"\n")
+    assert lines[-1] == b"", "stderr가 줄바꿈으로 끝나지 않음: %r" % err
+    return lines[:-1]
+
+
+@test
+def p2_timing_keeps_stdout(env):
+    # --timing은 stderr에만 쓴다. stdout은 옵션이 없을 때와 바이트 단위로 같다.
+    expect_ok(env.run(TWO_INSERTS), b"INSERT 1\nINSERT 1\n")
+    q = env.sql_file("SELECT * FROM users WHERE id = 2;"
+                     "SELECT * FROM users WHERE age = 25;"
+                     "EXPLAIN SELECT * FROM users;"
+                     "SELECT * FROM users WHERE id BETWEEN 1 AND 2;")
+    code, plain, err = env.run_args(["--data-dir", env.data_dir, q])
+    eq((code, err), (0, b""), "옵션 없음")
+    code, timed, err = env.run_args(["--timing", "--data-dir", env.data_dir, q])
+    eq(code, 0, "--timing 종료 코드")
+    eq(timed, plain, "--timing stdout")
+    lines = timing_lines(err)
+    eq(len(lines), 6, "측정 줄 수")
+    m = TIMING_START.match(lines[0])
+    assert m and m.group(1) == b"2", lines[0]
+    m = TIMING_INDEX.match(lines[1])
+    assert m and m.groups() == (b"1", b"1", b"0"), lines[1]
+    expected = [(b"1", b"1"), (b"2", b"1"), (b"3", None), (b"4", b"2")]
+    for line, (no, rows) in zip(lines[2:], expected):
+        m = TIMING_STMT.match(line)
+        assert m, line
+        eq(m.group(1), no, "문장 번호")
+        if rows is None:
+            eq(m.group(2), u("계획만"), "EXPLAIN 측정")
+        else:
+            eq(m.group(3), rows, "결과 행 수")
+
+
+@test
+def p2_timing_insert_and_failure(env):
+    # 새 디렉터리: 시작 0행. INSERT는 "추가 1행". 실패한 문장은 측정 줄 없이 오류만
+    q = env.sql_file("INSERT INTO users (name, age) VALUES ('a', 1);"
+                     "SELECT * FROM users WHERE age > 1;")
+    code, out, err = env.run_args([q, "--timing", "--data-dir", env.data_dir])
+    assert code == 1, code
+    eq(out, b"INSERT 1\n", "stdout")
+    lines = timing_lines(err)
+    eq(len(lines), 4, "줄 수: 시작, 인덱스, 문장 1, 오류")
+    assert TIMING_START.match(lines[0]).group(1) == b"0"
+    assert TIMING_INDEX.match(lines[1])
+    m = TIMING_STMT.match(lines[2])
+    assert m and m.group(1) == b"1" and m.group(2) == u("추가 1행"), lines[2]
+    assert lines[3].startswith(u("오류: 문장 2:")), lines[3]
+    eq(env.data(), b"1\ta\t1\n", "파일")
+
+
+@test
+def p2_timing_usage(env):
+    code, out, _ = env.run_args(["--help"])
+    eq(code, 0, "--help")
+    assert b"--timing" in out
+    code, _, err = env.run_args(["--timing"])
+    eq(code, 2, "SQL 파일 없음")
+    code, _, err = env.run_args(["--timings", "x.sql"])
+    eq(code, 2, "비슷한 이름의 알 수 없는 옵션")
+
+
+@test
+def p2_gen_sql_feeds_cli(env):
+    gen = subprocess.run([sys.executable, os.path.join(TOOLS, "gen_sql.py"), "152"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    eq((gen.returncode, gen.stderr), (0, b""), "gen_sql 실행")
+    assert b"\r" not in gen.stdout, "LF로만 써야 함"
+    expect_ok(env.run(gen.stdout), b"INSERT 1\n" * 152)
+    data = env.data().split(b"\n")
+    eq(data[0], b"1\tuser000001\t1", "첫 줄")
+    eq(data[150], b"151\tuser000151\t0", "151번째: age = 151 % 151")
+    eq(data[151], b"152\tuser000152\t1", "마지막 줄")
+    bad = subprocess.run([sys.executable, os.path.join(TOOLS, "gen_sql.py"), "x"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    eq(bad.returncode, 2, "잘못된 인자")
+
+
+@test
+def p2_bench_smoke(env):
+    # 작은 건수로 벤치마크 스크립트 전체 흐름(생성 → 삽입 → EXPLAIN → --timing 반복 → 표)을 확인
+    work = os.path.join(env.root, "bench")
+    p = subprocess.run([sys.executable, os.path.join(TOOLS, "bench.py"), "--rows", "300", "--repeat", "2",
+                        "--bin", BIN, "--workdir", work],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+    eq((p.returncode, p.stderr), (0, b""), "bench.py 실행")
+    out = p.stdout.decode("utf-8")
+    for needle in ("| 레코드 수 | 300건 |", "INDEX LOOKUP", "INDEX RANGE SCAN", "FULL SCAN",
+                   "| id 범위 1,000건 | `id BETWEEN 150 AND 1149` | INDEX RANGE SCAN | 151 |",
+                   "| age 단건 — 일치 없음 | `age = 151` | FULL SCAN | 0 |",
+                   "| id 단건 — 없음 | `id = 301` | INDEX LOOKUP | 0 |"):
+        assert needle in out, "출력에 %r 없음:\n%s" % (needle, out)
 
 
 @test

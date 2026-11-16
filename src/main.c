@@ -4,10 +4,14 @@
  *
  * 종료 코드: 0 성공, 1 SQL·데이터·파일 오류, 2 잘못된 사용법
  */
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L /* clock_gettime(CLOCK_MONOTONIC) */
+#endif
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "executor.h"
 #include "parser.h"
@@ -39,8 +43,59 @@ static void setup_windows_output(void) {
 #endif
 
 static void print_usage(FILE *out) {
-    fprintf(out, "사용법: minidb [--data-dir 디렉터리] SQL파일\n"
-                 "  --data-dir  데이터 파일(users.tsv) 위치. 기본값: " DEFAULT_DATA_DIR "\n");
+    fprintf(out, "사용법: minidb [--data-dir 디렉터리] [--timing] SQL파일\n"
+                 "  --data-dir  데이터 파일(users.tsv) 위치. 기본값: " DEFAULT_DATA_DIR "\n"
+                 "  --timing    시작 비용과 문장별 실행 시간을 stderr에 출력 (stdout은 그대로)\n");
+}
+
+/* ---------- 실행 측정 (--timing, P2-04) ---------- */
+
+/*
+ * 실제 실행 측정값. EXPLAIN의 PlanStats(계획 시점 통계)와 섞지 않는 별도 타입이다.
+ * 시간은 단조 증가 시계로 잰다(시스템 시각 변경에 영향받지 않음).
+ */
+typedef struct {
+    double elapsed_ms;     /* executor_run 한 번에 걸린 시간 (결과 출력 포함) */
+    int64_t rows_returned; /* SELECT가 출력한 행 수 */
+} ExecStats;
+
+static double now_ms(void) {
+#ifdef _WIN32
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER c;
+    if (freq.QuadPart == 0) {
+        QueryPerformanceFrequency(&freq);
+    }
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart * 1000.0 / (double)freq.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+#endif
+}
+
+/* 측정 줄은 stderr로. 앞선 stdout 결과가 먼저 보이도록 flush한다(측정 구간 밖에서). */
+static void print_timing_start(double ms, const Table *t) {
+    IndexStats ix;
+
+    table_index_stats(t, &ix);
+    fflush(stdout);
+    fprintf(stderr, "[측정] 시작: %.3f ms (파일 전체 읽기 + 인덱스 구축, %" PRId64 "행)\n", ms, ix.keys);
+    fprintf(stderr, "[측정] 인덱스: 높이 %d, 리프 %zu개, 내부 노드 %zu개, 약 %.1f MB\n", ix.height,
+            ix.leaves, ix.internals, (double)ix.bytes / (1024.0 * 1024.0));
+}
+
+static void print_timing_stmt(long stmt_no, const Statement *st, const ExecStats *es) {
+    fflush(stdout);
+    if (st->kind == STMT_INSERT) {
+        fprintf(stderr, "[측정] 문장 %ld: %.4f ms, 추가 1행\n", stmt_no, es->elapsed_ms);
+    } else if (st->explain) {
+        fprintf(stderr, "[측정] 문장 %ld: %.4f ms, 계획만\n", stmt_no, es->elapsed_ms);
+    } else {
+        fprintf(stderr, "[측정] 문장 %ld: %.4f ms, 결과 %" PRId64 "행\n", stmt_no, es->elapsed_ms,
+                es->rows_returned);
+    }
 }
 
 /* 파일 전체를 NUL로 끝나는 버퍼로 읽는다. 호출자가 free한다. */
@@ -107,7 +162,8 @@ static int print_insert(int64_t id, void *ctx) {
 }
 
 static int print_row(const Row *row, void *ctx) {
-    (void)ctx;
+    ExecStats *es = ctx;
+    es->rows_returned++;
     return printf("%" PRId64 "\t%s\t%d\n", row->id, row->name, row->age) < 0 ? -1 : 0;
 }
 
@@ -168,9 +224,12 @@ int main(int argc, char **argv) {
     size_t sql_len = 0;
     size_t pos = 0;
     Table *table = NULL;
+    ExecStats es = {0.0, 0};
     ResultSink sink = {print_insert, print_row, NULL, print_plan};
     long stmt_no = 0;
     int status = 0;
+    int timing = 0;
+    double t0;
     int i;
 
 #ifdef _WIN32
@@ -186,6 +245,8 @@ int main(int argc, char **argv) {
                 return EXIT_USAGE;
             }
             data_dir = argv[++i];
+        } else if (strcmp(argv[i], "--timing") == 0) {
+            timing = 1;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(stdout);
             return 0;
@@ -215,11 +276,16 @@ int main(int argc, char **argv) {
         pos = 3; /* UTF-8 BOM 건너뛰기 */
     }
 
+    t0 = now_ms();
     if (table_open(data_dir, &table, &err) != 0) {
         report(0, &err);
         free(sql);
         return EXIT_FAIL;
     }
+    if (timing) {
+        print_timing_start(now_ms() - t0, table);
+    }
+    sink.ctx = &es;
 
     /* 문장을 순서대로 실행하고, 하나라도 실패하면 즉시 멈춘다(fail-fast).
      * 앞서 성공한 INSERT는 이미 파일에 있으므로 유지된다. */
@@ -244,7 +310,13 @@ int main(int argc, char **argv) {
             rc = -1;
         }
         if (rc == 0) {
+            es.rows_returned = 0;
+            t0 = now_ms();
             rc = executor_run(table, &st, &sink, &err);
+            es.elapsed_ms = now_ms() - t0;
+            if (rc == 0 && timing) {
+                print_timing_stmt(stmt_no, &st, &es);
+            }
         }
         statement_free(&st);
         if (rc != 0) {

@@ -220,6 +220,30 @@ int bpt_range(const BpTree *t, int64_t lo, int64_t hi, BptVisitFn fn, void *ctx)
     return 0;
 }
 
+static void count_nodes(const BptNode *n, int order, BptMemStats *out) {
+    int i;
+
+    /* node_new가 요청하는 크기와 같게 센다: 구조체 + keys(order칸) + values 또는 children */
+    out->bytes += sizeof *n + (size_t)order * sizeof *n->keys;
+    if (n->is_leaf) {
+        out->leaves++;
+        out->bytes += (size_t)order * sizeof *n->values;
+        return;
+    }
+    out->internals++;
+    out->bytes += (size_t)(order + 1) * sizeof *n->children;
+    for (i = 0; i <= n->nkeys; i++) {
+        count_nodes(n->children[i], order, out);
+    }
+}
+
+void bpt_mem_stats(const BpTree *t, BptMemStats *out) {
+    out->leaves = 0;
+    out->internals = 0;
+    out->bytes = sizeof *t;
+    count_nodes(t->root, t->order, out);
+}
+
 size_t bpt_size(const BpTree *t) { return t->size; }
 int bpt_height(const BpTree *t) { return t->height; }
 int bpt_order(const BpTree *t) { return t->order; }
