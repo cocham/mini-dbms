@@ -7,6 +7,7 @@
 사용법: python tests/cli_test.py <minidb 실행 파일>
 """
 import os
+import random
 import re
 import subprocess
 import sys
@@ -712,6 +713,58 @@ def p2_bench_smoke(env):
                    "| age 단건 — 일치 없음 | `age = 151` | FULL SCAN | 0 |",
                    "| id 단건 — 없음 | `id = 301` | INDEX LOOKUP | 0 |"):
         assert needle in out, "출력에 %r 없음:\n%s" % (needle, out)
+
+
+# ---------- Phase 2 / P2-05: 전체 회귀 — 무작위 문장 묶음을 Python 모델과 비교 ----------
+
+@test
+def p2_random_model(env):
+    # 정해진 시드로 INSERT와 모든 조회 형태를 섞고, 실행을 세 번(재시작 두 번) 나눠
+    # 결과를 단순 모델(전체 목록을 걸러내기)과 바이트 단위로 비교한다.
+    rnd = random.Random(20261116)
+    model = []  # (id, name, age)
+    names = ["a", "민수", "O'Brien", "Alice", "지영"]
+
+    def rows(pred):
+        return b"".join(u("%d\t%s\t%d\n" % r) for r in model if pred(r))
+
+    for _round in range(3):
+        stmts, expected = [], b""
+        for _ in range(200):
+            k = rnd.random()
+            if k < 0.35:
+                rid = len(model) + 1
+                name = rnd.choice(names) + "_" * rnd.randint(0, 40) + str(rid)
+                age = rnd.randint(0, 150)
+                stmts.append("INSERT INTO users (name, age) VALUES ('%s', %d);" % (name.replace("'", "''"), age))
+                model.append((rid, name, age))
+                expected += b"INSERT 1\n"
+                continue
+            n = len(model)
+            a = rnd.randint(-2, n + 3)
+            b = rnd.randint(-2, n + 3)
+            kind = rnd.choice(["eq", "between", "lt", "le", "gt", "ge", "age", "none"])
+            if kind == "eq":
+                where, pred = "id = %d" % a, (lambda r, a=a: r[0] == a)
+            elif kind == "between":
+                where, pred = "id BETWEEN %d AND %d" % (a, b), (lambda r, a=a, b=b: a <= r[0] <= b)
+            elif kind == "lt":
+                where, pred = "id < %d" % a, (lambda r, a=a: r[0] < a)
+            elif kind == "le":
+                where, pred = "id <= %d" % a, (lambda r, a=a: r[0] <= a)
+            elif kind == "gt":
+                where, pred = "id > %d" % a, (lambda r, a=a: r[0] > a)
+            elif kind == "ge":
+                where, pred = "id >= %d" % a, (lambda r, a=a: r[0] >= a)
+            elif kind == "age":
+                age = rnd.choice([rnd.randint(0, 150), -1, 151])
+                where, pred = "age = %d" % age, (lambda r, age=age: r[2] == age)
+            else:
+                where, pred = None, (lambda r: True)
+            stmts.append("SELECT * FROM users%s;" % (" WHERE " + where if where else ""))
+            expected += HEADER + rows(pred)
+        expect_ok(env.run("\n".join(stmts)), expected)
+    eq(env.data(), rows(lambda r: True), "최종 파일")
 
 
 @test

@@ -15,7 +15,7 @@
 | DB-P2-D10 | D04 변경: P2-02~P2-05는 단위 구현 → 테스트·메모리 검사로 검증 → 통과하면 바로 커밋·다음 단위. 인터페이스 변경 결정은 구현 전 제안. 학습은 별도 노트로, 진행 조건이 아니다 | 확정(2026-11-16, 사용자. 처음엔 Codex 검증 대기였으나 같은 날 자동 커밋으로 변경) |
 | DB-P2-D11 | id 범위 조회: `BETWEEN`(양 끝 포함)과 `< <= > >=`, id에만. 뒤집힌 범위는 결과 없음. 내부에서는 양 끝 포함 `IdRange[lo, hi]`로 정규화하고 `bpt_range`(시작 리프 + next 연결) → `table_find_id_range`(첫 줄만 fseek, 이후 이어 읽기). EXPLAIN은 `INDEX RANGE SCAN (원래 조건, B+ 트리 높이)`, 건수 없음 | 확정(2026-11-16, 사용자) |
 | DB-P2-D12 | 측정: `--timing`은 stderr에만(stdout 불변), 실행 측정값 `ExecStats`는 CLI가 단조 시계로 잼(Executor 무변경). 대량 생성 `tools/gen_sql.py`, 자동 비교 `tools/bench.py`·`make bench`(test와 분리). 인덱스 메모리는 `bpt_mem_stats`로 실측. 오른쪽 끝 분할 최적화와 id 강제 선형 탐색 옵션은 하지 않음 | 확정(2026-11-16, 사용자) |
-| DB-P2-D08 | 주 개발 환경을 macOS(Apple clang, make)로 옮긴다. Windows 빌드 경로는 Makefile에 유지. 메모리 검사는 Docker `gcc:13`에서 `make sanitize` | 적용(2026-11-15). macOS의 Apple clang ASan은 이 OS 버전에서 초기화 중 멈춰 사용하지 않는다 |
+| DB-P2-D08 | 주 개발 환경을 macOS(Apple clang, make)로 옮긴다. Windows 빌드 경로는 Makefile에 유지. 메모리 검사는 Docker `gcc:13`에서 `make sanitize`. (P2-02~P2-05는 Windows TDM-GCC + Docker에서 진행) | 적용(2026-11-15). macOS의 Apple clang ASan은 이 OS 버전에서 초기화 중 멈춰 사용하지 않는다 |
 
 ## 모듈 구성
 

@@ -1,10 +1,10 @@
 # 미니 DBMS
 
-C로 SQL 파일을 실행하고 데이터를 파일에 저장하는 CLI(Phase 1)에, id B+ 트리 인덱스(Phase 2)를 붙여 가는 중이다.
+C로 SQL 파일을 실행하고 데이터를 파일에 저장하는 CLI(Phase 1)에, id B+ 트리 인덱스(Phase 2)를 붙였다.
 
-## Phase 2 — B+ 트리 인덱스 (진행 중)
+## Phase 2 — B+ 트리 인덱스 (완료)
 
-현재 상태: **P2-04(100만 건과 성능 비교)까지 완료.** `WHERE id = ?`는 B+ 트리에서 바이트 위치를 찾아 그 한 줄만 읽고, `WHERE id BETWEEN a AND b`·`id < v` 등은 리프 연결을 따라 범위 안의 줄만 읽고, `EXPLAIN SELECT ...`는 조회 없이 실행 계획(INDEX LOOKUP / INDEX RANGE SCAN / FULL SCAN과 계획 시점 통계)을 보여 준다.
+현재 상태: **P2-01~P2-05 완료.** `WHERE id = ?`는 B+ 트리에서 바이트 위치를 찾아 그 한 줄만 읽고, `WHERE id BETWEEN a AND b`·`id < v` 등은 리프 연결을 따라 범위 안의 줄만 읽고, `EXPLAIN SELECT ...`는 조회 없이 실행 계획(INDEX LOOKUP / INDEX RANGE SCAN / FULL SCAN과 계획 시점 통계)을 보여 준다.
 
 1. [탑다운 학습 가이드](docs/phase2/learning.md): 결과물 → 전체 지도 → 기능별 실습. **여기서 시작**
 2. [개발 명세](docs/phase2/spec.md): 최종 결과, 데이터 흐름, Phase 1 대비 변경점

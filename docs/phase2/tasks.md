@@ -2,7 +2,7 @@
 
 ## 현재 상태
 
-P2-04 완료(2026-11-16). 다음은 P2-05.
+**Phase 2 완료(2026-11-16).** P2-01~P2-05 모두 구현·검증·커밋. Phase 3는 시작하지 않는다.
 
 진행 방식(2026-11-16 변경, DB-P2-D10): 한 단위 구현 → 단위·CLI 테스트와 메모리 검사로 검증 → 통과하면 바로 커밋하고 다음 단위. 사용자 동작이나 공개 인터페이스를 바꾸는 결정은 구현 전에 짧게 제안한다. 학습은 사용자의 별도 노트로 진행하며 진행 조건이 아니다. Phase 3는 시작하지 않는다.
 
@@ -13,7 +13,7 @@ P2-04 완료(2026-11-16). 다음은 P2-05.
 | P2-02 | EXPLAIN 실행 계획 | `EXPLAIN SELECT ...`가 INDEX LOOKUP / FULL SCAN과 계획 시점 통계(트리 높이, 전체 행 수)를 보여 줌. spec B5 | 완료 |
 | P2-03 | id 범위 조회 | `BETWEEN`, `<` `<=` `>` `>=`를 리프 연결로 처리, EXPLAIN에 INDEX RANGE SCAN. spec B6 | 완료 |
 | P2-04 | 100만 건과 성능 비교 | 대량 SQL 생성, 시작 비용과 조회 시간 분리 측정, 인덱스 vs 선형 탐색 결과 기록. spec B7 | 완료 |
-| P2-05 | 전체 검증·마무리 | Phase 1 회귀, 메모리 검사, 문서 정리. spec B8 | 대기 |
+| P2-05 | 전체 검증·마무리 | Phase 1 회귀, 메모리 검사, 문서 정리. spec B8 | 완료 |
 
 기능마다 하는 일: (인터페이스 변경 제안) → 구현 → 단위·CLI 테스트 → 메모리 검사 → 이 문서에 기록 → 통과하면 커밋.
 
@@ -134,6 +134,39 @@ spec 대응:
 | ID | 테스트·기록 |
 |---|---|
 | B7 | 단위 `test_bpt_mem_stats`(빈 트리·분할 후 노드 수, 바이트가 노드 수에 비례), `test_storage_index_stats`(64건에서 높이 2·리프 2·내부 1). CLI `p2_timing_keeps_stdout`(stdout 불변, 측정 줄 형식·행 수), `p2_timing_insert_and_failure`(추가 1행, 실패 문장은 측정 없음), `p2_timing_usage`, `p2_gen_sql_feeds_cli`(LF, 값 규칙, 처리기로 삽입), `p2_bench_smoke`(300건으로 전체 흐름·표 내용). 100만 건 결과는 benchmark.md |
+
+## P2-05 — 전체 검증·마무리
+
+**역할:** Phase 2 전 기능을 함께 돌려 Phase 1 계약(A1~A8)과 Phase 2 계약(B1~B7)이 동시에 지켜지는지 확인하고 문서를 정리한다. 사용자 동작·인터페이스 변경 없음.
+
+- CLI `p2_random_model` 추가: 시드 고정 무작위 문장 600개(INSERT 35%, `id =`·`BETWEEN`·`< <= > >=`·`age =`·조건 없음), 실행 3번(재시작 2번)을 Python 모델과 바이트 비교. 변이(`id <= v`를 `v-1`로)를 넣으면 실패함을 확인.
+- `.gitignore`에 `__pycache__/`(bench.py가 gen_sql.py를 import하며 생김).
+- 예제 전부 실행: `phase2_id_lookup`·`phase2_explain`·`phase2_range`·`third` 정상. `basic.sql`은 2번째 문장의 `nickname` 컬럼으로 일부러 실패하는 Phase 1 예제(fail-fast 확인용, 내용 변경 없음).
+
+**P2-05 검증 기록(2026-11-16)**
+
+| 명령 | 환경 | 결과 |
+|---|---|---|
+| `mingw32-make` | Windows, TDM-GCC 10.3 | 경고 0 |
+| `mingw32-make test` | Windows | 단위 23,276개 검사 실패 0, CLI 46개 실패 0 |
+| `docker run --rm -v "$PWD:/src" -w /src gcc:13 bash -c "make clean; make sanitize"` | Linux, GCC 13, ASan/UBSan/LSan | 경고 0, 단위 23,276개·CLI 46개 실패 0, bpt_demo 정상, 검사 도구 보고 없음 |
+| macOS(Apple clang) 빌드·`leaks` | — | P2-02 이후 실행하지 않음(작업 환경 Windows). P2-01까지는 macOS에서 확인 |
+
+spec 대응:
+
+| ID | 확인 |
+|---|---|
+| B8 | Phase 1 CLI 테스트 28개(`a1_`~`a7_`, 주석·사용법 등)와 Phase 1 단위 테스트가 Phase 2 전 기능과 함께 통과(A1~A7). 단위·CLI 전체를 ASan/UBSan/LSan으로 다시 실행해 보고 없음(A8). Phase 1 계약 변경은 DB-P2-D07(`WHERE id`가 파일 끝까지 읽지 않음) 하나뿐 |
+
+### Phase 2 전체 요약
+
+| 기능 | 커밋 | 핵심 |
+|---|---|---|
+| P2-01 id 조회 | f331be6 | B+ 트리(차수 64), 시작 시 재구성, `WHERE id = ?` → 위치 → 한 줄 |
+| P2-02 EXPLAIN | 668ca65 | `executor_plan` 한 곳에서 경로 결정, `QueryPlan`/`PlanStats`(계획 시점 통계) |
+| P2-03 범위 조회 | 46256d9 | `BETWEEN`·`< <= > >=`, `bpt_range`(리프 연결), 첫 줄만 fseek |
+| P2-04 측정 | e6616a7 | `--timing`(`ExecStats`, stderr), gen_sql·bench, 100만 건 id 0.02 ms vs age 0.7~0.84 s |
+| P2-05 마무리 | (이 커밋) | 무작위 모델 회귀, 전체 메모리 검사, 문서 정리 |
 
 ## 공통 규칙 (Phase 1에서 이어짐)
 
