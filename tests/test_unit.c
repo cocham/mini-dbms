@@ -392,8 +392,73 @@ static void test_parse_explain_errors(void) {
     EXPECT_PARSE_ERROR("SELECT EXPLAIN * FROM users;", "SELECT *");
     /* EXPLAIN 뒤 SELECT의 오류 규칙은 일반 SELECT와 같다 */
     EXPECT_PARSE_ERROR("EXPLAIN SELECT * FROM users", "세미콜론");
-    EXPECT_PARSE_ERROR("EXPLAIN SELECT * FROM users WHERE id > 1;", "'='");
+    EXPECT_PARSE_ERROR("EXPLAIN SELECT * FROM users WHERE id <> 1;", "BETWEEN만 지원");
     EXPECT_PARSE_ERROR("EXPLAIN SELECT * FROM orders;", "테이블 'orders'");
+}
+
+static void expect_range(const char *sql, CmpOp op, int64_t v1, int64_t v2) {
+    Statement st;
+    DbError err = {{0}};
+    int r = parse_one(sql, &st, &err);
+
+    CHECK(r == 1);
+    CHECK(r == 1 && st.kind == STMT_SELECT && st.where == WHERE_ID_RANGE);
+    CHECK(r == 1 && st.where_op == op && st.where_value == v1 && st.where_value2 == v2);
+    if (r != 1 || st.where != WHERE_ID_RANGE || st.where_op != op || st.where_value != v1 ||
+        st.where_value2 != v2) {
+        fprintf(stderr, "    SQL: %s\n    메시지: %s\n", sql, err.msg);
+    }
+    if (r == 1) {
+        statement_free(&st);
+    }
+}
+
+static void test_parse_id_range(void) {
+    Statement st;
+    DbError err = {{0}};
+
+    expect_range("SELECT * FROM users WHERE id BETWEEN 10 AND 20;", CMP_BETWEEN, 10, 20);
+    expect_range("select * from users where ID between -5 and 3;", CMP_BETWEEN, -5, 3);
+    expect_range("SELECT * FROM users WHERE id BETWEEN 20 AND 10;", CMP_BETWEEN, 20, 10); /* 뒤집힘도 파싱은 성공 */
+    expect_range("SELECT * FROM users WHERE id\n BETWEEN /* c */ 1 -- x\n AND 1;", CMP_BETWEEN, 1, 1);
+    expect_range("SELECT * FROM users WHERE id < 5;", CMP_LT, 5, 0);
+    expect_range("SELECT * FROM users WHERE id<=5;", CMP_LE, 5, 0);
+    expect_range("SELECT * FROM users WHERE id > 5;", CMP_GT, 5, 0);
+    expect_range("SELECT * FROM users WHERE id >= 5;", CMP_GE, 5, 0);
+    expect_range("SELECT * FROM users WHERE id < -9223372036854775808;", CMP_LT, INT64_MIN, 0);
+    expect_range("SELECT * FROM users WHERE id > 9223372036854775807;", CMP_GT, INT64_MAX, 0);
+    expect_range("SELECT * FROM users WHERE id BETWEEN -9223372036854775808 AND 9223372036854775807;",
+                 CMP_BETWEEN, INT64_MIN, INT64_MAX);
+    expect_range("EXPLAIN SELECT * FROM users WHERE id >= 7;", CMP_GE, 7, 0);
+    /* 등호 조건은 여전히 WHERE_ID / WHERE_AGE + CMP_EQ */
+    CHECK(parse_one("SELECT * FROM users WHERE id = 3;", &st, &err) == 1);
+    CHECK(st.where == WHERE_ID && st.where_op == CMP_EQ && st.where_value2 == 0);
+    statement_free(&st);
+    CHECK(parse_one("SELECT * FROM users WHERE age = 3;", &st, &err) == 1);
+    CHECK(st.where == WHERE_AGE && st.where_op == CMP_EQ);
+    statement_free(&st);
+}
+
+static void test_parse_id_range_errors(void) {
+    EXPECT_PARSE_ERROR("SELECT * FROM users WHERE id <> 1;", "BETWEEN만 지원");
+    EXPECT_PARSE_ERROR("SELECT * FROM users WHERE id != 1;", "BETWEEN만 지원");
+    EXPECT_PARSE_ERROR("SELECT * FROM users WHERE id ! 1;", "BETWEEN만 지원");
+    EXPECT_PARSE_ERROR("SELECT * FROM users WHERE id NOT BETWEEN 1 AND 2;", "BETWEEN만 지원");
+    EXPECT_PARSE_ERROR("SELECT * FROM users WHERE age BETWEEN 1 AND 2;", "age 조건은 '='");
+    EXPECT_PARSE_ERROR("SELECT * FROM users WHERE age >= 1;", "age 조건은 '='");
+    EXPECT_PARSE_ERROR("SELECT * FROM users WHERE id BETWEEN 1;", "BETWEEN의 AND");
+    EXPECT_PARSE_ERROR("SELECT * FROM users WHERE id BETWEEN 1 OR 2;", "BETWEEN의 AND");
+    EXPECT_PARSE_ERROR("SELECT * FROM users WHERE id BETWEEN AND 2;", "id 조건에는 정수 값");
+    EXPECT_PARSE_ERROR("SELECT * FROM users WHERE id BETWEEN 1 AND;", "정수 값");
+    EXPECT_PARSE_ERROR("SELECT * FROM users WHERE id BETWEEN 1 AND 'x';", "id 조건에는 정수 값");
+    EXPECT_PARSE_ERROR("SELECT * FROM users WHERE id BETWEEN 1 AND 2 AND age = 3;", "AND/OR");
+    EXPECT_PARSE_ERROR("SELECT * FROM users WHERE id >= 1 OR id = 2;", "AND/OR");
+    EXPECT_PARSE_ERROR("SELECT * FROM users WHERE id < ;", "정수 값");
+    EXPECT_PARSE_ERROR("SELECT * FROM users WHERE id >= 9223372036854775808;", "64비트");
+    EXPECT_PARSE_ERROR("SELECT * FROM users WHERE id BETWEEN 1 AND 9223372036854775808;", "64비트");
+    EXPECT_PARSE_ERROR("SELECT * FROM users WHERE id BETWEEN 1 AND 2", "세미콜론");
+    EXPECT_PARSE_ERROR("SELECT * FROM users WHERE id < 1 < 2;", "세미콜론");
+    EXPECT_PARSE_ERROR("SELECT * FROM users WHERE id 1;", "'='");
 }
 
 /* ---------- Storage ---------- */
@@ -566,7 +631,7 @@ static int count_insert(int64_t id, void *ctx) {
 
 static void expect_exec_error(Table *t, const char *name, int age, const char *needle) {
     char buf[300];
-    Statement st = {STMT_INSERT, NULL, 0, WHERE_NONE, 0, 0};
+    Statement st = {STMT_INSERT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0};
     DbError err = {{0}};
 
     snprintf(buf, sizeof buf, "%s", name);
@@ -607,7 +672,7 @@ static void test_executor_validation(void) {
 
     /* 경계값은 성공한다. */
     {
-        Statement st = {STMT_INSERT, NULL, 0, WHERE_NONE, 0, 0};
+        Statement st = {STMT_INSERT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0};
         int64_t last = 0;
         ResultSink sink = {count_insert, NULL, &last, NULL};
 
@@ -630,8 +695,8 @@ static void test_executor_insert_select(void) {
     int64_t last = 0;
     char kim[] = "kim";
     char lee[] = "lee";
-    Statement ins = {STMT_INSERT, kim, 20, WHERE_NONE, 0, 0};
-    Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0};
+    Statement ins = {STMT_INSERT, kim, 20, WHERE_NONE, 0, 0, CMP_EQ, 0};
+    Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0};
     ResultSink sink;
 
     memset(&c, 0, sizeof c);
@@ -657,7 +722,7 @@ static void test_executor_insert_select(void) {
 
 /* WHERE 조건으로 조회한 id 목록을 ids에 담고 개수를 돌려준다. */
 static int select_where(Table *t, WhereKind kind, int64_t value, int64_t *ids) {
-    Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0};
+    Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0};
     ResultSink sink = {NULL, collect_row, NULL, NULL};
     DbError err = {{0}};
     Collected c;
@@ -730,9 +795,9 @@ static void test_executor_id_uses_index_age_scans(void) {
     const char good[] = "1\ta\t25\n2\tb\t30\n";
     Table *t = NULL;
     DbError err = {{0}};
-    Statement by_id = {STMT_SELECT, NULL, 0, WHERE_ID, 1, 0};
-    Statement by_id2 = {STMT_SELECT, NULL, 0, WHERE_ID, 2, 0};
-    Statement by_age = {STMT_SELECT, NULL, 0, WHERE_AGE, 25, 0};
+    Statement by_id = {STMT_SELECT, NULL, 0, WHERE_ID, 1, 0, CMP_EQ, 0};
+    Statement by_id2 = {STMT_SELECT, NULL, 0, WHERE_ID, 2, 0, CMP_EQ, 0};
+    Statement by_age = {STMT_SELECT, NULL, 0, WHERE_AGE, 25, 0, CMP_EQ, 0};
     Collected c;
     ResultSink sink = {NULL, collect_row, NULL, NULL};
 
@@ -784,8 +849,8 @@ static void test_executor_plan_paths_and_stats(void) {
     const char *dir = fresh_dir("exec_plan");
     Table *t = NULL;
     DbError err = {{0}};
-    Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0};
-    Statement ins = {STMT_INSERT, NULL, 0, WHERE_NONE, 0, 0};
+    Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0};
+    Statement ins = {STMT_INSERT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0};
     QueryPlan plan;
     char name[] = "a";
     int i;
@@ -844,9 +909,9 @@ static void test_executor_explain_does_not_execute(void) {
     const char good[] = "1\ta\t25\n2\tb\t30\n";
     Table *t = NULL;
     DbError err = {{0}};
-    Statement ex_age = {STMT_SELECT, NULL, 0, WHERE_AGE, 25, 1};
-    Statement ex_id = {STMT_SELECT, NULL, 0, WHERE_ID, 2, 1};
-    Statement sel_age = {STMT_SELECT, NULL, 0, WHERE_AGE, 25, 0};
+    Statement ex_age = {STMT_SELECT, NULL, 0, WHERE_AGE, 25, 1, CMP_EQ, 0};
+    Statement ex_id = {STMT_SELECT, NULL, 0, WHERE_ID, 2, 1, CMP_EQ, 0};
+    Statement sel_age = {STMT_SELECT, NULL, 0, WHERE_AGE, 25, 0, CMP_EQ, 0};
     Collected c;
     PlanCapture pc;
     ResultSink sink = {NULL, row_must_not_be_called, NULL, capture_plan};
@@ -880,6 +945,177 @@ static void test_executor_explain_does_not_execute(void) {
     collect.ctx = &c;
     CHECK(executor_run(t, &sel_age, &collect, &err) == -1);
     CHECK(strstr(err.msg, "2번째 줄") != NULL);
+    CHECK(table_close(t, &err) == 0);
+}
+
+/* ---------- Executor: id 범위 조회 (P2-03) ---------- */
+
+/* 범위 조회 결과(id 목록)를 out에 담고 개수를 돌려준다. 실패하면 -1. */
+static int select_range(Table *t, CmpOp op, int64_t v1, int64_t v2, int64_t *out, int cap) {
+    Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 0, 0, CMP_EQ, 0};
+    ResultSink sink = {NULL, collect_row, NULL, NULL};
+    DbError err = {{0}};
+    Collected c;
+    int i;
+
+    memset(&c, 0, sizeof c);
+    sel.where_op = op;
+    sel.where_value = v1;
+    sel.where_value2 = v2;
+    sink.ctx = &c;
+    if (executor_run(t, &sel, &sink, &err) != 0) {
+        return -1;
+    }
+    for (i = 0; i < c.count && i < 8 && i < cap; i++) {
+        out[i] = c.ids[i];
+    }
+    return c.count;
+}
+
+static void test_executor_id_range(void) {
+    const char *dir = fresh_dir("exec_range");
+    const char data[] = "1\ta\t25\n2\tb\t30\n3\tc\t25\n5\td\t40\n6\te\t25\n9\tf\t1\n";
+    Table *t = NULL;
+    DbError err = {{0}};
+    int64_t ids[8];
+    QueryPlan plan;
+    Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 2, 0, CMP_BETWEEN, 5};
+
+    write_file(dir, data, sizeof data - 1); /* 4, 7, 8이 빠진 파일 */
+    CHECK(table_open(dir, &t, &err) == 0);
+
+    /* BETWEEN: 양 끝 포함, 빈 번호는 건너뜀 */
+    CHECK(select_range(t, CMP_BETWEEN, 2, 5, ids, 8) == 3 && ids[0] == 2 && ids[1] == 3 && ids[2] == 5);
+    CHECK(select_range(t, CMP_BETWEEN, 4, 4, ids, 8) == 0);
+    CHECK(select_range(t, CMP_BETWEEN, 7, 8, ids, 8) == 0);
+    CHECK(select_range(t, CMP_BETWEEN, 6, 6, ids, 8) == 1 && ids[0] == 6);
+    CHECK(select_range(t, CMP_BETWEEN, 5, 2, ids, 8) == 0); /* 뒤집힘: 결과 없음 */
+    CHECK(select_range(t, CMP_BETWEEN, INT64_MIN, INT64_MAX, ids, 8) == 6);
+    CHECK(select_range(t, CMP_BETWEEN, -10, 1, ids, 8) == 1 && ids[0] == 1);
+    CHECK(select_range(t, CMP_BETWEEN, 9, INT64_MAX, ids, 8) == 1 && ids[0] == 9);
+    CHECK(select_range(t, CMP_BETWEEN, 10, INT64_MAX, ids, 8) == 0);
+
+    /* < <= > >= 경계 */
+    CHECK(select_range(t, CMP_LT, 3, 0, ids, 8) == 2 && ids[0] == 1 && ids[1] == 2);
+    CHECK(select_range(t, CMP_LE, 3, 0, ids, 8) == 3 && ids[2] == 3);
+    CHECK(select_range(t, CMP_GT, 5, 0, ids, 8) == 2 && ids[0] == 6 && ids[1] == 9);
+    CHECK(select_range(t, CMP_GE, 5, 0, ids, 8) == 3 && ids[0] == 5);
+    CHECK(select_range(t, CMP_LT, 1, 0, ids, 8) == 0);
+    CHECK(select_range(t, CMP_GT, 9, 0, ids, 8) == 0);
+    CHECK(select_range(t, CMP_GE, 4, 0, ids, 8) == 3 && ids[0] == 5); /* 없는 키에서 시작 */
+    CHECK(select_range(t, CMP_LE, 4, 0, ids, 8) == 3 && ids[2] == 3);
+    /* 64비트 끝: ±1이 넘치지 않고 빈 범위 / 전체가 된다 */
+    CHECK(select_range(t, CMP_LT, INT64_MIN, 0, ids, 8) == 0);
+    CHECK(select_range(t, CMP_GT, INT64_MAX, 0, ids, 8) == 0);
+    CHECK(select_range(t, CMP_LE, INT64_MAX, 0, ids, 8) == 6);
+    CHECK(select_range(t, CMP_GE, INT64_MIN, 0, ids, 8) == 6);
+    CHECK(select_range(t, CMP_LT, INT64_MAX, 0, ids, 8) == 6);
+    CHECK(select_range(t, CMP_GT, INT64_MIN, 0, ids, 8) == 6);
+
+    /* 계획: INDEX RANGE SCAN과 정규화된 범위 */
+    CHECK(executor_plan(t, &sel, &plan, &err) == 0);
+    CHECK(plan.kind == PLAN_INDEX_RANGE_SCAN && plan.where_op == CMP_BETWEEN);
+    CHECK(plan.where_value == 2 && plan.where_value2 == 5);
+    CHECK(plan.range.lo == 2 && plan.range.hi == 5 && !plan.range.empty);
+    sel.where_op = CMP_LT;
+    sel.where_value = 3;
+    CHECK(executor_plan(t, &sel, &plan, &err) == 0);
+    CHECK(plan.range.lo == INT64_MIN && plan.range.hi == 2 && !plan.range.empty);
+    sel.where_op = CMP_GT;
+    CHECK(executor_plan(t, &sel, &plan, &err) == 0);
+    CHECK(plan.range.lo == 4 && plan.range.hi == INT64_MAX && !plan.range.empty);
+    sel.where_value = INT64_MAX;
+    CHECK(executor_plan(t, &sel, &plan, &err) == 0 && plan.range.empty);
+    sel.where_op = CMP_BETWEEN;
+    sel.where_value = 5;
+    sel.where_value2 = 2;
+    CHECK(executor_plan(t, &sel, &plan, &err) == 0 && plan.range.empty);
+    CHECK(table_close(t, &err) == 0);
+}
+
+/* 같은 실행에서 INSERT한 레코드도 범위 조회에 바로 보이고, 결과가 선형 탐색과 같아야 한다. */
+static void test_executor_range_matches_scan(void) {
+    const char *dir = fresh_dir("exec_range_scan");
+    Table *t = NULL;
+    DbError err = {{0}};
+    char name[64];
+    int64_t id;
+    int i;
+    int lo;
+    int ok = 1;
+
+    CHECK(table_open(dir, &t, &err) == 0);
+    for (i = 1; i <= 300; i++) {
+        snprintf(name, sizeof name, "%.*s%d", 1 + i % 30, "abcdefghijklmnopqrstuvwxyz0123456789", i);
+        if (table_append(t, name, i % 151, &id, &err) != 0) {
+            ok = 0;
+        }
+    }
+    CHECK(ok);
+    /* 차수 64 기본 트리에서 리프 경계를 여러 번 넘는 범위들 */
+    for (lo = -3; lo <= 305 && ok; lo += 17) {
+        int hi;
+        for (hi = lo - 2; hi <= lo + 140; hi += 23) {
+            int expect = 0;
+            int got;
+            int64_t first = 0;
+            int64_t out[8];
+            int a = lo < 1 ? 1 : lo;
+            int b = hi > 300 ? 300 : hi;
+            if (a <= b) {
+                expect = b - a + 1;
+                first = a;
+            }
+            got = select_range(t, CMP_BETWEEN, lo, hi, out, 8);
+            if (got != expect || (expect > 0 && out[0] != first)) {
+                fprintf(stderr, "    BETWEEN %d AND %d: 기대 %d건, 실제 %d건\n", lo, hi, expect, got);
+                ok = 0;
+                break;
+            }
+        }
+    }
+    CHECK(ok);
+    CHECK(table_close(t, &err) == 0);
+}
+
+static void test_executor_range_reads_only_inside(void) {
+    /*
+     * 범위 조회는 범위 안의 줄만 읽는다. 열린 뒤 2번째 줄을 망가뜨리면
+     * BETWEEN 1 AND 1은 성공하고, 2를 포함하는 범위는 "인덱스 불일치"로 실패한다.
+     */
+    const char *dir = fresh_dir("exec_range_corrupt");
+    const char good[] = "1\ta\t25\n2\tb\t30\n";
+    Table *t = NULL;
+    DbError err = {{0}};
+    Statement r11 = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 1, 0, CMP_BETWEEN, 1};
+    Statement r12 = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 1, 0, CMP_BETWEEN, 2};
+    Statement empty = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 2, 0, CMP_BETWEEN, 1};
+    Collected c;
+    ResultSink sink = {NULL, collect_row, NULL, NULL};
+
+    write_file(dir, good, sizeof good - 1);
+    CHECK(table_open(dir, &t, &err) == 0);
+    corrupt_line2_behind_back(dir);
+
+    memset(&c, 0, sizeof c);
+    sink.ctx = &c;
+    CHECK(executor_run(t, &r11, &sink, &err) == 0);
+    CHECK(c.count == 1 && c.ids[0] == 1 && strcmp(c.names[0], "a") == 0);
+
+    memset(&c, 0, sizeof c);
+    CHECK(executor_run(t, &r12, &sink, &err) == -1);
+    CHECK(strstr(err.msg, "인덱스와 데이터 파일이 일치하지 않습니다") != NULL);
+    CHECK(c.count == 1); /* 1번은 이미 넘긴 뒤 2번에서 멈춤 */
+
+    memset(&c, 0, sizeof c);
+    CHECK(executor_run(t, &empty, &sink, &err) == 0 && c.count == 0); /* 빈 범위는 아무것도 읽지 않음 */
+
+    /* 형식은 멀쩡하지만 id가 다른 줄(같은 길이): 파싱은 통과하므로 id 재확인만이 잡는다 */
+    write_file(dir, "1\ta\t25\n7\tb\t30\n", 14);
+    memset(&c, 0, sizeof c);
+    CHECK(executor_run(t, &r12, &sink, &err) == -1);
+    CHECK(strstr(err.msg, "인덱스와 데이터 파일이 일치하지 않습니다") != NULL);
+    CHECK(c.count == 1 && c.ids[0] == 1);
     CHECK(table_close(t, &err) == 0);
 }
 
@@ -1130,6 +1366,110 @@ static void test_bpt_nomem_leaves_tree_unchanged(void) {
     bpt_test_fail_alloc_after(-1);
 }
 
+/* ---------- B+ 트리: 범위 순회 (P2-03) ---------- */
+
+typedef struct {
+    int count;
+    int64_t keys[4096];
+    int64_t values[4096];
+    int stop_after; /* 0이면 멈추지 않음 */
+} RangeCollect;
+
+static int collect_range(int64_t key, int64_t value, void *ctx) {
+    RangeCollect *rc = ctx;
+    if (rc->count < 4096) {
+        rc->keys[rc->count] = key;
+        rc->values[rc->count] = value;
+    }
+    rc->count++;
+    return (rc->stop_after != 0 && rc->count >= rc->stop_after) ? 7 : 0;
+}
+
+/* 키가 2, 4, 6, ..., 2n(짝수만)인 트리에서 [lo, hi] 결과가 직접 센 값과 같은지 */
+static int range_ok(const BpTree *t, int n, int64_t lo, int64_t hi) {
+    static RangeCollect rc;
+    int64_t k;
+    int i = 0;
+
+    rc.count = 0;
+    rc.stop_after = 0;
+    if (bpt_range(t, lo, hi, collect_range, &rc) != 0) {
+        return 0;
+    }
+    for (k = 2; k <= 2 * (int64_t)n; k += 2) {
+        if (k < lo || k > hi) {
+            continue;
+        }
+        if (i >= rc.count || rc.keys[i] != k || rc.values[i] != k * 10) {
+            return 0;
+        }
+        i++;
+    }
+    return i == rc.count;
+}
+
+static void test_bpt_range(void) {
+    static const int orders[] = {3, 4, 5, 64};
+    static const int sizes[] = {0, 1, 2, 3, 7, 50, 1000};
+    size_t oi;
+    size_t si;
+
+    for (oi = 0; oi < sizeof orders / sizeof orders[0]; oi++) {
+        for (si = 0; si < sizeof sizes / sizeof sizes[0]; si++) {
+            int n = sizes[si];
+            BpTree *t = bpt_create(orders[oi]);
+            int ok = 1;
+            int64_t lo;
+            int i;
+
+            CHECK(t != NULL);
+            if (t == NULL) {
+                continue;
+            }
+            for (i = 1; i <= n; i++) {
+                ok = ok && bpt_insert(t, 2 * (int64_t)i, 20 * (int64_t)i) == BPT_OK;
+            }
+            CHECK(ok);
+            /* 있는 키·없는 키(홀수)에서 시작/끝, 리프 경계를 넘는 범위, 뒤집힌 범위 */
+            for (lo = -1; lo <= 2 * (int64_t)n + 2 && ok; lo += (n > 100 ? 37 : 1)) {
+                int64_t hi;
+                for (hi = lo - 2; hi <= lo + 2 * (int64_t)n + 3; hi += (n > 100 ? 211 : 1)) {
+                    if (!range_ok(t, n, lo, hi)) {
+                        fprintf(stderr, "    차수 %d, 키 %d개, [%lld, %lld] 불일치\n", orders[oi], n,
+                                (long long)lo, (long long)hi);
+                        ok = 0;
+                        break;
+                    }
+                }
+            }
+            CHECK(ok);
+            CHECK(range_ok(t, n, INT64_MIN, INT64_MAX));
+            CHECK(range_ok(t, n, INT64_MAX, INT64_MAX));
+            CHECK(range_ok(t, n, INT64_MIN, INT64_MIN));
+            CHECK(range_ok(t, n, INT64_MAX, INT64_MIN));
+            bpt_destroy(t);
+        }
+    }
+
+    /* 콜백이 멈추라고 하면 바로 멈추고 그 값을 돌려준다 */
+    {
+        static RangeCollect rc;
+        BpTree *t = bpt_create(3);
+        int i;
+        CHECK(t != NULL);
+        if (t != NULL) {
+            for (i = 1; i <= 20; i++) {
+                bpt_insert(t, i, i);
+            }
+            memset(&rc, 0, sizeof rc);
+            rc.stop_after = 5;
+            CHECK(bpt_range(t, 3, 100, collect_range, &rc) == 7);
+            CHECK(rc.count == 5 && rc.keys[0] == 3 && rc.keys[4] == 7);
+            bpt_destroy(t);
+        }
+    }
+}
+
 /* ---------- Storage: id 인덱스 ---------- */
 
 static void test_storage_index_lookup(void) {
@@ -1263,6 +1603,8 @@ int main(int argc, char **argv) {
     test_parse_errors();
     test_parse_explain();
     test_parse_explain_errors();
+    test_parse_id_range();
+    test_parse_id_range_errors();
 
     test_storage_empty_then_append();
     test_storage_persist_and_restore_id();
@@ -1278,6 +1620,9 @@ int main(int argc, char **argv) {
     test_executor_id_uses_index_age_scans();
     test_executor_plan_paths_and_stats();
     test_executor_explain_does_not_execute();
+    test_executor_id_range();
+    test_executor_range_matches_scan();
+    test_executor_range_reads_only_inside();
 
     test_bpt_create_order_bounds();
     test_bpt_empty();
@@ -1286,6 +1631,7 @@ int main(int argc, char **argv) {
     test_bpt_random_order_and_duplicates();
     test_bpt_height_is_logarithmic();
     test_bpt_nomem_leaves_tree_unchanged();
+    test_bpt_range();
 
     test_storage_index_lookup();
     test_storage_index_rebuilt_on_open();

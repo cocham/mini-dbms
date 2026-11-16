@@ -192,6 +192,34 @@ int bpt_search(const BpTree *t, int64_t key, int64_t *out_value) {
     return 0;
 }
 
+int bpt_range(const BpTree *t, int64_t lo, int64_t hi, BptVisitFn fn, void *ctx) {
+    const BptNode *n = t->root;
+    int pos;
+
+    if (lo > hi) {
+        return 0;
+    }
+    /* 시작 리프: lo를 찾을 때와 같은 길로 내려간다. 구분 키 규칙상 lo 이상인 첫 키는
+     * 이 리프 안에 있거나, 이 리프에 없으면 바로 다음 리프의 첫 키다. */
+    while (!n->is_leaf) {
+        n = n->children[child_index(n, lo)];
+    }
+    pos = lower_bound(n, lo);
+    for (; n != NULL; n = n->next, pos = 0) {
+        for (; pos < n->nkeys; pos++) {
+            int r;
+            if (n->keys[pos] > hi) {
+                return 0; /* 리프 연결은 오름차순이라 이후 키는 모두 hi보다 크다 */
+            }
+            r = fn(n->keys[pos], n->values[pos], ctx);
+            if (r != 0) {
+                return r;
+            }
+        }
+    }
+    return 0;
+}
+
 size_t bpt_size(const BpTree *t) { return t->size; }
 int bpt_height(const BpTree *t) { return t->height; }
 int bpt_order(const BpTree *t) { return t->order; }

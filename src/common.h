@@ -9,7 +9,10 @@ typedef struct {
 
 /* err가 NULL이면 아무것도 하지 않는다. 메시지가 길면 잘린다. */
 void db_error_set(DbError *err, const char *fmt, ...)
-#if defined(__GNUC__)
+#if defined(__MINGW32__)
+    /* Windows 빌드는 __USE_MINGW_ANSI_STDIO=1로 C99 printf(%lld 등)를 쓰므로 그 규칙으로 검사한다 */
+    __attribute__((format(gnu_printf, 2, 3)))
+#elif defined(__GNUC__)
     __attribute__((format(printf, 2, 3)))
 #endif
     ;

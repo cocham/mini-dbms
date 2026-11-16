@@ -11,7 +11,8 @@
  * 재귀 하강 파서(parse_insert / parse_select)가 토큰 순서를 문법과 맞춰 본다.
  *
  * INSERT INTO users ( 컬럼 [, 컬럼] ) VALUES ( 값 [, 값] ) ;
- * SELECT * FROM users [ WHERE id|age = 정수 ] ;
+ * SELECT * FROM users [ WHERE 조건 ] ;
+ *   조건: id = 정수 | id (< <= > >=) 정수 | id BETWEEN 정수 AND 정수 | age = 정수
  * EXPLAIN SELECT ... ;   (EXPLAIN 뒤에는 SELECT만 올 수 있다)
  */
 
@@ -463,10 +464,49 @@ static int parse_insert(Parser *p, Statement *out) {
     return expect_end(p);
 }
 
-/* WHERE id|age = 정수. 현재 토큰이 WHERE인 상태에서 호출한다. */
+/* 현재 토큰이 정수면 *out에 담고 다음 토큰으로 넘어간다. */
+static int parse_where_int(Parser *p, const char *col, int64_t *out) {
+    if (p->cur.kind != TOK_INT) {
+        if (p->cur.kind == TOK_STRING || p->cur.kind == TOK_IDENT) {
+            db_error_set(p->err, "%s 조건에는 정수 값이 필요합니다", col);
+            return -1;
+        }
+        return syntax_error(p, "정수 값");
+    }
+    if (parse_where_value(p, col, out) != 0) {
+        return -1;
+    }
+    return advance(p);
+}
+
+/* 현재 토큰이 id 범위 비교 연산자(< <= > >=)면 *op에 담고 1, 아니면 0. */
+static int id_range_op(const Token *t, CmpOp *op) {
+    if (t->kind != TOK_CMP) {
+        return 0;
+    }
+    if (t->len == 1 && t->text[0] == '<') {
+        *op = CMP_LT;
+    } else if (t->len == 1 && t->text[0] == '>') {
+        *op = CMP_GT;
+    } else if (t->len == 2 && t->text[0] == '<' && t->text[1] == '=') {
+        *op = CMP_LE;
+    } else if (t->len == 2 && t->text[0] == '>' && t->text[1] == '=') {
+        *op = CMP_GE;
+    } else {
+        return 0; /* <> != ! */
+    }
+    return 1;
+}
+
+/*
+ * WHERE id = 정수 | id (< <= > >=) 정수 | id BETWEEN 정수 AND 정수 | age = 정수.
+ * 현재 토큰이 WHERE인 상태에서 호출한다.
+ */
 static int parse_where(Parser *p, Statement *out) {
     const char *col;
     int shown;
+    int is_id;
+    CmpOp op;
 
     if (advance(p) != 0) { /* WHERE */
         return -1;
@@ -475,10 +515,10 @@ static int parse_where(Parser *p, Statement *out) {
         return syntax_error(p, "조건 컬럼 이름");
     }
     if (tok_is(&p->cur, "id")) {
-        out->where = WHERE_ID;
+        is_id = 1;
         col = "id";
     } else if (tok_is(&p->cur, "age")) {
-        out->where = WHERE_AGE;
+        is_id = 0;
         col = "age";
     } else {
         shown = p->cur.len > 64 ? 64 : (int)p->cur.len;
@@ -492,23 +532,39 @@ static int parse_where(Parser *p, Statement *out) {
     if (advance(p) != 0) {
         return -1;
     }
-    if (p->cur.kind == TOK_CMP) {
-        db_error_set(p->err, "WHERE 조건은 '=' 비교만 지원합니다 (현재: %.*s)",
-                     (int)p->cur.len, p->cur.text);
-        return -1;
-    }
-    if (expect(p, TOK_EQ, "'='") != 0) {
-        return -1;
-    }
-    if (p->cur.kind != TOK_INT) {
-        if (p->cur.kind == TOK_STRING || p->cur.kind == TOK_IDENT) {
-            db_error_set(p->err, "%s 조건에는 정수 값이 필요합니다", col);
+
+    if (is_id && tok_is(&p->cur, "between")) {
+        /* id BETWEEN a AND b: 양 끝 포함. 여기의 AND는 복합 조건이 아니라 BETWEEN 문법의 일부다. */
+        out->where = WHERE_ID_RANGE;
+        out->where_op = CMP_BETWEEN;
+        if (advance(p) != 0 || parse_where_int(p, col, &out->where_value) != 0 ||
+            expect_word(p, "and", "BETWEEN의 AND") != 0 ||
+            parse_where_int(p, col, &out->where_value2) != 0) {
             return -1;
         }
-        return syntax_error(p, "정수 값");
-    }
-    if (parse_where_value(p, col, &out->where_value) != 0 || advance(p) != 0) {
+    } else if (is_id && id_range_op(&p->cur, &op)) {
+        out->where = WHERE_ID_RANGE;
+        out->where_op = op;
+        if (advance(p) != 0 || parse_where_int(p, col, &out->where_value) != 0) {
+            return -1;
+        }
+    } else if (p->cur.kind == TOK_CMP || tok_is(&p->cur, "between") || tok_is(&p->cur, "not")) {
+        shown = p->cur.len > 16 ? 16 : (int)p->cur.len;
+        if (is_id) {
+            db_error_set(p->err, "id 조건은 =, <, <=, >, >=, BETWEEN만 지원합니다 (현재: %.*s)",
+                         shown, p->cur.text);
+        } else {
+            db_error_set(p->err, "age 조건은 '=' 비교만 지원합니다 (현재: %.*s)", shown,
+                         p->cur.text);
+        }
         return -1;
+    } else {
+        out->where = is_id ? WHERE_ID : WHERE_AGE;
+        out->where_op = CMP_EQ;
+        if (expect(p, TOK_EQ, is_id ? "'=', 비교 연산자 또는 BETWEEN" : "'='") != 0 ||
+            parse_where_int(p, col, &out->where_value) != 0) {
+            return -1;
+        }
     }
     if (tok_is(&p->cur, "and") || tok_is(&p->cur, "or")) {
         db_error_set(p->err, "WHERE 조건은 하나만 지원합니다 (AND/OR 복합 조건은 지원하지 않음)");
@@ -552,6 +608,8 @@ int parser_next(const char *sql, size_t *pos, Statement *out, DbError *err) {
     out->where = WHERE_NONE;
     out->where_value = 0;
     out->explain = 0;
+    out->where_op = CMP_EQ;
+    out->where_value2 = 0;
 
     p.sql = sql;
     p.pos = *pos;

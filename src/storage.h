@@ -39,6 +39,11 @@ int table_scan(Table *t, RowFn fn, void *ctx, DbError *err);
  * 없으면 파일을 읽지 않고 fn 없이 0을 반환한다. 읽은 줄의 id가 다르면 -1(인덱스 불일치). */
 int table_find_by_id(Table *t, int64_t id, RowFn fn, void *ctx, DbError *err);
 
+/* id 인덱스로 lo ≤ id ≤ hi인 레코드를 id 오름차순으로 찾아 하나씩 fn을 호출한다(양 끝 포함).
+ * lo > hi거나 범위에 키가 없으면 파일을 읽지 않고 0. 범위 밖의 줄은 읽지 않는다.
+ * 읽은 줄의 id가 인덱스와 다르면 -1(인덱스 불일치). fn이 0이 아니면 멈추고 -1. */
+int table_find_id_range(Table *t, int64_t lo, int64_t hi, RowFn fn, void *ctx, DbError *err);
+
 /*
  * 인덱스 통계 (실행 계획용). 메모리의 B+ 트리에서 바로 읽는다.
  * table_open이 시작 시 파일 전체를 읽어 인덱스를 만든 뒤로는, 이 함수들이 파일을 추가로 읽지 않는다.

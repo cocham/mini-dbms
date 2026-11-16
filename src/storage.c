@@ -282,6 +282,70 @@ int table_find_by_id(Table *t, int64_t id, RowFn fn, void *ctx, DbError *err) {
     return 0;
 }
 
+/* table_find_id_range가 bpt_range 콜백으로 넘기는 상태 */
+typedef struct {
+    Table *t;
+    RowFn fn;
+    void *ctx;
+    DbError *err;
+    int64_t next_pos; /* 파일 포인터가 지금 있는 위치. -1이면 아직 이동 전 */
+} RangeRead;
+
+/*
+ * 리프에서 (id, 위치)를 하나 받을 때마다 그 줄을 읽는다.
+ * id가 증가 순서로 저장되므로 범위 안의 줄은 파일에서도 이어져 있다. 그래서 보통 첫 줄에서만
+ * fseek하고 나머지는 이어서 읽는다. 위치가 이어지지 않으면(예상 밖 상황) 그 위치로 다시 이동한다.
+ * 반환: 0 계속, 1 오류(err 설정 완료)
+ */
+static int range_visit(int64_t id, int64_t offset, void *vctx) {
+    RangeRead *rr = vctx;
+    char line[LINE_CAP];
+    size_t len;
+    const char *why = NULL;
+    Row row;
+    int r;
+
+    if (offset != rr->next_pos) {
+        if (offset > LONG_MAX) {
+            db_error_set(rr->err, "데이터 파일이 너무 커서 위치로 이동할 수 없습니다: %s", rr->t->path);
+            return 1;
+        }
+        if ((rr->next_pos < 0 && fflush(rr->t->fp) != 0) ||
+            fseek(rr->t->fp, (long)offset, SEEK_SET) != 0) {
+            db_error_set(rr->err, "데이터 파일 위치 이동 실패: %s (%s)", rr->t->path, strerror(errno));
+            return 1;
+        }
+    }
+    r = read_line(rr->t->fp, line, sizeof line, &len, &why);
+    if (r == -2) {
+        db_error_set(rr->err, "데이터 파일 읽기 실패: %s", rr->t->path);
+        return 1;
+    }
+    /* table_find_by_id와 같은 재확인: 열린 뒤 파일이 바뀌었으면 엉뚱한 행 대신 오류 */
+    if (r != 1 || parse_record(line, len, 0, &row, &why) != 0 || row.id != id) {
+        db_error_set(rr->err, "인덱스와 데이터 파일이 일치하지 않습니다: %s (id %" PRId64 ", 위치 %" PRId64 ")",
+                     rr->t->path, id, offset);
+        return 1;
+    }
+    rr->next_pos = offset + (int64_t)len + 1;
+    if (rr->fn != NULL && rr->fn(&row, rr->ctx) != 0) {
+        db_error_set(rr->err, "조회 결과 처리에 실패했습니다");
+        return 1;
+    }
+    return 0;
+}
+
+int table_find_id_range(Table *t, int64_t lo, int64_t hi, RowFn fn, void *ctx, DbError *err) {
+    RangeRead rr;
+
+    rr.t = t;
+    rr.fn = fn;
+    rr.ctx = ctx;
+    rr.err = err;
+    rr.next_pos = -1;
+    return bpt_range(t->index, lo, hi, range_visit, &rr) == 0 ? 0 : -1;
+}
+
 int table_append(Table *t, const char *name, int age, int64_t *out_id, DbError *err) {
     size_t name_len = strlen(name);
     int64_t id;

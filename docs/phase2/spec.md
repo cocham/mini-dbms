@@ -24,8 +24,8 @@ EXPLAIN SELECT * FROM users WHERE id = 777777;
 INDEX LOOKUP (id = 777777, B+ 트리 높이 4)          ← P2-02 형식(확정)
 EXPLAIN SELECT * FROM users WHERE age = 30;
 FULL SCAN (age = 30, 전체 행 수 1000000)            ← P2-02 형식(확정)
-SELECT * FROM users WHERE id BETWEEN 10 AND 12;
-  → INDEX RANGE SCAN (리프 연결을 따라 3건)          ← P2-03에서 확정
+EXPLAIN SELECT * FROM users WHERE id BETWEEN 10 AND 12;
+INDEX RANGE SCAN (id BETWEEN 10 AND 12, B+ 트리 높이 4)   ← P2-03 형식(확정). 결과 건수는 실행 측정값이라 넣지 않음
   조회 시간 0.00x ms / 2xx ms                         ← 실제 실행 측정값, --timing 형식은 P2-04에서 확정
 ```
 
@@ -69,7 +69,7 @@ flowchart TD
 | `WHERE age = 값`, 조건 없음 | 선형 탐색 | 변경 없음 |
 | 파일 손상 검출 | 시작 시 전체 검증 + 조회 시 전체 읽기 | 시작 시 전체 검증(인덱스 구축과 함께). id 조회는 읽은 줄의 id를 다시 확인해, 다르면 "인덱스와 데이터 파일이 일치하지 않습니다" 오류 |
 | `EXPLAIN SELECT ...` | 없음 | 실행 계획 한 줄 출력, 조회는 실행하지 않음 (P2-02, 아래 "EXPLAIN 계약") |
-| `WHERE id BETWEEN a AND b`, `id <`, `<=`, `>`, `>=` | 오류 | 인덱스 범위 조회 (P2-03, 문법·경계는 그 기능에서 확정). age는 계속 `=`만 |
+| `WHERE id BETWEEN a AND b`, `id <`, `<=`, `>`, `>=` | 오류 | 인덱스 범위 조회 (P2-03, 아래 "id 범위 조회 계약"). age는 계속 `=`만 |
 | 대량 데이터 생성 · 시간 측정 | 없음 | `tools/gen_sql.py`, `--timing` 등 (P2-04에서 확정) |
 
 ### EXPLAIN 계약 (P2-02 확정, 2026-11-16 사용자)
@@ -90,6 +90,20 @@ EXPLAIN SELECT * FROM users [ WHERE id|age = 정수 ] ;     -- 키워드 대소�
 - 경로는 조건의 종류만으로 정한다. 없는 id, 음수 id도 `INDEX LOOKUP`이다(키 존재 여부는 실행해야 안다).
 - EXPLAIN이 보여 주는 경로와 같은 문장을 실제로 실행할 때의 경로는 항상 같다(경로를 고르는 곳이 한 곳).
 - 오류: `EXPLAIN INSERT ...` → "EXPLAIN은 SELECT 문에만 사용할 수 있습니다", `EXPLAIN` 뒤에 SELECT가 아닌 것 → 구문 오류. 그 밖의 오류 규칙과 fail-fast는 일반 SELECT와 같다.
+
+### id 범위 조회 계약 (P2-03 확정, 2026-11-16 사용자)
+
+```text
+WHERE id BETWEEN a AND b      a ≤ id ≤ b (양 끝 포함)
+WHERE id < v | id <= v | id > v | id >= v
+```
+
+- 출력은 일반 SELECT와 같다: 헤더 + 범위 안의 행을 id 오름차순(= 저장 순서)으로. 같은 조건을 전체 조회에서 골라낸 결과와 바이트 단위로 같다.
+- 뒤집힌 범위(`BETWEEN 20 AND 10`)는 오류가 아니라 결과 없음(SQL 표준). 값은 64비트 정수 전체를 받고, `id < -9223372036854775808`·`id > 9223372036854775807`처럼 끝을 넘는 범위도 넘침 없이 결과 없음.
+- 범위 안의 줄만 읽는다. 시작 리프만 트리로 찾고 리프 연결을 따라가며, 파일에서는 첫 줄 위치로 한 번 이동한 뒤 이어 읽는다. 읽은 줄마다 id를 다시 확인해 다르면 "인덱스와 데이터 파일이 일치하지 않습니다".
+- EXPLAIN: `INDEX RANGE SCAN (조건, B+ 트리 높이 h)`. 조건은 사용자가 쓴 형태 그대로(`id BETWEEN 10 AND 20`, `id >= 5`). 결과 건수는 넣지 않는다(실행해야 아는 값).
+- `id = v`는 그대로 `INDEX LOOKUP`.
+- 오류: `id <>`·`!=`·`NOT BETWEEN` → "id 조건은 =, <, <=, >, >=, BETWEEN만 지원합니다", age의 비교·BETWEEN → "age 조건은 '=' 비교만 지원합니다", `BETWEEN a` 뒤 AND 누락 → 구문 오류, `BETWEEN a AND b` 뒤의 AND/OR → 복합 조건 미지원.
 
 SQL 문법, 출력 형식, 저장 파일 형식(users.tsv), 오류 규칙은 위 표 외에는 Phase 1과 같다. 결과 순서도 그대로 저장 순서(= id 오름차순)다.
 

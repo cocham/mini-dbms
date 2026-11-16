@@ -2,7 +2,7 @@
 
 ## 현재 상태
 
-P2-02 완료(2026-11-16). 다음은 P2-03.
+P2-03 완료(2026-11-16). 다음은 P2-04.
 
 진행 방식(2026-11-16 변경, DB-P2-D10): 한 단위 구현 → 단위·CLI 테스트와 메모리 검사로 검증 → 통과하면 바로 커밋하고 다음 단위. 사용자 동작이나 공개 인터페이스를 바꾸는 결정은 구현 전에 짧게 제안한다. 학습은 사용자의 별도 노트로 진행하며 진행 조건이 아니다. Phase 3는 시작하지 않는다.
 
@@ -11,7 +11,7 @@ P2-02 완료(2026-11-16). 다음은 P2-03.
 | P2-00 | 구현 전 결정 | design.md DB-P2-D01~D08 | 완료(2026-11-15) |
 | P2-01 | id 조회 최소 경로 | B+ 트리 삽입·분할·탐색, 시작 시 인덱스 구축, INSERT 시 등록, `WHERE id = ?`가 트리 → 위치 → 한 줄. spec B1~B4 | 완료(커밋 f331be6) |
 | P2-02 | EXPLAIN 실행 계획 | `EXPLAIN SELECT ...`가 INDEX LOOKUP / FULL SCAN과 계획 시점 통계(트리 높이, 전체 행 수)를 보여 줌. spec B5 | 완료 |
-| P2-03 | id 범위 조회 | `BETWEEN`, `<` `<=` `>` `>=`를 리프 연결로 처리, EXPLAIN에 INDEX RANGE SCAN. spec B6 | 대기 |
+| P2-03 | id 범위 조회 | `BETWEEN`, `<` `<=` `>` `>=`를 리프 연결로 처리, EXPLAIN에 INDEX RANGE SCAN. spec B6 | 완료 |
 | P2-04 | 100만 건과 성능 비교 | 대량 SQL 생성, 시작 비용과 조회 시간 분리 측정, 인덱스 vs 선형 탐색 결과 기록. spec B7 | 대기 |
 | P2-05 | 전체 검증·마무리 | Phase 1 회귀, 메모리 검사, 문서 정리. spec B8 | 대기 |
 
@@ -79,6 +79,35 @@ spec 대응:
 | ID | 테스트 |
 |---|---|
 | B5 | 단위 `test_parse_explain`·`_errors`, `test_executor_plan_paths_and_stats`(빈 테이블 높이 1·행 0, 키 63→64개에서 높이 1→2, 재시작 후 같은 통계, 없는 id·음수도 INDEX LOOKUP, INSERT 계획 거부), `test_executor_explain_does_not_execute`(열린 뒤 2번째 줄을 망가뜨려도 EXPLAIN은 성공·on_row 호출 없음, 같은 조건 실제 SELECT는 손상 보고, on_plan 실패 전파). CLI `p2_explain_paths_and_stats`, `p2_explain_does_not_execute`(헤더 없음, 파일 불변, SELECT와 섞임), `p2_explain_errors`(fail-fast, 앞선 출력·INSERT 유지) |
+
+## P2-03 — id 범위 조회
+
+**역할:** `WHERE id` 범위 조건을 B+ 트리의 리프 연결로 처리한다. 계약은 spec "id 범위 조회 계약", 설계는 design "id 범위 조회"(DB-P2-D11).
+
+- `src/parser.{h,c}`: `WHERE_ID_RANGE`, `CmpOp`(`= < <= > >= BETWEEN`), `Statement.where_op`·`where_value2`. age는 계속 `=`만.
+- `src/bptree.{h,c}`: `bpt_range(lo, hi, 콜백)` — 시작 리프만 루트에서 찾고 next 연결을 따라감.
+- `src/storage.{h,c}`: `table_find_id_range` — 첫 줄만 fseek, 이후 이어 읽기, 줄마다 id 재확인.
+- `src/executor.{h,c}`: `PLAN_INDEX_RANGE_SCAN`, `IdRange`(양 끝 포함 정규화, 64비트 끝 넘침 방지), `QueryPlan`에 `where_op`·`where_value2`·`range`. `row_matches`도 범위 조건 처리.
+- `src/main.c`: `INDEX RANGE SCAN (조건, B+ 트리 높이 h)`.
+- `src/common.h`: MinGW에서 `db_error_set` 형식 검사를 `gnu_printf`로. P2-01부터 있던 Windows `PRId64` 경고 5줄이 사라짐(동작 변경 없음).
+- 기존 테스트 변경: 위치 초기화 `Statement`에 새 필드 값, P2-02 테스트 중 `id > 1`·`id >= 1`을 오류로 기대하던 2곳을 `id <> 1`로(이제 유효한 문법이므로).
+
+**직접 확인:** `build/minidb --data-dir data/p2r examples/phase2_range.sql`
+
+**P2-03 검증 기록(2026-11-16)**
+
+| 명령 | 환경 | 결과 |
+|---|---|---|
+| `mingw32-make` | Windows, TDM-GCC | 경고 0 |
+| `mingw32-make test` | Windows | 단위 23,202개 검사 실패 0, CLI 40개 실패 0 |
+| `docker run --rm -v "$PWD:/src" -w /src gcc:13 bash -c "make clean; make sanitize"` | Linux, GCC 13, ASan/UBSan/LSan | 경고 0, 단위 23,202개·CLI 40개 실패 0, bpt_demo 정상, 검사 도구 보고 없음 |
+| 변이 확인 4종 | Windows | `bpt_range` 시작 위치 무시(59곳 실패), 범위 조회 id 재확인 제거(2곳), `id < v` 경계 포함(3곳), 뒤집힌 BETWEEN 무시(1곳) 모두 잡힘. 처음에 id 재확인 제거를 놓쳐 "형식은 정상이고 id만 다른 줄" 테스트를 추가함. 확인 후 원복 |
+
+spec 대응:
+
+| ID | 테스트 |
+|---|---|
+| B6 | 단위 `test_bpt_range`(차수 3·4·5·64 × 키 0~1000개, 없는 키에서 시작·끝, 리프 경계, 뒤집힘, INT64 끝, 콜백 멈춤 전파), `test_parse_id_range`·`_errors`, `test_executor_id_range`(빈 번호 파일, 모든 연산자 경계, INT64 끝 넘침 없음, 계획의 정규화 범위), `test_executor_range_matches_scan`(300건, 리프 경계를 넘는 범위 다수), `test_executor_range_reads_only_inside`(범위 밖 손상 줄은 읽지 않음, id만 다른 줄은 불일치 오류). CLI `p2_range_matches_full_scan`(전체 조회에서 골라낸 결과와 바이트 비교 17종), `p2_range_same_run_and_restart`, `p2_range_with_gaps_in_file`, `p2_range_explain`, `p2_range_errors`(fail-fast) |
 
 ## 공통 규칙 (Phase 1에서 이어짐)
 

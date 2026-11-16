@@ -42,6 +42,16 @@ int bpt_insert(BpTree *t, int64_t key, int64_t value);
 /* key를 찾으면 1을 반환하고 *out_value에 값을 담는다. 없으면 0. out_value는 NULL이어도 된다. */
 int bpt_search(const BpTree *t, int64_t key, int64_t *out_value);
 
+/* bpt_range가 키 하나마다 부르는 콜백. 0이면 계속, 0이 아니면 멈춘다. */
+typedef int (*BptVisitFn)(int64_t key, int64_t value, void *ctx);
+
+/*
+ * lo ≤ key ≤ hi인 키를 오름차순으로 fn에 넘긴다. lo > hi면 아무것도 하지 않는다.
+ * 루트에서는 lo가 있을 리프 하나만 찾고, 그다음은 리프의 next 연결을 따라 옆으로 걷는다: O(log N + K).
+ * fn이 0이 아닌 값을 반환하면 바로 멈추고 그 값을 반환한다. 끝까지 가면 0.
+ */
+int bpt_range(const BpTree *t, int64_t lo, int64_t hi, BptVisitFn fn, void *ctx);
+
 size_t bpt_size(const BpTree *t);   /* 저장된 키 개수 */
 int bpt_height(const BpTree *t);    /* 루트에서 리프까지 노드 수. 빈 트리도 리프 하나라 1 */
 int bpt_order(const BpTree *t);

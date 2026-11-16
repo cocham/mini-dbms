@@ -16,9 +16,17 @@
 
 /* SELECT가 탈 조회 경로. 경로를 고르는 곳은 executor_plan 한 곳뿐이다. */
 typedef enum {
-    PLAN_FULL_SCAN,   /* 파일을 처음부터 끝까지 읽으며 조건 검사 (조건 없음, WHERE age) */
-    PLAN_INDEX_LOOKUP /* B+ 트리로 바이트 위치를 찾아 그 한 줄만 읽음 (WHERE id = ?) */
+    PLAN_FULL_SCAN,       /* 파일을 처음부터 끝까지 읽으며 조건 검사 (조건 없음, WHERE age) */
+    PLAN_INDEX_LOOKUP,    /* B+ 트리로 바이트 위치를 찾아 그 한 줄만 읽음 (WHERE id = ?) */
+    PLAN_INDEX_RANGE_SCAN /* 시작 리프만 트리로 찾고 리프 연결을 따라 범위 안의 줄만 읽음 */
 } PlanKind;
+
+/* id 범위를 양 끝 포함 [lo, hi]로 정규화한 것. < <= > >= BETWEEN이 모두 이 형태가 된다. */
+typedef struct {
+    int64_t lo;
+    int64_t hi;
+    int empty; /* 1이면 어떤 id도 해당하지 않음 (BETWEEN 20 AND 10, id < INT64_MIN 등) */
+} IdRange;
 
 /*
  * 계획 시점 통계: 계획을 만들 때 메모리의 인덱스에서 읽은 값이다.
@@ -33,8 +41,11 @@ typedef struct {
 typedef struct {
     PlanKind kind;
     WhereKind where;     /* 계획이 다루는 조건 (Statement에서 복사) */
-    int64_t where_value; /* where가 WHERE_NONE이 아닐 때의 비교값 */
+    int64_t where_value; /* where가 WHERE_NONE이 아닐 때의 비교값. BETWEEN이면 아래쪽 끝 */
     PlanStats stats;     /* 계획 시점 통계. 경로와 상관없이 둘 다 채운다 */
+    CmpOp where_op;      /* 사용자가 쓴 비교 형태 (출력용) */
+    int64_t where_value2; /* CMP_BETWEEN의 위쪽 끝 (출력용) */
+    IdRange range;       /* PLAN_INDEX_RANGE_SCAN일 때 실제로 읽을 범위 */
 } QueryPlan;
 
 /*

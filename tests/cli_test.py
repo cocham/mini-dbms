@@ -511,7 +511,101 @@ def p2_explain_errors(env):
     eq(env.data(), b"1\ta\t1\n", "실패 후 파일")
     expect_fail(env.run("EXPLAIN;"), "문장 1", "EXPLAIN 뒤에 SELECT")
     expect_fail(env.run("EXPLAIN EXPLAIN SELECT * FROM users;"), "EXPLAIN 뒤에 SELECT")
-    expect_fail(env.run("EXPLAIN SELECT * FROM users WHERE id >= 1;"), "'='")
+    expect_fail(env.run("EXPLAIN SELECT * FROM users WHERE id <> 1;"), "BETWEEN만 지원")
+
+
+# ---------- Phase 2 / P2-03: id 범위 조회 ----------
+
+@test
+def p2_range_matches_full_scan(env):
+    # 인덱스 범위 조회 결과는 전체 조회에서 같은 범위를 골라낸 것과 바이트 단위로 같아야 한다.
+    people = many_people(300)
+    expect_ok(env.run(insert_sql(people)), b"INSERT 1\n" * 300)
+    code, out, err = env.run("SELECT * FROM users;")
+    eq((code, err), (0, b""), "전체 조회")
+    lines = out.split(b"\n")[1:-1]
+    by_id = {int(line.split(b"\t")[0]): line + b"\n" for line in lines}
+
+    def rows(lo, hi):
+        return b"".join(by_id[i] for i in sorted(by_id) if lo <= i <= hi)
+
+    cases = [
+        ("id BETWEEN 10 AND 20", 10, 20), ("id BETWEEN 1 AND 300", 1, 300),
+        ("id BETWEEN 0 AND 1", 0, 1), ("id BETWEEN 300 AND 999", 300, 999),
+        ("id BETWEEN 63 AND 65", 63, 65), ("id BETWEEN 20 AND 10", 1, 0),
+        ("id BETWEEN 301 AND 400", 1, 0), ("id < 5", -2**63, 4), ("id <= 5", -2**63, 5),
+        ("id > 295", 296, 2**63 - 1), ("id >= 295", 295, 2**63 - 1), ("id < 1", 1, 0),
+        ("id > 300", 1, 0), ("id <= -9223372036854775808", 1, 0),
+        ("id < -9223372036854775808", 1, 0), ("id > 9223372036854775807", 1, 0),
+        ("id >= -9223372036854775808", -2**63, 2**63 - 1),
+    ]
+    sql = "".join("SELECT * FROM users WHERE %s;" % c for c, _, _ in cases)
+    expected = b"".join(HEADER + rows(lo, hi) for _, lo, hi in cases)
+    expect_ok(env.run(sql), expected)
+
+
+@test
+def p2_range_same_run_and_restart(env):
+    # 같은 실행에서 방금 넣은 레코드도 범위에 보이고, 재시작 후에도 같다
+    expect_ok(env.run(TWO_INSERTS + "SELECT * FROM users WHERE id >= 2;"
+                      "INSERT INTO users (name, age) VALUES ('c', 3);"
+                      "SELECT * FROM users WHERE id between 2 and 3;"),
+              b"INSERT 1\nINSERT 1\n" + HEADER + u("2\tO'Brien\t30\n") +
+              b"INSERT 1\n" + HEADER + u("2\tO'Brien\t30\n3\tc\t3\n"))
+    expect_ok(env.run("SELECT * FROM users WHERE id <= 2;"), HEADER + TWO_ROWS)
+
+
+@test
+def p2_range_with_gaps_in_file(env):
+    os.makedirs(env.data_dir)
+    with open(env.data_file, "wb") as f:
+        f.write(u("1\ta\t1\n4\t넷\t4\n10\tten\t100\n"))
+    expect_ok(env.run("SELECT * FROM users WHERE id BETWEEN 2 AND 9;"
+                      "SELECT * FROM users WHERE id BETWEEN 5 AND 9;"
+                      "SELECT * FROM users WHERE id > 1;"),
+              HEADER + u("4\t넷\t4\n") + HEADER + HEADER + u("4\t넷\t4\n10\tten\t100\n"))
+
+
+@test
+def p2_range_explain(env):
+    expect_ok(env.run(TWO_INSERTS +
+                      "EXPLAIN SELECT * FROM users WHERE id BETWEEN 10 AND 20;"
+                      "explain select * from users where id between 20 and 10;"
+                      "EXPLAIN SELECT * FROM users WHERE id<5;"
+                      "EXPLAIN SELECT * FROM users WHERE id <= 5;"
+                      "EXPLAIN SELECT * FROM users WHERE id > -1;"
+                      "EXPLAIN SELECT * FROM users WHERE id >= 9223372036854775807;"
+                      "EXPLAIN SELECT * FROM users WHERE id = 5;"),
+              b"INSERT 1\nINSERT 1\n" +
+              u("INDEX RANGE SCAN (id BETWEEN 10 AND 20, B+ 트리 높이 1)\n"
+                "INDEX RANGE SCAN (id BETWEEN 20 AND 10, B+ 트리 높이 1)\n"
+                "INDEX RANGE SCAN (id < 5, B+ 트리 높이 1)\n"
+                "INDEX RANGE SCAN (id <= 5, B+ 트리 높이 1)\n"
+                "INDEX RANGE SCAN (id > -1, B+ 트리 높이 1)\n"
+                "INDEX RANGE SCAN (id >= 9223372036854775807, B+ 트리 높이 1)\n"
+                "INDEX LOOKUP (id = 5, B+ 트리 높이 1)\n"))
+
+
+RANGE_ERROR_CASES = [
+    ("SELECT * FROM users WHERE id <> 1;", "BETWEEN만 지원"),
+    ("SELECT * FROM users WHERE id != 1;", "BETWEEN만 지원"),
+    ("SELECT * FROM users WHERE id NOT BETWEEN 1 AND 2;", "BETWEEN만 지원"),
+    ("SELECT * FROM users WHERE age BETWEEN 1 AND 2;", "age 조건은 '='"),
+    ("SELECT * FROM users WHERE age < 3;", "age 조건은 '='"),
+    ("SELECT * FROM users WHERE id BETWEEN 1;", "BETWEEN의 AND"),
+    ("SELECT * FROM users WHERE id BETWEEN 1 AND 2 AND age = 1;", "AND/OR"),
+    ("SELECT * FROM users WHERE id BETWEEN 1 AND 9223372036854775808;", "64비트"),
+]
+
+
+@test
+def p2_range_errors(env):
+    for sql, needle in RANGE_ERROR_CASES:
+        expect_fail(env.run("INSERT INTO users (name, age) VALUES ('a', 1);" + sql +
+                            "INSERT INTO users (name, age) VALUES ('b', 2);"),
+                    "문장 2", needle, stdout=b"INSERT 1\n")
+    eq(env.data(), b"".join(u("%d\ta\t1\n" % (i + 1)) for i in range(len(RANGE_ERROR_CASES))),
+       "실패한 문장 뒤 INSERT는 실행되지 않음")
 
 
 @test

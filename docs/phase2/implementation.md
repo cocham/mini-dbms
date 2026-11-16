@@ -1,6 +1,6 @@
 # Phase 2 구현설명서
 
-위에서 아래로 읽는 지도. 기능이 하나 끝날 때마다 절이 늘어난다. 지금은 **P2-02(EXPLAIN)**까지 있다.
+위에서 아래로 읽는 지도. 기능이 하나 끝날 때마다 절이 늘어난다. 지금은 **P2-03(id 범위 조회)**까지 있다.
 
 ## 1. 무엇이 바뀌었나 — 한 장 요약
 
@@ -88,7 +88,6 @@ pos = lower_bound(n, key);                  /* 리프 안에서 이진 탐색 �
 
 ## 6. 다음 기능에서 이어질 절
 
-- 8절 범위 조회 — 리프 연결 리스트 걷기 (P2-03)
 - 9절 100만 건과 측정 — 시작 비용 vs 조회 비용 (P2-04)
 
 ## 7. EXPLAIN — 경로 선택을 바깥에서 보기 (P2-02)
@@ -122,3 +121,28 @@ CLI       print_plan: QueryPlan → 한 줄 문구
 `test_executor_explain_does_not_execute`가 이를 증명한다. 열린 뒤 2번째 줄을 망가뜨려도 `EXPLAIN ... WHERE age = 25`는 성공하고, 같은 조건의 실제 SELECT는 2번째 줄 손상을 보고한다.
 
 **①을 `executor_run`도 쓰는 이유:** EXPLAIN이 "INDEX LOOKUP"이라고 말하는데 실제 실행은 선형 탐색을 타는 일이 구조적으로 불가능해진다. P2-03의 INDEX RANGE SCAN도 ①에 분기 하나를 더하면 EXPLAIN과 실행에 동시에 반영된다.
+
+## 8. 범위 조회 — 리프 연결 리스트 걷기 (P2-03)
+
+```sql
+SELECT * FROM users WHERE id BETWEEN 2 AND 4;
+```
+
+```text
+Parser    WHERE_ID_RANGE, where_op = CMP_BETWEEN, where_value = 2, where_value2 = 4
+Executor  executor_plan → PLAN_INDEX_RANGE_SCAN, range = [2, 4]   (id < v → [INT64_MIN, v-1] 등으로 정규화)
+          executor_run  → range.empty면 끝, 아니면 table_find_id_range(2, 4)
+Storage   bpt_range(2, 4, range_visit)
+            ① 루트에서 2가 있을 리프까지 내려감 (bpt_search와 같은 길)
+            ② 리프 안 lower_bound(2)부터 키를 하나씩: 키 > 4면 끝
+            ③ 리프 끝이면 next로 옆 리프, pos = 0부터 계속
+          range_visit(id, 위치)
+            첫 키: fflush + fseek(위치) / 다음 키: 위치가 이어지면 그대로 read_line
+            parse_record → id 재확인 → print_row
+```
+
+**왜 루트로 다시 올라가지 않나:** 리프는 오름차순으로 `next`가 이어져 있어서, 시작점만 찾으면 나머지는 옆으로 걷기만 하면 된다. 그래서 비용은 O(log N + K)이다. `bpt_demo 3 7`의 "리프 연결" 줄이 이 길이다.
+
+**왜 파일에서도 한 번만 이동하나:** id는 증가 순서로만 저장되고(append 전용, 자동 증가) 모든 줄이 인덱스에 있으므로, 연속된 키는 파일에서도 바로 이웃한 줄이다. 줄마다 fseek하면 stdio 버퍼를 매번 버리게 된다.
+
+**넘침 주의:** `id < v`를 `[.., v-1]`로 바꿀 때 v가 INT64_MIN이면 `v-1`이 넘친다. 이때는 빈 범위로 처리한다(`id_range_of`).

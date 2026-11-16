@@ -1,5 +1,6 @@
 #include "executor.h"
 
+#include <stdint.h>
 #include <string.h>
 
 static int validate_insert(const Statement *st, DbError *err) {
@@ -31,8 +32,9 @@ static int validate_insert(const Statement *st, DbError *err) {
 }
 
 /*
- * SELECT ... WHERE: 조회 경로를 고르는 곳.
- *  - WHERE id = 값  → 인덱스 조회: B+ 트리로 위치를 찾아 그 한 줄만 읽는다 (Phase 2)
+ * SELECT ... WHERE: 조회 경로는 executor_plan 한 곳에서 고른다.
+ *  - WHERE id = 값        → 인덱스 조회: B+ 트리로 위치를 찾아 그 한 줄만 읽는다 (P2-01)
+ *  - WHERE id 범위         → 인덱스 범위 조회: 시작 리프만 찾고 리프 연결을 따라간다 (P2-03)
  *  - 그 밖(조건 없음, age) → 선형 탐색: Storage가 레코드를 하나씩 넘겨주면 조건에 맞는 것만 전달
  * Storage는 SQL 조건을 모르고, CLI는 어느 경로로 찾았는지 모른다.
  */
@@ -42,11 +44,51 @@ typedef struct {
     void *next_ctx;
 } FilterCtx;
 
+/* id 범위 조건을 양 끝 포함 [lo, hi]로 바꾼다. 64비트 끝에서 ±1이 넘치지 않게 빈 범위로 처리한다. */
+static IdRange id_range_of(const Statement *st) {
+    IdRange r = {INT64_MIN, INT64_MAX, 0};
+    int64_t v = st->where_value;
+
+    switch (st->where_op) {
+    case CMP_LT:
+        if (v == INT64_MIN) {
+            r.empty = 1;
+        } else {
+            r.hi = v - 1;
+        }
+        break;
+    case CMP_LE: r.hi = v; break;
+    case CMP_GT:
+        if (v == INT64_MAX) {
+            r.empty = 1;
+        } else {
+            r.lo = v + 1;
+        }
+        break;
+    case CMP_GE: r.lo = v; break;
+    case CMP_BETWEEN:
+        r.lo = v;
+        r.hi = st->where_value2;
+        r.empty = r.lo > r.hi; /* SQL 표준: 뒤집힌 BETWEEN은 오류가 아니라 결과 없음 */
+        break;
+    case CMP_EQ:
+        r.lo = v;
+        r.hi = v;
+        break;
+    }
+    return r;
+}
+
+/* 선형 탐색에서 쓰는 조건 검사. 인덱스 경로와 같은 결과를 내야 한다(테스트에서 비교). */
 static int row_matches(const Statement *st, const Row *row) {
     switch (st->where) {
     case WHERE_NONE: return 1;
     case WHERE_ID: return row->id == st->where_value;
     case WHERE_AGE: return (int64_t)row->age == st->where_value;
+    case WHERE_ID_RANGE: {
+        IdRange r = id_range_of(st);
+        return !r.empty && row->id >= r.lo && row->id <= r.hi;
+    }
     }
     return 0;
 }
@@ -66,9 +108,16 @@ int executor_plan(const Table *t, const Statement *st, QueryPlan *out, DbError *
         return -1;
     }
     /* 경로 선택 기준은 조건의 종류뿐이다. 값(where_value)이나 키 존재 여부는 보지 않는다. */
-    out->kind = st->where == WHERE_ID ? PLAN_INDEX_LOOKUP : PLAN_FULL_SCAN;
+    switch (st->where) {
+    case WHERE_ID: out->kind = PLAN_INDEX_LOOKUP; break;
+    case WHERE_ID_RANGE: out->kind = PLAN_INDEX_RANGE_SCAN; break;
+    default: out->kind = PLAN_FULL_SCAN; break;
+    }
     out->where = st->where;
     out->where_value = st->where_value;
+    out->where_op = st->where_op;
+    out->where_value2 = st->where_value2;
+    out->range = id_range_of(st);
     out->stats.tree_height = table_index_height(t);
     out->stats.total_rows = table_row_count(t);
     return 0;
@@ -107,6 +156,13 @@ int executor_run(Table *t, const Statement *st, const ResultSink *sink, DbError 
         case PLAN_INDEX_LOOKUP:
             return table_find_by_id(t, st->where_value, sink != NULL ? sink->on_row : NULL,
                                     sink != NULL ? sink->ctx : NULL, err);
+        case PLAN_INDEX_RANGE_SCAN:
+            if (plan.range.empty) {
+                return 0; /* 빈 범위: 트리도 파일도 보지 않는다 */
+            }
+            return table_find_id_range(t, plan.range.lo, plan.range.hi,
+                                       sink != NULL ? sink->on_row : NULL,
+                                       sink != NULL ? sink->ctx : NULL, err);
         case PLAN_FULL_SCAN:
             f.st = st;
             f.next = sink != NULL ? sink->on_row : NULL;

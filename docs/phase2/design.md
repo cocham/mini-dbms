@@ -13,6 +13,7 @@
 | DB-P2-D07 | Phase 1 계약 변경: `WHERE id`는 더 이상 파일 끝까지 읽지 않는다. 손상 검출은 시작 시 전체 검증 + 읽은 줄의 id 재확인으로 대신한다 | 적용(2026-11-15, 과제 요구 "ID 검색 시 인덱스 활용"의 직접 결과) |
 | DB-P2-D09 | EXPLAIN은 계획만 만들고 실행하지 않는다. 계획은 `QueryPlan` 구조체(경로 + 조건 + 계획 시점 통계 `PlanStats`)로 Executor가 만들고, 출력 문구는 CLI가 정한다. `executor_run`도 같은 `executor_plan`으로 경로를 고른다. 출력: `INDEX LOOKUP (id = 3, B+ 트리 높이 2)`, `FULL SCAN (age = 25, 전체 행 수 5)` | 확정(2026-11-16, 사용자. "전체 행 수" 문구, 계획 시점 통계와 실행 측정값 구분 지시) |
 | DB-P2-D10 | D04 변경: P2-02~P2-05는 단위 구현 → 테스트·메모리 검사로 검증 → 통과하면 바로 커밋·다음 단위. 인터페이스 변경 결정은 구현 전 제안. 학습은 별도 노트로, 진행 조건이 아니다 | 확정(2026-11-16, 사용자. 처음엔 Codex 검증 대기였으나 같은 날 자동 커밋으로 변경) |
+| DB-P2-D11 | id 범위 조회: `BETWEEN`(양 끝 포함)과 `< <= > >=`, id에만. 뒤집힌 범위는 결과 없음. 내부에서는 양 끝 포함 `IdRange[lo, hi]`로 정규화하고 `bpt_range`(시작 리프 + next 연결) → `table_find_id_range`(첫 줄만 fseek, 이후 이어 읽기). EXPLAIN은 `INDEX RANGE SCAN (원래 조건, B+ 트리 높이)`, 건수 없음 | 확정(2026-11-16, 사용자) |
 | DB-P2-D08 | 주 개발 환경을 macOS(Apple clang, make)로 옮긴다. Windows 빌드 경로는 Makefile에 유지. 메모리 검사는 Docker `gcc:13`에서 `make sanitize` | 적용(2026-11-15). macOS의 Apple clang ASan은 이 OS 버전에서 초기화 중 멈춰 사용하지 않는다 |
 
 ## 모듈 구성
@@ -107,6 +108,25 @@ int64_t table_row_count(const Table *t);  /* bpt_size: 모든 레코드가 인�
 | 경로는 조건 종류로만 | 실제 DB의 비용 기반 선택(선택도 추정 등)은 범위 밖. id 조건이면 항상 인덱스가 이득이고 그 밖에는 인덱스가 없다 |
 
 한계: 인덱스 등록만 메모리 부족으로 실패한 레코드(design "파일 위치와 일관성")는 파일에는 있지만 키 수에 빠져, 그 실행 동안 전체 행 수가 실제보다 작게 보일 수 있다. 이 경우 INSERT가 오류를 보고하므로 CLI는 fail-fast로 멈춘다.
+
+## id 범위 조회 (P2-03, DB-P2-D11)
+
+```text
+WHERE id >= 5  ─parser─▶  WHERE_ID_RANGE, where_op = CMP_GE, where_value = 5
+               ─executor_plan─▶  PLAN_INDEX_RANGE_SCAN, range = [5, INT64_MAX]
+               ─executor_run─▶  table_find_id_range(5, INT64_MAX)
+                                  └ bpt_range: 루트 → lo가 있을 리프 → next → next ... (키 > hi에서 멈춤)
+                                      └ range_visit: 첫 키 위치로 fseek, 다음부터는 이어서 read_line + id 재확인
+```
+
+| 결정 | 이유 |
+|---|---|
+| 비교 형태(`CmpOp`)와 정규화 범위(`IdRange`)를 둘 다 보관 | 실행은 한 가지 형태 `[lo, hi]`만 다루면 되고, EXPLAIN은 사용자가 쓴 형태를 그대로 보여 준다 |
+| 정규화에서 `v - 1`, `v + 1`이 넘칠 때는 빈 범위 | `id < INT64_MIN`, `id > INT64_MAX`가 오버플로로 전체 범위가 되는 것을 막는다 |
+| 뒤집힌 BETWEEN은 결과 없음 | SQL 표준과 같다. 빈 범위는 트리도 파일도 보지 않는다 |
+| 트리는 콜백 순회(`bpt_range`) | 트리 모듈은 여전히 파일을 모른다. 멈춤 신호로 오류를 바로 전파한다 |
+| 파일은 첫 줄에서만 이동 | id가 증가 순서로 저장되고 모든 줄이 인덱스에 있으므로, 연속된 키는 파일에서도 연속된 줄이다. 줄마다 fseek하면 stdio 버퍼를 매번 버린다. 위치가 이어지지 않으면 그 위치로 다시 이동한다 |
+| `row_matches`에도 범위 조건 | 선형 탐색으로 같은 조건을 처리할 때도 같은 결과가 나오게 한다(인덱스 경로와 비교 기준) |
 
 ## 시작 비용에 대한 주의
 
