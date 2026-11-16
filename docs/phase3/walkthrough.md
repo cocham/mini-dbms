@@ -21,7 +21,13 @@ docker run --rm -it -p 127.0.0.1:8080:8080 -v "${PWD}:/src" -w /src gcc:13 `
 
 ## 2. 요청 보내기
 
-**새 PowerShell 창**에서 실행한다. PowerShell의 `curl`은 다른 명령의 별칭이라 반드시 `curl.exe`라고 쓴다. 한글이 든 SQL은 파일로 보내는 것(`@파일`)이 안전하다. `-d` 대신 `--data-binary`를 쓰는 이유는 `-d`가 파일의 줄바꿈을 지우기 때문이다.
+**새 PowerShell 창**을 열고, **먼저 프로젝트 폴더로 이동한다.** 새 창은 보통 홈 폴더(`C:\Users\USER`)에서 열린다. 그런데 `@examples/...`는 지금 폴더를 기준으로 파일을 찾으므로, 이동하지 않으면 `curl: option --data-binary: error encountered when reading a file`이 난다.
+
+```powershell
+cd C:\Users\USER\Desktop\KraftonJungle\miniDBMS
+```
+
+PowerShell의 `curl`은 다른 명령의 별칭이라 반드시 `curl.exe`라고 쓴다. 한글이 든 SQL은 파일로 보내는 것(`@파일`)이 안전하다. `-d` 대신 `--data-binary`를 쓰는 이유는 `-d`가 파일의 줄바꿈을 지우기 때문이다.
 
 ### ① 살아 있나
 
