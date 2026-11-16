@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "bptree.h"
 #include "executor.h"
 #include "parser.h"
 #include "storage.h"
@@ -660,20 +661,12 @@ static void test_executor_where(void) {
     CHECK(table_close(t, &err) == 0);
 }
 
-static void test_executor_where_scans_whole_file(void) {
-    /* 선형 탐색은 일치하는 행을 찾은 뒤에도 끝까지 읽으므로 뒤쪽 손상도 오류로 보고한다. */
-    const char *dir = fresh_dir("exec_where_corrupt");
-    const char good[] = "1\ta\t25\n";
+static void corrupt_line2_behind_back(const char *dir) {
+    /* 열린 뒤 다른 경로로 2번째 줄이 손상된 상황 */
     const char bad[] = "1\ta\t25\n2\tb\n";
-    Table *t = NULL;
-    DbError err = {{0}};
-    Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID, 1};
     char path[600];
     FILE *fp;
 
-    write_file(dir, good, sizeof good - 1);
-    CHECK(table_open(dir, &t, &err) == 0);
-    /* 열린 뒤 다른 경로로 손상된 줄이 덧붙은 상황 */
     snprintf(path, sizeof path, "%s/users.tsv", dir);
     fp = fopen(path, "wb");
     CHECK(fp != NULL);
@@ -681,8 +674,399 @@ static void test_executor_where_scans_whole_file(void) {
         fwrite(bad, 1, sizeof bad - 1, fp);
         fclose(fp);
     }
-    CHECK(executor_run(t, &sel, NULL, &err) == -1);
+}
+
+static void test_executor_id_uses_index_age_scans(void) {
+    /*
+     * Phase 2: WHERE id는 인덱스로 그 줄 하나만 읽고, WHERE age는 끝까지 선형 탐색한다.
+     * 열린 뒤 2번째 줄을 망가뜨리면 id = 1은 성공하고(2번째 줄을 읽지 않으므로)
+     * age 조회는 2번째 줄에서 손상을 보고한다. 두 경로가 실제로 다르다는 증거다.
+     */
+    const char *dir = fresh_dir("exec_where_corrupt");
+    const char good[] = "1\ta\t25\n2\tb\t30\n";
+    Table *t = NULL;
+    DbError err = {{0}};
+    Statement by_id = {STMT_SELECT, NULL, 0, WHERE_ID, 1};
+    Statement by_id2 = {STMT_SELECT, NULL, 0, WHERE_ID, 2};
+    Statement by_age = {STMT_SELECT, NULL, 0, WHERE_AGE, 25};
+    Collected c;
+    ResultSink sink = {NULL, collect_row, NULL};
+
+    write_file(dir, good, sizeof good - 1);
+    CHECK(table_open(dir, &t, &err) == 0);
+    corrupt_line2_behind_back(dir);
+
+    memset(&c, 0, sizeof c);
+    sink.ctx = &c;
+    CHECK(executor_run(t, &by_id, &sink, &err) == 0);
+    CHECK(c.count == 1 && c.ids[0] == 1 && strcmp(c.names[0], "a") == 0 && c.ages[0] == 25);
+
+    /* 인덱스가 가리키는 줄이 바뀌었으면 엉뚱한 행을 돌려주지 않고 불일치로 보고한다 */
+    memset(&c, 0, sizeof c);
+    CHECK(executor_run(t, &by_id2, &sink, &err) == -1);
+    CHECK(strstr(err.msg, "인덱스와 데이터 파일이 일치하지 않습니다") != NULL);
+    CHECK(c.count == 0);
+
+    memset(&c, 0, sizeof c);
+    CHECK(executor_run(t, &by_age, &sink, &err) == -1);
     CHECK(strstr(err.msg, "2번째 줄") != NULL);
+    CHECK(table_close(t, &err) == 0);
+}
+
+/* ---------- B+ 트리 ---------- */
+
+#define EXPECT_VALID(t)                                                     \
+    do {                                                                    \
+        char why_[128] = "";                                                \
+        int ok_ = bpt_validate((t), why_, sizeof why_) == 0;                \
+        CHECK(ok_);                                                         \
+        if (!ok_) {                                                         \
+            fprintf(stderr, "    불변식 위반: %s\n", why_);                 \
+        }                                                                   \
+    } while (0)
+
+static void test_bpt_create_order_bounds(void) {
+    BpTree *t;
+
+    CHECK(bpt_create(BPT_MIN_ORDER - 1) == NULL);
+    CHECK(bpt_create(BPT_MAX_ORDER + 1) == NULL);
+    CHECK(bpt_create(0) == NULL);
+    CHECK(bpt_create(-5) == NULL);
+    t = bpt_create(BPT_MIN_ORDER);
+    CHECK(t != NULL && bpt_order(t) == BPT_MIN_ORDER);
+    bpt_destroy(t);
+    t = bpt_create(BPT_MAX_ORDER);
+    CHECK(t != NULL && bpt_order(t) == BPT_MAX_ORDER);
+    bpt_destroy(t);
+    bpt_destroy(NULL); /* NULL 해제는 아무것도 하지 않는다 */
+}
+
+static void test_bpt_empty(void) {
+    BpTree *t = bpt_create(4);
+    int64_t v = 777;
+
+    CHECK(t != NULL);
+    if (t == NULL) {
+        return;
+    }
+    CHECK(bpt_size(t) == 0);
+    CHECK(bpt_height(t) == 1);
+    CHECK(bpt_search(t, 1, &v) == 0);
+    CHECK(v == 777); /* 못 찾으면 값을 건드리지 않는다 */
+    CHECK(bpt_search(t, 0, NULL) == 0);
+    EXPECT_VALID(t);
+    bpt_destroy(t);
+}
+
+static void test_bpt_split_shapes(void) {
+    /* 차수 3(키 최대 2개): 손으로 그린 모양과 높이가 일치하는지 */
+    BpTree *t = bpt_create(3);
+    int64_t v;
+    int64_t k;
+
+    CHECK(t != NULL);
+    if (t == NULL) {
+        return;
+    }
+    CHECK(bpt_insert(t, 1, 100) == BPT_OK);
+    CHECK(bpt_insert(t, 2, 200) == BPT_OK);
+    CHECK(bpt_height(t) == 1); /* [1 2]: 아직 리프 하나 */
+    CHECK(bpt_insert(t, 3, 300) == BPT_OK);
+    CHECK(bpt_height(t) == 2); /* [1 2 3] 넘침 → [1 2] [3], 루트 [3] */
+    CHECK(bpt_insert(t, 4, 400) == BPT_OK);
+    CHECK(bpt_insert(t, 5, 500) == BPT_OK);
+    CHECK(bpt_height(t) == 2); /* 루트 [3 5]: 꽉 참 */
+    CHECK(bpt_insert(t, 6, 600) == BPT_OK);
+    CHECK(bpt_insert(t, 7, 700) == BPT_OK);
+    CHECK(bpt_height(t) == 3); /* 리프·루트 연쇄 분할 → 새 루트 [5] */
+    EXPECT_VALID(t);
+    for (k = 1; k <= 7; k++) {
+        CHECK(bpt_search(t, k, &v) == 1 && v == k * 100);
+    }
+    CHECK(bpt_search(t, 0, NULL) == 0);
+    CHECK(bpt_search(t, 8, NULL) == 0);
+    bpt_destroy(t);
+}
+
+static void test_bpt_sequential_many_orders(void) {
+    /* 자동 ID처럼 1, 2, 3...을 차례로 넣는다. 작은 차수일수록 분할이 많이 일어난다. */
+    static const int orders[] = {3, 4, 5, 8, 64};
+    size_t oi;
+
+    for (oi = 0; oi < sizeof orders / sizeof orders[0]; oi++) {
+        BpTree *t = bpt_create(orders[oi]);
+        int64_t k;
+        int all_found = 1;
+        int valid_each = 1;
+
+        CHECK(t != NULL);
+        if (t == NULL) {
+            continue;
+        }
+        for (k = 1; k <= 2000; k++) {
+            CHECK(bpt_insert(t, k, k * 10 + 1) == BPT_OK);
+            if (k <= 200 && bpt_validate(t, NULL, 0) != 0) {
+                valid_each = 0; /* 앞부분은 삽입할 때마다 전체 불변식을 확인한다 */
+            }
+        }
+        CHECK(valid_each);
+        EXPECT_VALID(t);
+        CHECK(bpt_size(t) == 2000);
+        for (k = 1; k <= 2000; k++) {
+            int64_t v = 0;
+            if (bpt_search(t, k, &v) != 1 || v != k * 10 + 1) {
+                all_found = 0;
+            }
+        }
+        CHECK(all_found);
+        CHECK(bpt_search(t, 0, NULL) == 0);
+        CHECK(bpt_search(t, -1, NULL) == 0);
+        CHECK(bpt_search(t, 2001, NULL) == 0);
+        CHECK(bpt_search(t, INT64_MAX, NULL) == 0);
+        CHECK(bpt_search(t, INT64_MIN, NULL) == 0);
+        bpt_destroy(t);
+    }
+}
+
+/* 결정적인 의사 난수 (테스트 재현용) */
+static uint64_t g_rng = 88172645463325252ULL;
+static uint64_t next_rand(void) {
+    g_rng ^= g_rng << 13;
+    g_rng ^= g_rng >> 7;
+    g_rng ^= g_rng << 17;
+    return g_rng;
+}
+
+static void test_bpt_random_order_and_duplicates(void) {
+    /* 섞인 순서·음수·극단값 키, 중복 삽입 거부 */
+    enum { N = 3000 };
+    static int64_t keys[N];
+    static const int orders[] = {3, 4, 7, 64};
+    size_t oi;
+    int i;
+
+    for (i = 0; i < N; i++) {
+        keys[i] = (int64_t)i * 7919 - 5000000; /* 서로 다른 값, 음수 포함 */
+    }
+    keys[0] = INT64_MIN;
+    keys[1] = INT64_MAX;
+    keys[2] = 0;
+    for (oi = 0; oi < sizeof orders / sizeof orders[0]; oi++) {
+        BpTree *t = bpt_create(orders[oi]);
+        int all_found = 1;
+        int64_t v;
+
+        CHECK(t != NULL);
+        if (t == NULL) {
+            continue;
+        }
+        for (i = N - 1; i > 0; i--) { /* Fisher-Yates 섞기 */
+            int j = (int)(next_rand() % (uint64_t)(i + 1));
+            int64_t tmp = keys[i];
+            keys[i] = keys[j];
+            keys[j] = tmp;
+        }
+        for (i = 0; i < N; i++) {
+            CHECK(bpt_insert(t, keys[i], keys[i] ^ 0x5a5a) == BPT_OK);
+        }
+        EXPECT_VALID(t);
+        CHECK(bpt_size(t) == N);
+        for (i = 0; i < N; i++) {
+            if (bpt_search(t, keys[i], &v) != 1 || v != (keys[i] ^ 0x5a5a)) {
+                all_found = 0;
+            }
+        }
+        CHECK(all_found);
+        /* 중복: 거부되고 크기·기존 값은 그대로 */
+        CHECK(bpt_insert(t, keys[10], 12345) == BPT_DUPLICATE);
+        CHECK(bpt_insert(t, INT64_MIN, 1) == BPT_DUPLICATE);
+        CHECK(bpt_size(t) == N);
+        CHECK(bpt_search(t, keys[10], &v) == 1 && v == (keys[10] ^ 0x5a5a));
+        CHECK(bpt_search(t, 1, NULL) == 0); /* 7919의 배수 - 5000000 꼴이 아닌 값 */
+        EXPECT_VALID(t);
+        bpt_destroy(t);
+    }
+}
+
+static void test_bpt_height_is_logarithmic(void) {
+    /* 차수 64로 10만 개: 리프가 절반만 차도(순차 삽입) 높이는 4 이하여야 한다 */
+    BpTree *t = bpt_create(64);
+    int64_t k;
+
+    CHECK(t != NULL);
+    if (t == NULL) {
+        return;
+    }
+    for (k = 1; k <= 100000; k++) {
+        if (bpt_insert(t, k, k) != BPT_OK) {
+            CHECK(0);
+            break;
+        }
+    }
+    CHECK(bpt_height(t) >= 3 && bpt_height(t) <= 4);
+    EXPECT_VALID(t);
+    bpt_destroy(t);
+}
+
+static void test_bpt_nomem_leaves_tree_unchanged(void) {
+    /*
+     * 차수 3에 1..6을 넣으면 루트 [3 5]와 리프 [5 6]이 모두 꽉 찬다.
+     * 여기에 7을 넣으면 리프 1개 + 내부 1개 + 새 루트 1개 = 노드 3개(할당 9번)가 필요하다.
+     * 몇 번째 할당에서 실패하든 트리는 삽입 전과 같아야 한다.
+     */
+    long fail_at;
+
+    for (fail_at = 0; fail_at <= 9; fail_at++) {
+        BpTree *t = bpt_create(3);
+        int64_t k;
+        int r;
+        int all_found = 1;
+
+        CHECK(t != NULL);
+        if (t == NULL) {
+            continue;
+        }
+        for (k = 1; k <= 6; k++) {
+            CHECK(bpt_insert(t, k, k) == BPT_OK);
+        }
+        CHECK(bpt_height(t) == 2);
+        bpt_test_fail_alloc_after(fail_at);
+        r = bpt_insert(t, 7, 7);
+        bpt_test_fail_alloc_after(-1);
+        if (fail_at < 9) {
+            CHECK(r == BPT_NOMEM);
+            CHECK(bpt_size(t) == 6);
+            CHECK(bpt_height(t) == 2);
+            CHECK(bpt_search(t, 7, NULL) == 0);
+            CHECK(bpt_insert(t, 7, 7) == BPT_OK); /* 메모리가 돌아오면 다시 넣을 수 있다 */
+        } else {
+            CHECK(r == BPT_OK); /* 9번 모두 성공하면 삽입 완료 */
+        }
+        CHECK(bpt_height(t) == 3);
+        for (k = 1; k <= 7; k++) {
+            if (bpt_search(t, k, NULL) != 1) {
+                all_found = 0;
+            }
+        }
+        CHECK(all_found);
+        EXPECT_VALID(t);
+        bpt_destroy(t);
+    }
+    /* 생성 자체의 할당 실패 */
+    bpt_test_fail_alloc_after(0);
+    CHECK(bpt_create(4) == NULL);
+    bpt_test_fail_alloc_after(1);
+    CHECK(bpt_create(4) == NULL);
+    bpt_test_fail_alloc_after(-1);
+}
+
+/* ---------- Storage: id 인덱스 ---------- */
+
+static void test_storage_index_lookup(void) {
+    const char *dir = fresh_dir("index_lookup");
+    Table *t = NULL;
+    DbError err = {{0}};
+    Collected c;
+    int64_t id;
+
+    CHECK(table_open(dir, &t, &err) == 0);
+    memset(&c, 0, sizeof c);
+    CHECK(table_find_by_id(t, 1, collect_row, &c, &err) == 0 && c.count == 0); /* 빈 테이블 */
+    CHECK(table_append(t, "민수", 25, &id, &err) == 0 && id == 1);
+    CHECK(table_append(t, "O'Brien", 30, &id, &err) == 0 && id == 2);
+    CHECK(table_append(t, "지영", 41, &id, &err) == 0 && id == 3);
+
+    /* 같은 실행 안에서 방금 추가한 레코드도 인덱스로 찾는다 */
+    memset(&c, 0, sizeof c);
+    CHECK(table_find_by_id(t, 2, collect_row, &c, &err) == 0);
+    CHECK(c.count == 1 && c.ids[0] == 2 && strcmp(c.names[0], "O'Brien") == 0 && c.ages[0] == 30);
+    memset(&c, 0, sizeof c);
+    CHECK(table_find_by_id(t, 3, collect_row, &c, &err) == 0);
+    CHECK(c.count == 1 && strcmp(c.names[0], "지영") == 0);
+    memset(&c, 0, sizeof c);
+    CHECK(table_find_by_id(t, 4, collect_row, &c, &err) == 0 && c.count == 0);
+    CHECK(table_find_by_id(t, 0, collect_row, &c, &err) == 0 && c.count == 0);
+    CHECK(table_find_by_id(t, -1, collect_row, &c, &err) == 0 && c.count == 0);
+    CHECK(table_find_by_id(t, 1, NULL, NULL, &err) == 0); /* 콜백 없음도 허용 */
+    /* 콜백이 멈추라고 하면 실패로 보고한다 (선형 탐색과 같은 규칙) */
+    memset(&c, 0, sizeof c);
+    c.stop_after = 1;
+    CHECK(table_find_by_id(t, 1, collect_row, &c, &err) == -1);
+    CHECK(table_close(t, &err) == 0);
+}
+
+static void test_storage_index_rebuilt_on_open(void) {
+    /* 인덱스는 메모리에만 있으므로, 다시 열면 파일에서 위치를 새로 계산해야 한다 */
+    const char *dir = fresh_dir("index_rebuild");
+    const char data[] = "1\t가\t1\n2\tbb\t22\n5\t다라마\t150\n9\tz\t0\n";
+    Table *t = NULL;
+    DbError err = {{0}};
+    Collected c;
+    int64_t id;
+
+    write_file(dir, data, sizeof data - 1); /* id 사이에 빈 번호가 있는 파일 */
+    CHECK(table_open(dir, &t, &err) == 0);
+    memset(&c, 0, sizeof c);
+    CHECK(table_find_by_id(t, 5, collect_row, &c, &err) == 0);
+    CHECK(c.count == 1 && strcmp(c.names[0], "다라마") == 0 && c.ages[0] == 150);
+    memset(&c, 0, sizeof c);
+    CHECK(table_find_by_id(t, 9, collect_row, &c, &err) == 0 && c.count == 1 && c.ages[0] == 0);
+    memset(&c, 0, sizeof c);
+    CHECK(table_find_by_id(t, 3, collect_row, &c, &err) == 0 && c.count == 0);
+    CHECK(table_append(t, "새", 7, &id, &err) == 0 && id == 10);
+    CHECK(table_close(t, &err) == 0);
+
+    CHECK(table_open(dir, &t, &err) == 0);
+    memset(&c, 0, sizeof c);
+    CHECK(table_find_by_id(t, 10, collect_row, &c, &err) == 0);
+    CHECK(c.count == 1 && strcmp(c.names[0], "새") == 0 && c.ages[0] == 7);
+    memset(&c, 0, sizeof c);
+    CHECK(table_find_by_id(t, 1, collect_row, &c, &err) == 0 && c.count == 1);
+    CHECK(strcmp(c.names[0], "가") == 0);
+    CHECK(table_close(t, &err) == 0);
+}
+
+static void test_storage_index_many_records(void) {
+    /* 길이가 제각각인 레코드 수천 건: 모든 위치가 정확해야 하고, 재시작 후에도 같아야 한다 */
+    enum { N = 5000 };
+    const char *dir = fresh_dir("index_many");
+    Table *t = NULL;
+    DbError err = {{0}};
+    char name[300];
+    int pass;
+    int i;
+
+    CHECK(table_open(dir, &t, &err) == 0);
+    for (i = 1; i <= N; i++) {
+        int64_t id;
+        int len = 1 + (i * 37) % 200;
+        memset(name, 'a' + i % 26, (size_t)len);
+        name[len] = '\0';
+        if (i % 3 == 0) {
+            memcpy(name, "한글", 6 < len ? 6 : 0); /* 여러 바이트 문자 섞기 */
+        }
+        if (table_append(t, name, i % 151, &id, &err) != 0 || id != i) {
+            CHECK(0);
+            break;
+        }
+    }
+    for (pass = 0; pass < 2; pass++) {
+        int ok = 1;
+        if (pass == 1) { /* 다시 열어 인덱스를 파일에서 재구성 */
+            CHECK(table_close(t, &err) == 0);
+            CHECK(table_open(dir, &t, &err) == 0);
+        }
+        for (i = N; i >= 1; i -= 7) {
+            Collected c;
+            int len = 1 + (i * 37) % 200;
+            memset(&c, 0, sizeof c);
+            if (table_find_by_id(t, i, collect_row, &c, &err) != 0 || c.count != 1 || c.ids[0] != i ||
+                c.ages[0] != i % 151 || strlen(c.names[0]) != (size_t)len) {
+                ok = 0;
+            }
+        }
+        CHECK(ok);
+    }
     CHECK(table_close(t, &err) == 0);
 }
 
@@ -719,7 +1103,19 @@ int main(int argc, char **argv) {
     test_executor_validation();
     test_executor_insert_select();
     test_executor_where();
-    test_executor_where_scans_whole_file();
+    test_executor_id_uses_index_age_scans();
+
+    test_bpt_create_order_bounds();
+    test_bpt_empty();
+    test_bpt_split_shapes();
+    test_bpt_sequential_many_orders();
+    test_bpt_random_order_and_duplicates();
+    test_bpt_height_is_logarithmic();
+    test_bpt_nomem_leaves_tree_unchanged();
+
+    test_storage_index_lookup();
+    test_storage_index_rebuilt_on_open();
+    test_storage_index_many_records();
 
     printf("단위 테스트: %d개 검사 중 %d개 실패\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

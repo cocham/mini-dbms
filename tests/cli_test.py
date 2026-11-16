@@ -350,7 +350,8 @@ def a7_data_file_is_directory(env):
 
 @test
 def a7_corrupted_line_after_match_still_fails(env):
-    # 선형 탐색은 일치 행을 찾은 뒤에도 끝까지 읽어 뒤쪽 손상을 보고한다.
+    # Phase 2: id 조회는 한 줄만 읽지만, 시작할 때(table_open) 파일 전체를 검증하며
+    # 인덱스를 만들기 때문에 뒤쪽 손상은 여전히 보고된다.
     os.makedirs(env.data_dir)
     with open(env.data_file, "wb") as f:
         f.write(b"1\ta\t25\n2\tb\t30\n3\tc\n")
@@ -375,6 +376,81 @@ def a7_stdout_write_failure(env):
 @test
 def a7_nul_byte_in_sql(env):
     expect_fail(env.run(b"SELECT * FROM users;\x00"), "NUL")
+
+
+# ---------- Phase 2 / P2-01: id 조회가 B+ 트리 인덱스를 거친다 ----------
+
+def many_people(n):
+    """이름 길이·문자 종류가 제각각인 n명. 바이트 위치가 줄마다 달라지게 한다."""
+    people = []
+    for i in range(1, n + 1):
+        name = ("민수" if i % 3 == 0 else "a" * (1 + i % 40)) + str(i)
+        if i % 7 == 0:
+            name = "O'Brien-" + name
+        people.append((i, name, i % 151))
+    return people
+
+
+def insert_sql(people):
+    return "".join("INSERT INTO users (name, age) VALUES ('%s', %d);\n" % (n.replace("'", "''"), a)
+                   for _, n, a in people)
+
+
+def row_bytes(person):
+    i, n, a = person
+    return u("%d\t%s\t%d\n" % (i, n, a))
+
+
+@test
+def p2_id_lookup_after_restart(env):
+    # 다른 실행에서 저장한 데이터: 시작할 때 파일에서 인덱스를 다시 만들어 찾는다.
+    people = many_people(300)
+    expect_ok(env.run(insert_sql(people)), b"INSERT 1\n" * 300)
+    for i in (1, 2, 150, 299, 300):
+        expect_ok(env.run("SELECT * FROM users WHERE id = %d;" % i), HEADER + row_bytes(people[i - 1]))
+    for i in (0, -5, 301, 9223372036854775807):
+        expect_ok(env.run("SELECT * FROM users WHERE id = %d;" % i), HEADER)
+
+
+@test
+def p2_id_lookup_same_run_after_insert(env):
+    # 같은 실행 안에서 INSERT 직후의 id도 인덱스에 등록돼 있어야 한다.
+    sql = ("INSERT INTO users (name, age) VALUES ('첫째', 10);"
+           "SELECT * FROM users WHERE id = 1;"
+           "INSERT INTO users (name, age) VALUES ('둘째', 20);"
+           "SELECT * FROM users WHERE id = 2;"
+           "SELECT * FROM users WHERE id = 3;")
+    expect_ok(env.run(sql), b"INSERT 1\n" + HEADER + u("1\t첫째\t10\n") +
+              b"INSERT 1\n" + HEADER + u("2\t둘째\t20\n") + HEADER)
+    expect_ok(env.run("INSERT INTO users (name, age) VALUES ('셋째', 30); SELECT * FROM users WHERE id = 3;"),
+              b"INSERT 1\n" + HEADER + u("3\t셋째\t30\n"))
+
+
+@test
+def p2_index_result_matches_full_scan(env):
+    # 인덱스 경로의 결과는 전체 조회에서 같은 id를 골라낸 것과 바이트 단위로 같아야 한다.
+    people = many_people(120)
+    expect_ok(env.run(insert_sql(people)), b"INSERT 1\n" * 120)
+    code, out, err = env.run("SELECT * FROM users;")
+    eq((code, err), (0, b""), "전체 조회")
+    lines = out.split(b"\n")[1:-1]
+    by_id = {int(line.split(b"\t")[0]): line + b"\n" for line in lines}
+    sql = "".join("SELECT * FROM users WHERE id = %d;" % i for i in range(1, 121, 9))
+    expected = b"".join(HEADER + by_id[i] for i in range(1, 121, 9))
+    expect_ok(env.run(sql), expected)
+
+
+@test
+def p2_id_lookup_with_gaps_in_file(env):
+    # 파일의 id는 증가 순서만 지키면 된다. 빈 번호는 인덱스에도 없다.
+    os.makedirs(env.data_dir)
+    with open(env.data_file, "wb") as f:
+        f.write(u("1\ta\t1\n4\t넷\t4\n10\tten\t100\n"))
+    expect_ok(env.run("SELECT * FROM users WHERE id = 4; SELECT * FROM users WHERE id = 5;"
+                      "SELECT * FROM users WHERE id = 10;"),
+              HEADER + u("4\t넷\t4\n") + HEADER + HEADER + b"10\tten\t100\n")
+    expect_ok(env.run("INSERT INTO users (name, age) VALUES ('b', 2); SELECT * FROM users WHERE id = 11;"),
+              b"INSERT 1\n" + HEADER + b"11\tb\t2\n")
 
 
 # ---------- 사용법 ----------

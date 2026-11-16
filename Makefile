@@ -1,13 +1,14 @@
 # 미니 DBMS 빌드 (DB-D04)
 #   Windows: mingw32-make (TDM-GCC)  — 빌드·단위·CLI 테스트
+#   macOS: make (Apple clang)        — 빌드·단위·CLI 테스트 (Phase 2부터 주 개발 환경)
 #   Linux/Docker: make               — 위 + sanitize(ASan/UBSan·누수 검사)
 
 CC = gcc
 CFLAGS = -std=c17 -Wall -Wextra -Wpedantic -Wshadow -Wstrict-prototypes -O2 -g
 SAN_FLAGS = -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all -O1 -g
 
-SRC = src/common.c src/parser.c src/storage.c src/executor.c
-HDR = src/common.h src/parser.h src/storage.h src/executor.h
+SRC = src/common.c src/parser.c src/bptree.c src/storage.c src/executor.c
+HDR = src/common.h src/parser.h src/bptree.h src/storage.h src/executor.h
 
 ifeq ($(OS),Windows_NT)
   SHELL := cmd.exe
@@ -25,10 +26,11 @@ endif
 
 BIN = build/minidb$(EXE)
 TEST_BIN = build/test_unit$(EXE)
+DEMO_BIN = build/bpt_demo$(EXE)
 
 .PHONY: all test unit cli sanitize clean
 
-all: $(BIN)
+all: $(BIN) $(DEMO_BIN)
 
 build:
 	mkdir build
@@ -36,8 +38,12 @@ build:
 $(BIN): $(SRC) src/main.c $(HDR) | build
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $(SRC) src/main.c
 
+# 학습용: B+ 트리 모양과 탐색 경로를 출력한다 (Phase 2)
+$(DEMO_BIN): src/bptree.c src/bptree.h tools/bpt_demo.c | build
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Isrc -o $@ src/bptree.c tools/bpt_demo.c
+
 $(TEST_BIN): $(SRC) tests/test_unit.c $(HDR) | build
-	$(CC) $(CFLAGS) $(CPPFLAGS) -Isrc -o $@ $(SRC) tests/test_unit.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DMINIDB_TESTING -Isrc -o $@ $(SRC) tests/test_unit.c
 
 test: unit cli
 
@@ -51,9 +57,11 @@ cli: $(BIN)
 sanitize:
 	mkdir -p build/san
 	$(CC) $(CFLAGS) $(SAN_FLAGS) -o build/san/minidb $(SRC) src/main.c
-	$(CC) $(CFLAGS) $(SAN_FLAGS) -Isrc -o build/san/test_unit $(SRC) tests/test_unit.c
+	$(CC) $(CFLAGS) $(SAN_FLAGS) -DMINIDB_TESTING -Isrc -o build/san/test_unit $(SRC) tests/test_unit.c
 	ASAN_OPTIONS=detect_leaks=1 build/san/test_unit build/san/tmp_unit
 	ASAN_OPTIONS=detect_leaks=1 $(PYTHON) tests/cli_test.py build/san/minidb
+	$(CC) $(CFLAGS) $(SAN_FLAGS) -Isrc -o build/san/bpt_demo src/bptree.c tools/bpt_demo.c
+	ASAN_OPTIONS=detect_leaks=1 build/san/bpt_demo --shuffle 5 500 1 250 500 999 > /dev/null
 
 clean:
 	$(RMDIR)

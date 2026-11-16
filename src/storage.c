@@ -1,7 +1,10 @@
 #include "storage.h"
 
+#include "bptree.h"
+
 #include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +28,7 @@ struct Table {
     FILE *fp;      /* "a+b": 읽기는 아무 위치에서, 쓰기는 항상 파일 끝 */
     char *path;
     int64_t last_id; /* 파일에 있는 최대 ID. 빈 테이블이면 0 */
+    BpTree *index;   /* id → 그 레코드 줄이 시작하는 바이트 위치. 메모리에만 있다 */
 };
 
 /* ---------- 레코드 읽기 ---------- */
@@ -126,6 +130,8 @@ static int parse_record(char *line, size_t len, int64_t prev_id, Row *row, const
     return 0;
 }
 
+static int scan_file(Table *t, BpTree *build, RowFn fn, void *ctx, DbError *err);
+
 /* ---------- 공개 함수 ---------- */
 
 int table_open(const char *data_dir, Table **out, DbError *err) {
@@ -160,8 +166,13 @@ int table_open(const char *data_dir, Table **out, DbError *err) {
         }
     }
 
-    /* 시작할 때 한 번만 전체를 검증하며 최대 ID를 복원한다. */
-    if (table_scan(t, NULL, NULL, err) != 0) {
+    /* 시작할 때 한 번만 전체를 검증하며 최대 ID를 복원하고, id 인덱스를 메모리에 다시 만든다. */
+    t->index = bpt_create(BPT_DEFAULT_ORDER);
+    if (t->index == NULL) {
+        db_error_set(err, "메모리가 부족합니다");
+        goto fail;
+    }
+    if (scan_file(t, t->index, NULL, NULL, err) != 0) {
         goto fail;
     }
     *out = t;
@@ -171,16 +182,23 @@ fail:
     if (t->fp != NULL) {
         fclose(t->fp);
     }
+    bpt_destroy(t->index);
     free(t->path);
     free(t);
     return -1;
 }
 
-int table_scan(Table *t, RowFn fn, void *ctx, DbError *err) {
+/*
+ * 파일을 처음부터 끝까지 한 줄씩 읽어 검증하고 fn을 호출한다.
+ * build가 NULL이 아니면 각 레코드의 (id, 줄 시작 바이트 위치)를 build 인덱스에 넣는다.
+ * 위치는 ftell 대신 직접 센다: 줄 길이 + LF 1바이트. 바이너리 모드라 바이트 수가 정확하다.
+ */
+static int scan_file(Table *t, BpTree *build, RowFn fn, void *ctx, DbError *err) {
     char line[LINE_CAP];
     size_t len;
     long lineno = 0;
     int64_t prev_id = 0;
+    int64_t offset = 0; /* 다음에 읽을 줄이 시작하는 바이트 위치 */
 
     /* 쓰기 직후 읽기로 바꿀 때는 flush/seek가 필요하다(C 표준 규칙). */
     if (fflush(t->fp) != 0 || fseek(t->fp, 0, SEEK_SET) != 0) {
@@ -190,6 +208,7 @@ int table_scan(Table *t, RowFn fn, void *ctx, DbError *err) {
     for (;;) {
         Row row;
         const char *why = NULL;
+        int64_t line_start = offset;
         int r = read_line(t->fp, line, sizeof line, &len, &why);
 
         if (r == 0) {
@@ -204,7 +223,13 @@ int table_scan(Table *t, RowFn fn, void *ctx, DbError *err) {
             db_error_set(err, "데이터 파일 손상: %s %ld번째 줄: %s", t->path, lineno, why);
             return -1;
         }
+        offset += (int64_t)len + 1;
         prev_id = row.id;
+        if (build != NULL && bpt_insert(build, row.id, line_start) != BPT_OK) {
+            /* id는 위에서 증가 순서를 확인했으므로 중복은 없다. 남은 원인은 메모리 부족뿐이다. */
+            db_error_set(err, "메모리가 부족해 인덱스를 만들 수 없습니다");
+            return -1;
+        }
         if (fn != NULL && fn(&row, ctx) != 0) {
             db_error_set(err, "조회 결과 처리에 실패했습니다");
             return -1;
@@ -214,9 +239,53 @@ int table_scan(Table *t, RowFn fn, void *ctx, DbError *err) {
     return 0;
 }
 
+int table_scan(Table *t, RowFn fn, void *ctx, DbError *err) {
+    return scan_file(t, NULL, fn, ctx, err);
+}
+
+int table_find_by_id(Table *t, int64_t id, RowFn fn, void *ctx, DbError *err) {
+    char line[LINE_CAP];
+    size_t len;
+    int64_t offset;
+    const char *why = NULL;
+    Row row;
+    int r;
+
+    /* 1) B+ 트리에서 id → 바이트 위치. 없으면 파일을 읽지 않고 끝난다. */
+    if (!bpt_search(t->index, id, &offset)) {
+        return 0;
+    }
+    if (offset > LONG_MAX) {
+        db_error_set(err, "데이터 파일이 너무 커서 위치로 이동할 수 없습니다: %s", t->path);
+        return -1;
+    }
+    /* 2) 그 위치로 바로 이동해 한 줄만 읽는다. */
+    if (fflush(t->fp) != 0 || fseek(t->fp, (long)offset, SEEK_SET) != 0) {
+        db_error_set(err, "데이터 파일 위치 이동 실패: %s (%s)", t->path, strerror(errno));
+        return -1;
+    }
+    r = read_line(t->fp, line, sizeof line, &len, &why);
+    if (r == -2) {
+        db_error_set(err, "데이터 파일 읽기 실패: %s", t->path);
+        return -1;
+    }
+    /* 3) 읽은 줄이 정말 그 id인지 확인한다. 열린 뒤 파일이 바뀌었으면 여기서 드러난다. */
+    if (r != 1 || parse_record(line, len, 0, &row, &why) != 0 || row.id != id) {
+        db_error_set(err, "인덱스와 데이터 파일이 일치하지 않습니다: %s (id %" PRId64 ", 위치 %" PRId64 ")",
+                     t->path, id, offset);
+        return -1;
+    }
+    if (fn != NULL && fn(&row, ctx) != 0) {
+        db_error_set(err, "조회 결과 처리에 실패했습니다");
+        return -1;
+    }
+    return 0;
+}
+
 int table_append(Table *t, const char *name, int age, int64_t *out_id, DbError *err) {
     size_t name_len = strlen(name);
     int64_t id;
+    long offset;
 
     /* 파일 형식을 깨는 값은 Executor 검증과 별개로 여기서도 막는다. */
     if (name_len == 0 || name_len > NAME_MAX_BYTES || strpbrk(name, "\t\r\n") != NULL ||
@@ -230,13 +299,21 @@ int table_append(Table *t, const char *name, int age, int64_t *out_id, DbError *
     }
     id = t->last_id + 1;
 
-    if (fseek(t->fp, 0, SEEK_END) != 0 ||
+    /* 새 줄이 시작할 위치(= 현재 파일 크기)를 기록 전에 구해 둔다. */
+    if (fseek(t->fp, 0, SEEK_END) != 0 || (offset = ftell(t->fp)) < 0 ||
         fprintf(t->fp, "%" PRId64 "\t%s\t%d\n", id, name, age) < 0 ||
         fflush(t->fp) != 0) {
         db_error_set(err, "데이터 파일 쓰기 실패: %s (%s)", t->path, strerror(errno));
         return -1;
     }
     t->last_id = id;
+    /* 파일에 기록한 뒤 인덱스에 등록한다. 실패는 메모리 부족뿐이고, 이때 레코드는 파일에 남는다.
+     * 다음 실행의 table_open이 파일에서 인덱스를 다시 만들므로 파일 기준으로는 일관된다. */
+    if (bpt_insert(t->index, id, (int64_t)offset) != BPT_OK) {
+        db_error_set(err, "메모리가 부족해 id %" PRId64 "를 인덱스에 등록하지 못했습니다 "
+                     "(레코드는 저장됨, 다시 실행하면 인덱스가 재구성됨)", id);
+        return -1;
+    }
     if (out_id != NULL) {
         *out_id = id;
     }
@@ -253,6 +330,7 @@ int table_close(Table *t, DbError *err) {
     if (rc != 0) {
         db_error_set(err, "데이터 파일 닫기 실패: %s (%s)", t->path, strerror(errno));
     }
+    bpt_destroy(t->index);
     free(t->path);
     free(t);
     return rc == 0 ? 0 : -1;

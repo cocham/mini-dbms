@@ -31,9 +31,10 @@ static int validate_insert(const Statement *st, DbError *err) {
 }
 
 /*
- * SELECT ... WHERE: Storage가 레코드를 하나씩 넘겨주면, 조건에 맞는 것만 원래 콜백에 전달한다.
- * Storage는 조건을 모르고, CLI는 조건이 있었는지 모른다. 여기가 조건 검사가 들어가는 유일한 곳이다.
- * Phase 1은 선형 탐색: 파일 전체를 끝까지 읽는다(뒤쪽 레코드의 손상도 함께 검출된다).
+ * SELECT ... WHERE: 조회 경로를 고르는 곳.
+ *  - WHERE id = 값  → 인덱스 조회: B+ 트리로 위치를 찾아 그 한 줄만 읽는다 (Phase 2)
+ *  - 그 밖(조건 없음, age) → 선형 탐색: Storage가 레코드를 하나씩 넘겨주면 조건에 맞는 것만 전달
+ * Storage는 SQL 조건을 모르고, CLI는 어느 경로로 찾았는지 모른다.
  */
 typedef struct {
     const Statement *st;
@@ -76,6 +77,10 @@ int executor_run(Table *t, const Statement *st, const ResultSink *sink, DbError 
     }
     case STMT_SELECT: {
         FilterCtx f;
+        if (st->where == WHERE_ID) {
+            return table_find_by_id(t, st->where_value, sink != NULL ? sink->on_row : NULL,
+                                    sink != NULL ? sink->ctx : NULL, err);
+        }
         f.st = st;
         f.next = sink != NULL ? sink->on_row : NULL;
         f.next_ctx = sink != NULL ? sink->ctx : NULL;
