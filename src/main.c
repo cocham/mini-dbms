@@ -111,6 +111,30 @@ static int print_row(const Row *row, void *ctx) {
     return printf("%" PRId64 "\t%s\t%d\n", row->id, row->name, row->age) < 0 ? -1 : 0;
 }
 
+/*
+ * EXPLAIN 한 줄. 괄호 안의 숫자는 계획 시점 통계(트리 높이, 전체 행 수)이며 실행 측정값이 아니다.
+ *   INDEX LOOKUP (id = 3, B+ 트리 높이 2)
+ *   FULL SCAN (age = 25, 전체 행 수 5)
+ *   FULL SCAN (조건 없음, 전체 행 수 5)
+ */
+static int print_plan(const QueryPlan *plan, void *ctx) {
+    char cond[64];
+    int n;
+
+    (void)ctx;
+    switch (plan->where) {
+    case WHERE_ID: snprintf(cond, sizeof cond, "id = %" PRId64, plan->where_value); break;
+    case WHERE_AGE: snprintf(cond, sizeof cond, "age = %" PRId64, plan->where_value); break;
+    default: snprintf(cond, sizeof cond, "조건 없음"); break;
+    }
+    if (plan->kind == PLAN_INDEX_LOOKUP) {
+        n = printf("INDEX LOOKUP (%s, B+ 트리 높이 %d)\n", cond, plan->stats.tree_height);
+    } else {
+        n = printf("FULL SCAN (%s, 전체 행 수 %" PRId64 ")\n", cond, plan->stats.total_rows);
+    }
+    return n < 0 ? -1 : 0;
+}
+
 static void report(long stmt_no, const DbError *err) {
     fflush(stdout); /* 앞선 결과가 오류 메시지보다 먼저 보이게 */
     if (stmt_no > 0) {
@@ -128,7 +152,7 @@ int main(int argc, char **argv) {
     size_t sql_len = 0;
     size_t pos = 0;
     Table *table = NULL;
-    ResultSink sink = {print_insert, print_row, NULL};
+    ResultSink sink = {print_insert, print_row, NULL, print_plan};
     long stmt_no = 0;
     int status = 0;
     int i;
@@ -198,7 +222,8 @@ int main(int argc, char **argv) {
             status = EXIT_FAIL;
             break;
         }
-        if (st.kind == STMT_SELECT && printf("id\tname\tage\n") < 0) {
+        /* EXPLAIN은 행을 출력하지 않으므로 헤더도 없다. */
+        if (st.kind == STMT_SELECT && !st.explain && printf("id\tname\tage\n") < 0) {
             db_error_set(&err, "결과 출력에 실패했습니다");
             rc = -1;
         }

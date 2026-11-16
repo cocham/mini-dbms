@@ -60,6 +60,20 @@ static int filter_row(const Row *row, void *ctx) {
     return f->next(row, f->next_ctx);
 }
 
+int executor_plan(const Table *t, const Statement *st, QueryPlan *out, DbError *err) {
+    if (st->kind != STMT_SELECT) {
+        db_error_set(err, "실행 계획은 SELECT 문에만 만들 수 있습니다");
+        return -1;
+    }
+    /* 경로 선택 기준은 조건의 종류뿐이다. 값(where_value)이나 키 존재 여부는 보지 않는다. */
+    out->kind = st->where == WHERE_ID ? PLAN_INDEX_LOOKUP : PLAN_FULL_SCAN;
+    out->where = st->where;
+    out->where_value = st->where_value;
+    out->stats.tree_height = table_index_height(t);
+    out->stats.total_rows = table_row_count(t);
+    return 0;
+}
+
 int executor_run(Table *t, const Statement *st, const ResultSink *sink, DbError *err) {
     switch (st->kind) {
     case STMT_INSERT: {
@@ -76,15 +90,31 @@ int executor_run(Table *t, const Statement *st, const ResultSink *sink, DbError 
         return 0;
     }
     case STMT_SELECT: {
+        QueryPlan plan;
         FilterCtx f;
-        if (st->where == WHERE_ID) {
+
+        if (executor_plan(t, st, &plan, err) != 0) {
+            return -1;
+        }
+        if (st->explain) {
+            if (sink != NULL && sink->on_plan != NULL && sink->on_plan(&plan, sink->ctx) != 0) {
+                db_error_set(err, "결과 출력에 실패했습니다");
+                return -1;
+            }
+            return 0;
+        }
+        switch (plan.kind) {
+        case PLAN_INDEX_LOOKUP:
             return table_find_by_id(t, st->where_value, sink != NULL ? sink->on_row : NULL,
                                     sink != NULL ? sink->ctx : NULL, err);
+        case PLAN_FULL_SCAN:
+            f.st = st;
+            f.next = sink != NULL ? sink->on_row : NULL;
+            f.next_ctx = sink != NULL ? sink->ctx : NULL;
+            return table_scan(t, filter_row, &f, err);
         }
-        f.st = st;
-        f.next = sink != NULL ? sink->on_row : NULL;
-        f.next_ctx = sink != NULL ? sink->ctx : NULL;
-        return table_scan(t, filter_row, &f, err);
+        db_error_set(err, "알 수 없는 실행 계획입니다");
+        return -1;
     }
     }
     db_error_set(err, "알 수 없는 문장 종류입니다");

@@ -12,6 +12,7 @@
  *
  * INSERT INTO users ( 컬럼 [, 컬럼] ) VALUES ( 값 [, 값] ) ;
  * SELECT * FROM users [ WHERE id|age = 정수 ] ;
+ * EXPLAIN SELECT ... ;   (EXPLAIN 뒤에는 SELECT만 올 수 있다)
  */
 
 typedef enum {
@@ -550,6 +551,7 @@ int parser_next(const char *sql, size_t *pos, Statement *out, DbError *err) {
     out->age = 0;
     out->where = WHERE_NONE;
     out->where_value = 0;
+    out->explain = 0;
 
     p.sql = sql;
     p.pos = *pos;
@@ -562,7 +564,20 @@ int parser_next(const char *sql, size_t *pos, Statement *out, DbError *err) {
         return 0;
     }
 
-    if (tok_is(&p.cur, "insert")) {
+    if (tok_is(&p.cur, "explain")) {
+        if (advance(&p) != 0) {
+            return -1;
+        }
+        if (tok_is(&p.cur, "select")) {
+            out->explain = 1;
+            rc = parse_select(&p, out);
+        } else if (tok_is(&p.cur, "insert")) {
+            db_error_set(err, "EXPLAIN은 SELECT 문에만 사용할 수 있습니다");
+            rc = -1;
+        } else {
+            rc = syntax_error(&p, "EXPLAIN 뒤에 SELECT");
+        }
+    } else if (tok_is(&p.cur, "insert")) {
         rc = parse_insert(&p, out);
     } else if (tok_is(&p.cur, "select")) {
         rc = parse_select(&p, out);

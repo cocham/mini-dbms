@@ -455,6 +455,65 @@ def p2_id_lookup_with_gaps_in_file(env):
 
 # ---------- 사용법 ----------
 
+# ---------- Phase 2 / P2-02: EXPLAIN 실행 계획 ----------
+
+@test
+def p2_explain_paths_and_stats(env):
+    # 빈 테이블: 리프 하나뿐인 트리(높이 1), 행 0
+    expect_ok(env.run("EXPLAIN SELECT * FROM users;"
+                      "EXPLAIN SELECT * FROM users WHERE id = 1;"),
+              u("FULL SCAN (조건 없음, 전체 행 수 0)\n"
+                "INDEX LOOKUP (id = 1, B+ 트리 높이 1)\n"))
+    # 기본 차수 64: 키 64개에서 첫 분할 → 높이 2. 같은 실행 안의 INSERT를 바로 반영한다
+    people = many_people(64)
+    expect_ok(env.run(insert_sql(people[:63]) +
+                      "EXPLAIN SELECT * FROM users WHERE id = 63;" +
+                      insert_sql(people[63:]) +
+                      "explain select * from users where ID = 64;"
+                      "EXPLAIN SELECT * FROM users WHERE age = 25;"
+                      "EXPLAIN SELECT * FROM users;"),
+              b"INSERT 1\n" * 63 +
+              u("INDEX LOOKUP (id = 63, B+ 트리 높이 1)\n") +
+              b"INSERT 1\n" +
+              u("INDEX LOOKUP (id = 64, B+ 트리 높이 2)\n"
+                "FULL SCAN (age = 25, 전체 행 수 64)\n"
+                "FULL SCAN (조건 없음, 전체 행 수 64)\n"))
+    # 재시작 후: 파일에서 다시 만든 인덱스의 통계. 없는 id·음수도 경로는 INDEX LOOKUP
+    expect_ok(env.run("EXPLAIN SELECT * FROM users WHERE id = 999;"
+                      "EXPLAIN SELECT * FROM users WHERE id = -5;"
+                      "EXPLAIN SELECT * FROM users WHERE age = 151;"),
+              u("INDEX LOOKUP (id = 999, B+ 트리 높이 2)\n"
+                "INDEX LOOKUP (id = -5, B+ 트리 높이 2)\n"
+                "FULL SCAN (age = 151, 전체 행 수 64)\n"))
+
+
+@test
+def p2_explain_does_not_execute(env):
+    # 행도 헤더도 출력하지 않고, 파일도 바꾸지 않는다. 일반 SELECT와 섞여도 각자 규칙대로 출력한다
+    expect_ok(env.run(TWO_INSERTS), b"INSERT 1\nINSERT 1\n")
+    expect_ok(env.run("EXPLAIN SELECT * FROM users WHERE id = 1;"
+                      "SELECT * FROM users WHERE id = 1;"
+                      "EXPLAIN SELECT * FROM users;"),
+              u("INDEX LOOKUP (id = 1, B+ 트리 높이 1)\n") + HEADER + u("1\t민수\t25\n") +
+              u("FULL SCAN (조건 없음, 전체 행 수 2)\n"))
+    eq(env.data(), TWO_ROWS, "EXPLAIN 후 파일")
+
+
+@test
+def p2_explain_errors(env):
+    # EXPLAIN은 SELECT에만. 실패한 문장 앞의 출력과 INSERT는 남는다(fail-fast)
+    expect_fail(env.run("INSERT INTO users (name, age) VALUES ('a', 1);"
+                        "EXPLAIN SELECT * FROM users;"
+                        "EXPLAIN INSERT INTO users (name, age) VALUES ('b', 2);"
+                        "INSERT INTO users (name, age) VALUES ('c', 3);"),
+                "문장 3", "SELECT 문에만",
+                stdout=u("INSERT 1\nFULL SCAN (조건 없음, 전체 행 수 1)\n"))
+    eq(env.data(), b"1\ta\t1\n", "실패 후 파일")
+    expect_fail(env.run("EXPLAIN;"), "문장 1", "EXPLAIN 뒤에 SELECT")
+    expect_fail(env.run("EXPLAIN EXPLAIN SELECT * FROM users;"), "EXPLAIN 뒤에 SELECT")
+    expect_fail(env.run("EXPLAIN SELECT * FROM users WHERE id >= 1;"), "'='")
+
+
 @test
 def usage_errors(env):
     code, out, err = env.run_args([])

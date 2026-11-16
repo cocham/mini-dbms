@@ -320,6 +320,11 @@ int table_append(Table *t, const char *name, int age, int64_t *out_id, DbError *
     return 0;
 }
 
+int table_index_height(const Table *t) { return bpt_height(t->index); }
+
+/* 모든 레코드가 인덱스에 등록되므로(table_open·table_append) 키 수가 곧 행 수다. */
+int64_t table_row_count(const Table *t) { return (int64_t)bpt_size(t->index); }
+
 int table_close(Table *t, DbError *err) {
     int rc;
 

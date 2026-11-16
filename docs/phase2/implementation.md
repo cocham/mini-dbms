@@ -1,6 +1,6 @@
 # Phase 2 구현설명서
 
-위에서 아래로 읽는 지도. 기능이 하나 끝날 때마다 절이 늘어난다. 지금은 **P2-01(id 조회 최소 경로)**까지 있다.
+위에서 아래로 읽는 지도. 기능이 하나 끝날 때마다 절이 늘어난다. 지금은 **P2-02(EXPLAIN)**까지 있다.
 
 ## 1. 무엇이 바뀌었나 — 한 장 요약
 
@@ -29,7 +29,7 @@ parser_next → executor_run 반복
 table_close        → bpt_destroy (트리는 메모리와 함께 사라짐)
 ```
 
-Parser와 CLI는 한 줄도 바뀌지 않았다. "어떤 경로로 찾을지"는 Executor가, "어디에 있는지"는 Storage가 안다.
+P2-01에서 Parser와 CLI는 한 줄도 바뀌지 않았다(P2-02에서 EXPLAIN 때문에 바뀜, 7절). "어떤 경로로 찾을지"는 Executor가, "어디에 있는지"는 Storage가 안다.
 
 ## 3. WHERE id = 3 — 트리를 거쳐 한 줄을 읽기까지
 
@@ -88,6 +88,37 @@ pos = lower_bound(n, key);                  /* 리프 안에서 이진 탐색 �
 
 ## 6. 다음 기능에서 이어질 절
 
-- 7절 EXPLAIN — 경로 선택을 바깥에서 보기 (P2-02)
 - 8절 범위 조회 — 리프 연결 리스트 걷기 (P2-03)
 - 9절 100만 건과 측정 — 시작 비용 vs 조회 비용 (P2-04)
+
+## 7. EXPLAIN — 경로 선택을 바깥에서 보기 (P2-02)
+
+```sql
+EXPLAIN SELECT * FROM users WHERE id = 3;    -- INDEX LOOKUP (id = 3, B+ 트리 높이 1)
+EXPLAIN SELECT * FROM users WHERE age = 25;  -- FULL SCAN (age = 25, 전체 행 수 3)
+```
+
+```text
+Parser    "EXPLAIN" 다음 "SELECT"면 parse_select + st.explain = 1   (EXPLAIN INSERT는 오류)
+    ↓
+CLI       st.explain이면 "id name age" 헤더를 찍지 않음
+    ↓
+Executor  executor_run(SELECT)
+  ① executor_plan(t, st, &plan)        경로 판단은 여기 한 곳: WHERE_ID → INDEX LOOKUP, 그 밖 → FULL SCAN
+       plan.stats.tree_height = table_index_height(t)   ← bpt_height, 메모리만 봄
+       plan.stats.total_rows  = table_row_count(t)      ← bpt_size,   메모리만 봄
+  ② st.explain이면 sink->on_plan(&plan) 후 끝     조회 실행 없음, 파일 접근 없음
+  ③ 아니면 plan.kind로 table_find_by_id / table_scan
+    ↓
+CLI       print_plan: QueryPlan → 한 줄 문구
+```
+
+| 타입 | 담는 것 | 담지 않는 것 |
+|---|---|---|
+| `QueryPlan` | 경로(`PlanKind`), 조건, `PlanStats` | 출력 문구(CLI 몫) |
+| `PlanStats` | 계획 시점 통계: 트리 높이, 전체 행 수 | 실행 측정값(시간 등, P2-04에서 별도 타입) |
+
+**"파일을 읽지 않는다"의 범위:** 시작할 때 `table_open`은 여전히 파일 전체를 읽어 인덱스를 만든다. EXPLAIN이 아끼는 것은 그 뒤의 읽기다. 계획 생성은 이미 메모리에 있는 트리에서 높이와 키 수만 꺼낸다.
+`test_executor_explain_does_not_execute`가 이를 증명한다. 열린 뒤 2번째 줄을 망가뜨려도 `EXPLAIN ... WHERE age = 25`는 성공하고, 같은 조건의 실제 SELECT는 2번째 줄 손상을 보고한다.
+
+**①을 `executor_run`도 쓰는 이유:** EXPLAIN이 "INDEX LOOKUP"이라고 말하는데 실제 실행은 선형 탐색을 타는 일이 구조적으로 불가능해진다. P2-03의 INDEX RANGE SCAN도 ①에 분기 하나를 더하면 EXPLAIN과 실행에 동시에 반영된다.

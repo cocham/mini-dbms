@@ -4,18 +4,19 @@ C로 SQL 파일을 실행하고 데이터를 파일에 저장하는 CLI(Phase 1)
 
 ## Phase 2 — B+ 트리 인덱스 (진행 중)
 
-현재 상태: **P2-01(id 조회 최소 경로) 구현·테스트 완료, 사용자 실습 대기.** `WHERE id = ?`는 B+ 트리에서 바이트 위치를 찾아 그 한 줄만 읽는다.
+현재 상태: **P2-02(EXPLAIN)까지 완료.** `WHERE id = ?`는 B+ 트리에서 바이트 위치를 찾아 그 한 줄만 읽고, `EXPLAIN SELECT ...`는 조회 없이 실행 계획(INDEX LOOKUP / FULL SCAN과 계획 시점 통계)을 보여 준다.
 
 1. [탑다운 학습 가이드](docs/phase2/learning.md): 결과물 → 전체 지도 → 기능별 실습. **여기서 시작**
 2. [개발 명세](docs/phase2/spec.md): 최종 결과, 데이터 흐름, Phase 1 대비 변경점
 3. [설계와 결정](docs/phase2/design.md): 오프셋 인덱스, 트리 구조, 일관성, 시작 비용
 4. [작업 목록](docs/phase2/tasks.md): P2-01~P2-05와 검증 기록
-5. [구현설명서](docs/phase2/implementation.md): id 조회 경로를 코드로 따라가기
+5. [구현설명서](docs/phase2/implementation.md): id 조회 경로와 EXPLAIN을 코드로 따라가기
 
 ```text
 make                                   # build/minidb, build/bpt_demo (macOS·Linux)
 make test                              # 단위 + CLI 통합 테스트
 mkdir -p data && build/minidb --data-dir data/p2 examples/phase2_id_lookup.sql
+build/minidb --data-dir data/p2e examples/phase2_explain.sql   # EXPLAIN 실행 계획
 build/bpt_demo 3 7 4                   # 차수 3 트리에 1~7을 넣은 모양과 id 4 탐색 경로
 docker run --rm -v "$PWD:/src" -w /src gcc:13 make sanitize   # ASan/UBSan/LSan
 ```

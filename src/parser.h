@@ -19,6 +19,7 @@ typedef struct {
     int age;             /* INSERT */
     WhereKind where;     /* SELECT */
     int64_t where_value; /* SELECT: where가 WHERE_NONE이 아닐 때 비교할 값 */
+    int explain;         /* SELECT: EXPLAIN SELECT ...이면 1. 계획만 만들고 조회는 실행하지 않는다 */
 } Statement;
 
 /*

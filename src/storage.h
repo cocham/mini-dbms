@@ -39,6 +39,14 @@ int table_scan(Table *t, RowFn fn, void *ctx, DbError *err);
  * 없으면 파일을 읽지 않고 fn 없이 0을 반환한다. 읽은 줄의 id가 다르면 -1(인덱스 불일치). */
 int table_find_by_id(Table *t, int64_t id, RowFn fn, void *ctx, DbError *err);
 
+/*
+ * 인덱스 통계 (실행 계획용). 메모리의 B+ 트리에서 바로 읽는다.
+ * table_open이 시작 시 파일 전체를 읽어 인덱스를 만든 뒤로는, 이 함수들이 파일을 추가로 읽지 않는다.
+ * 실제로 조회를 실행해서 잰 값이 아니라 "지금 실행하면 얼마나 읽게 될지"의 근거다.
+ */
+int table_index_height(const Table *t); /* B+ 트리 높이 = id 조회 한 번이 방문하는 노드 수. 빈 테이블도 1 */
+int64_t table_row_count(const Table *t); /* 전체 행 수 = 인덱스 키 수 = 선형 탐색이 읽는 줄 수 */
+
 /* 파일을 닫고 메모리를 해제한다. 실패해도 t는 해제된다. t가 NULL이면 0. */
 int table_close(Table *t, DbError *err);
 

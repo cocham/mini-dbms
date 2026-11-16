@@ -353,6 +353,49 @@ static void test_parse_errors(void) {
     EXPECT_PARSE_ERROR("INSERT INTO users (name, age) VALUES ('a', 1.5);", "알 수 없는 문자");
 }
 
+static void test_parse_explain(void) {
+    Statement st;
+    DbError err = {{0}};
+
+    CHECK(parse_one("EXPLAIN SELECT * FROM users WHERE id = 3;", &st, &err) == 1);
+    CHECK(st.kind == STMT_SELECT && st.explain == 1 && st.where == WHERE_ID && st.where_value == 3);
+    statement_free(&st);
+    CHECK(parse_one("explain /* c */ select * from USERS where AGE = 25;", &st, &err) == 1);
+    CHECK(st.kind == STMT_SELECT && st.explain == 1 && st.where == WHERE_AGE && st.where_value == 25);
+    statement_free(&st);
+    CHECK(parse_one("Explain\nSELECT * FROM users;", &st, &err) == 1);
+    CHECK(st.explain == 1 && st.where == WHERE_NONE);
+    statement_free(&st);
+    /* EXPLAIN이 없으면 0 */
+    CHECK(parse_one("SELECT * FROM users WHERE id = 3;", &st, &err) == 1 && st.explain == 0);
+    statement_free(&st);
+    CHECK(parse_one("INSERT INTO users (name, age) VALUES ('a', 1);", &st, &err) == 1);
+    CHECK(st.explain == 0);
+    statement_free(&st);
+    /* 앞 문장의 EXPLAIN이 다음 문장으로 이어지지 않는다 */
+    {
+        const char *sql = "EXPLAIN SELECT * FROM users; SELECT * FROM users;";
+        size_t pos = 0;
+        CHECK(parser_next(sql, &pos, &st, &err) == 1 && st.explain == 1);
+        statement_free(&st);
+        CHECK(parser_next(sql, &pos, &st, &err) == 1 && st.explain == 0);
+        statement_free(&st);
+    }
+}
+
+static void test_parse_explain_errors(void) {
+    EXPECT_PARSE_ERROR("EXPLAIN INSERT INTO users (name, age) VALUES ('a', 1);", "SELECT 문에만");
+    EXPECT_PARSE_ERROR("EXPLAIN;", "EXPLAIN 뒤에 SELECT");
+    EXPECT_PARSE_ERROR("EXPLAIN", "EXPLAIN 뒤에 SELECT");
+    EXPECT_PARSE_ERROR("EXPLAIN EXPLAIN SELECT * FROM users;", "EXPLAIN 뒤에 SELECT");
+    EXPECT_PARSE_ERROR("EXPLAIN UPDATE users SET age = 1;", "EXPLAIN 뒤에 SELECT");
+    EXPECT_PARSE_ERROR("SELECT EXPLAIN * FROM users;", "SELECT *");
+    /* EXPLAIN 뒤 SELECT의 오류 규칙은 일반 SELECT와 같다 */
+    EXPECT_PARSE_ERROR("EXPLAIN SELECT * FROM users", "세미콜론");
+    EXPECT_PARSE_ERROR("EXPLAIN SELECT * FROM users WHERE id > 1;", "'='");
+    EXPECT_PARSE_ERROR("EXPLAIN SELECT * FROM orders;", "테이블 'orders'");
+}
+
 /* ---------- Storage ---------- */
 
 static void test_storage_empty_then_append(void) {
@@ -523,7 +566,7 @@ static int count_insert(int64_t id, void *ctx) {
 
 static void expect_exec_error(Table *t, const char *name, int age, const char *needle) {
     char buf[300];
-    Statement st = {STMT_INSERT, NULL, 0, WHERE_NONE, 0};
+    Statement st = {STMT_INSERT, NULL, 0, WHERE_NONE, 0, 0};
     DbError err = {{0}};
 
     snprintf(buf, sizeof buf, "%s", name);
@@ -564,9 +607,9 @@ static void test_executor_validation(void) {
 
     /* 경계값은 성공한다. */
     {
-        Statement st = {STMT_INSERT, NULL, 0, WHERE_NONE, 0};
+        Statement st = {STMT_INSERT, NULL, 0, WHERE_NONE, 0, 0};
         int64_t last = 0;
-        ResultSink sink = {count_insert, NULL, &last};
+        ResultSink sink = {count_insert, NULL, &last, NULL};
 
         CHECK(table_open(dir, &t, &err) == 0);
         st.kind = STMT_INSERT;
@@ -587,14 +630,15 @@ static void test_executor_insert_select(void) {
     int64_t last = 0;
     char kim[] = "kim";
     char lee[] = "lee";
-    Statement ins = {STMT_INSERT, kim, 20, WHERE_NONE, 0};
-    Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0};
+    Statement ins = {STMT_INSERT, kim, 20, WHERE_NONE, 0, 0};
+    Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0};
     ResultSink sink;
 
     memset(&c, 0, sizeof c);
     sink.on_insert = count_insert;
     sink.on_row = collect_row;
     sink.ctx = &last;
+    sink.on_plan = NULL;
 
     CHECK(table_open(dir, &t, &err) == 0);
     CHECK(executor_run(t, &ins, &sink, &err) == 0 && last == 1);
@@ -613,8 +657,8 @@ static void test_executor_insert_select(void) {
 
 /* WHERE 조건으로 조회한 id 목록을 ids에 담고 개수를 돌려준다. */
 static int select_where(Table *t, WhereKind kind, int64_t value, int64_t *ids) {
-    Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0};
-    ResultSink sink = {NULL, collect_row, NULL};
+    Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0};
+    ResultSink sink = {NULL, collect_row, NULL, NULL};
     DbError err = {{0}};
     Collected c;
     int i;
@@ -686,11 +730,11 @@ static void test_executor_id_uses_index_age_scans(void) {
     const char good[] = "1\ta\t25\n2\tb\t30\n";
     Table *t = NULL;
     DbError err = {{0}};
-    Statement by_id = {STMT_SELECT, NULL, 0, WHERE_ID, 1};
-    Statement by_id2 = {STMT_SELECT, NULL, 0, WHERE_ID, 2};
-    Statement by_age = {STMT_SELECT, NULL, 0, WHERE_AGE, 25};
+    Statement by_id = {STMT_SELECT, NULL, 0, WHERE_ID, 1, 0};
+    Statement by_id2 = {STMT_SELECT, NULL, 0, WHERE_ID, 2, 0};
+    Statement by_age = {STMT_SELECT, NULL, 0, WHERE_AGE, 25, 0};
     Collected c;
-    ResultSink sink = {NULL, collect_row, NULL};
+    ResultSink sink = {NULL, collect_row, NULL, NULL};
 
     write_file(dir, good, sizeof good - 1);
     CHECK(table_open(dir, &t, &err) == 0);
@@ -709,6 +753,132 @@ static void test_executor_id_uses_index_age_scans(void) {
 
     memset(&c, 0, sizeof c);
     CHECK(executor_run(t, &by_age, &sink, &err) == -1);
+    CHECK(strstr(err.msg, "2번째 줄") != NULL);
+    CHECK(table_close(t, &err) == 0);
+}
+
+/* ---------- Executor: 실행 계획 (EXPLAIN) ---------- */
+
+typedef struct {
+    int calls;
+    QueryPlan last;
+    int fail; /* 1이면 on_plan이 실패를 돌려준다 */
+} PlanCapture;
+
+static int capture_plan(const QueryPlan *plan, void *ctx) {
+    PlanCapture *pc = ctx;
+    pc->calls++;
+    pc->last = *plan;
+    return pc->fail;
+}
+
+/* EXPLAIN 테스트에서 on_row가 불리면 실패로 표시한다. */
+static int row_must_not_be_called(const Row *row, void *ctx) {
+    (void)row;
+    (void)ctx;
+    CHECK(0);
+    return 0;
+}
+
+static void test_executor_plan_paths_and_stats(void) {
+    const char *dir = fresh_dir("exec_plan");
+    Table *t = NULL;
+    DbError err = {{0}};
+    Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0};
+    Statement ins = {STMT_INSERT, NULL, 0, WHERE_NONE, 0, 0};
+    QueryPlan plan;
+    char name[] = "a";
+    int i;
+
+    CHECK(table_open(dir, &t, &err) == 0);
+
+    /* 빈 테이블: 리프 하나뿐이라 높이 1, 행 0 */
+    CHECK(executor_plan(t, &sel, &plan, &err) == 0);
+    CHECK(plan.kind == PLAN_FULL_SCAN && plan.where == WHERE_NONE);
+    CHECK(plan.stats.tree_height == 1 && plan.stats.total_rows == 0);
+
+    /* 경로는 조건의 종류만으로 정해진다. 없는 id·범위 밖 값도 INDEX LOOKUP */
+    sel.where = WHERE_ID;
+    sel.where_value = 99;
+    CHECK(executor_plan(t, &sel, &plan, &err) == 0);
+    CHECK(plan.kind == PLAN_INDEX_LOOKUP && plan.where == WHERE_ID && plan.where_value == 99);
+    sel.where_value = -1;
+    CHECK(executor_plan(t, &sel, &plan, &err) == 0 && plan.kind == PLAN_INDEX_LOOKUP);
+    sel.where = WHERE_AGE;
+    sel.where_value = 25;
+    CHECK(executor_plan(t, &sel, &plan, &err) == 0);
+    CHECK(plan.kind == PLAN_FULL_SCAN && plan.where == WHERE_AGE && plan.where_value == 25);
+
+    /* 통계는 같은 실행 안의 INSERT를 바로 반영한다. 기본 차수 64: 키 64개에서 첫 분할 */
+    ins.name = name;
+    ins.age = 1;
+    for (i = 0; i < 63; i++) {
+        CHECK(executor_run(t, &ins, NULL, &err) == 0);
+    }
+    CHECK(executor_plan(t, &sel, &plan, &err) == 0);
+    CHECK(plan.stats.tree_height == 1 && plan.stats.total_rows == 63);
+    CHECK(executor_run(t, &ins, NULL, &err) == 0);
+    CHECK(executor_plan(t, &sel, &plan, &err) == 0);
+    CHECK(plan.stats.tree_height == 2 && plan.stats.total_rows == 64);
+    CHECK(table_index_height(t) == 2 && table_row_count(t) == 64);
+    CHECK(table_close(t, &err) == 0);
+
+    /* 재시작 후: 파일에서 다시 만든 인덱스의 통계 */
+    CHECK(table_open(dir, &t, &err) == 0);
+    CHECK(executor_plan(t, &sel, &plan, &err) == 0);
+    CHECK(plan.stats.tree_height == 2 && plan.stats.total_rows == 64);
+
+    /* INSERT에는 계획이 없다 */
+    CHECK(executor_plan(t, &ins, &plan, &err) == -1);
+    CHECK(strstr(err.msg, "SELECT 문에만") != NULL);
+    CHECK(table_close(t, &err) == 0);
+}
+
+static void test_executor_explain_does_not_execute(void) {
+    /*
+     * EXPLAIN은 계획만 넘기고 조회를 실행하지 않는다.
+     * 열린 뒤 2번째 줄을 망가뜨려도 EXPLAIN ... WHERE age는 성공한다(계획 생성은 파일을 읽지 않으므로).
+     * 같은 조건의 실제 SELECT는 2번째 줄에서 손상을 보고한다.
+     */
+    const char *dir = fresh_dir("exec_explain");
+    const char good[] = "1\ta\t25\n2\tb\t30\n";
+    Table *t = NULL;
+    DbError err = {{0}};
+    Statement ex_age = {STMT_SELECT, NULL, 0, WHERE_AGE, 25, 1};
+    Statement ex_id = {STMT_SELECT, NULL, 0, WHERE_ID, 2, 1};
+    Statement sel_age = {STMT_SELECT, NULL, 0, WHERE_AGE, 25, 0};
+    Collected c;
+    PlanCapture pc;
+    ResultSink sink = {NULL, row_must_not_be_called, NULL, capture_plan};
+    ResultSink rows_only = {NULL, row_must_not_be_called, NULL, NULL};
+    ResultSink collect = {NULL, collect_row, NULL, NULL};
+
+    write_file(dir, good, sizeof good - 1);
+    CHECK(table_open(dir, &t, &err) == 0);
+    corrupt_line2_behind_back(dir);
+
+    memset(&pc, 0, sizeof pc);
+    sink.ctx = &pc;
+    CHECK(executor_run(t, &ex_age, &sink, &err) == 0);
+    CHECK(pc.calls == 1 && pc.last.kind == PLAN_FULL_SCAN && pc.last.where == WHERE_AGE);
+    CHECK(pc.last.where_value == 25 && pc.last.stats.total_rows == 2);
+    CHECK(executor_run(t, &ex_id, &sink, &err) == 0); /* 가리키는 줄이 바뀌었어도 계획은 성공 */
+    CHECK(pc.calls == 2 && pc.last.kind == PLAN_INDEX_LOOKUP && pc.last.where_value == 2);
+    CHECK(pc.last.stats.tree_height == 1);
+
+    /* on_plan이 없거나 sink가 없어도 성공하고, on_row는 부르지 않는다 */
+    CHECK(executor_run(t, &ex_age, &rows_only, &err) == 0);
+    CHECK(executor_run(t, &ex_age, NULL, &err) == 0);
+
+    /* 출력 콜백 실패는 실패로 보고한다 */
+    pc.fail = 1;
+    CHECK(executor_run(t, &ex_age, &sink, &err) == -1);
+    CHECK(strstr(err.msg, "출력") != NULL);
+
+    /* 실제 SELECT는 같은 조건에서 파일을 읽어 손상을 보고한다 */
+    memset(&c, 0, sizeof c);
+    collect.ctx = &c;
+    CHECK(executor_run(t, &sel_age, &collect, &err) == -1);
     CHECK(strstr(err.msg, "2번째 줄") != NULL);
     CHECK(table_close(t, &err) == 0);
 }
@@ -1091,6 +1261,8 @@ int main(int argc, char **argv) {
     test_parse_where_errors();
     test_parse_next_statement_error_isolated();
     test_parse_errors();
+    test_parse_explain();
+    test_parse_explain_errors();
 
     test_storage_empty_then_append();
     test_storage_persist_and_restore_id();
@@ -1104,6 +1276,8 @@ int main(int argc, char **argv) {
     test_executor_insert_select();
     test_executor_where();
     test_executor_id_uses_index_age_scans();
+    test_executor_plan_paths_and_stats();
+    test_executor_explain_does_not_execute();
 
     test_bpt_create_order_bounds();
     test_bpt_empty();

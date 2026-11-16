@@ -9,6 +9,7 @@
 - [과제 요구] Phase 1 SQL 처리기를 그대로 사용해 연결한다.
 - [확정: 사용자, 2026-11-15] 추가 기능: id 범위 조회, EXPLAIN 실행 계획.
 - [확정: 사용자, 2026-11-15] 기능 하나씩 구현하고, 사용자가 실행·예측·수정해 본 뒤 진행을 요청하면 다음 기능으로 넘어간다.
+- [변경: 사용자, 2026-11-16] P2-02~P2-05는 한 단위 구현 후 테스트·메모리 검사로 검증하고, 통과하면 바로 커밋한 뒤 다음 단위로 간다. 학습은 사용자의 별도 노트로 진행하며 구현의 진행 조건이 아니다.
 
 ## 최종 결과 — Phase 2가 끝나면 보이는 것
 
@@ -20,11 +21,12 @@ $ build/minidb --data-dir bench build/million.sql > /dev/null  # Phase 1 처리�
 
 $ build/minidb --data-dir bench --timing q.sql
 EXPLAIN SELECT * FROM users WHERE id = 777777;
-  → INDEX LOOKUP (B+ 트리 높이 4)                 0.00x ms
+INDEX LOOKUP (id = 777777, B+ 트리 높이 4)          ← P2-02 형식(확정)
 EXPLAIN SELECT * FROM users WHERE age = 30;
-  → FULL SCAN (1000000행)                          2xx ms
+FULL SCAN (age = 30, 전체 행 수 1000000)            ← P2-02 형식(확정)
 SELECT * FROM users WHERE id BETWEEN 10 AND 12;
-  → INDEX RANGE SCAN (리프 연결을 따라 3건)
+  → INDEX RANGE SCAN (리프 연결을 따라 3건)          ← P2-03에서 확정
+  조회 시간 0.00x ms / 2xx ms                         ← 실제 실행 측정값, --timing 형식은 P2-04에서 확정
 ```
 
 | 조회 | 경로 | 읽는 양 | 시간 복잡도 |
@@ -66,9 +68,28 @@ flowchart TD
 | `WHERE id = 값` | 선형 탐색. 일치 뒤에도 파일 끝까지 읽음 | **B+ 트리로 위치를 찾아 그 한 줄만 읽음** (P2-01) |
 | `WHERE age = 값`, 조건 없음 | 선형 탐색 | 변경 없음 |
 | 파일 손상 검출 | 시작 시 전체 검증 + 조회 시 전체 읽기 | 시작 시 전체 검증(인덱스 구축과 함께). id 조회는 읽은 줄의 id를 다시 확인해, 다르면 "인덱스와 데이터 파일이 일치하지 않습니다" 오류 |
-| `EXPLAIN SELECT ...` | 없음 | 실행 경로·트리 높이 출력 (P2-02, 형식은 그 기능에서 확정) |
+| `EXPLAIN SELECT ...` | 없음 | 실행 계획 한 줄 출력, 조회는 실행하지 않음 (P2-02, 아래 "EXPLAIN 계약") |
 | `WHERE id BETWEEN a AND b`, `id <`, `<=`, `>`, `>=` | 오류 | 인덱스 범위 조회 (P2-03, 문법·경계는 그 기능에서 확정). age는 계속 `=`만 |
 | 대량 데이터 생성 · 시간 측정 | 없음 | `tools/gen_sql.py`, `--timing` 등 (P2-04에서 확정) |
+
+### EXPLAIN 계약 (P2-02 확정, 2026-11-16 사용자)
+
+```text
+EXPLAIN SELECT * FROM users [ WHERE id|age = 정수 ] ;     -- 키워드 대소문자 무시, EXPLAIN 뒤에는 SELECT만
+```
+
+| 조건 | stdout (한 줄, 헤더 없음) |
+|---|---|
+| `WHERE id = 3` | `INDEX LOOKUP (id = 3, B+ 트리 높이 2)` |
+| `WHERE age = 25` | `FULL SCAN (age = 25, 전체 행 수 5)` |
+| 조건 없음 | `FULL SCAN (조건 없음, 전체 행 수 5)` |
+
+- **계획만 만들고 조회는 실행하지 않는다.** 행·`id name age` 헤더를 출력하지 않고 파일도 바꾸지 않는다.
+- 괄호 안 숫자는 **계획 시점 통계**다. 트리 높이 = id 조회 한 번이 방문할 노드 수, 전체 행 수 = 선형 탐색이 읽을 줄 수. 실제 실행 측정값(걸린 시간 등)이 아니며, 측정값은 P2-04에서 따로 표시한다.
+- 통계는 메모리의 인덱스에서 얻는다. 시작 시 `table_open`이 파일 전체를 읽어 인덱스를 만든 뒤로는, 계획을 만들면서 파일을 **추가로** 읽지 않는다.
+- 경로는 조건의 종류만으로 정한다. 없는 id, 음수 id도 `INDEX LOOKUP`이다(키 존재 여부는 실행해야 안다).
+- EXPLAIN이 보여 주는 경로와 같은 문장을 실제로 실행할 때의 경로는 항상 같다(경로를 고르는 곳이 한 곳).
+- 오류: `EXPLAIN INSERT ...` → "EXPLAIN은 SELECT 문에만 사용할 수 있습니다", `EXPLAIN` 뒤에 SELECT가 아닌 것 → 구문 오류. 그 밖의 오류 규칙과 fail-fast는 일반 SELECT와 같다.
 
 SQL 문법, 출력 형식, 저장 파일 형식(users.tsv), 오류 규칙은 위 표 외에는 Phase 1과 같다. 결과 순서도 그대로 저장 순서(= id 오름차순)다.
 
