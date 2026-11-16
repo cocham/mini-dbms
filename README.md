@@ -4,14 +4,19 @@ C로 SQL 파일을 실행하고 데이터를 파일에 저장하는 CLI(Phase 1)
 
 ## Phase 3 — API 서버 (진행 중)
 
-현재 상태: **P3-01(엔진 진입점과 전역 잠금)까지 완료.** CLI 동작은 그대로이고, 엔진 앞에 잠금을 가진 진입점(`src/db.h`)이 생겼다. 다음 단위(P3-02)에서 `curl`로 요청을 보낼 수 있는 최소 서버가 나온다.
+현재 상태: **P3-02(단일 스레드 HTTP 서버)까지 완료.** `POST /query`로 SQL을 보내면 JSON으로 답하는 최소 서버(`build/minidb-server`, POSIX 전용)가 동작한다. 연결은 아직 하나씩 처리한다(스레드 풀은 P3-03).
 
-1. [개발 명세](docs/phase3/spec.md): API 계약, 오류 코드, 크기 제한, 저장 후 실패, 동시성 계약
-2. [설계와 결정](docs/phase3/design.md): 엔진 연결, 지금 코드의 동시성 문제, 잠금 단계, 서버 구조
-3. [작업 순서](docs/phase3/tasks.md): P3-01~P3-05, 단위별 흐름·확인 시나리오·검증 기록
+1. [실습](docs/phase3/walkthrough.md): 서버 띄우기 → `curl`로 요청·응답 → 요청 하나가 엔진까지 가는 지도. **여기서 시작**
+2. [개발 명세](docs/phase3/spec.md): API 계약, 오류 코드, 크기 제한, 저장 후 실패, 동시성 계약
+3. [설계와 결정](docs/phase3/design.md): 엔진 연결, 지금 코드의 동시성 문제, 잠금 단계, 서버 구조
+4. [작업 순서](docs/phase3/tasks.md): P3-01~P3-05, 단위별 흐름·확인 시나리오·검증 기록
 
 ```bash
-make test                      # Windows·Linux: 단위(동시 정확성 포함)·CLI 테스트
+# Windows에서 Docker로 서버 띄우기 (자세한 것은 walkthrough)
+docker run --rm -it -p 127.0.0.1:8080:8080 -v "$PWD:/src" -w /src gcc:13 bash -c "make build/minidb-server && mkdir -p data/p3 && build/minidb-server --host 0.0.0.0 --port 8080 --data-dir data/p3"
+curl.exe -s http://localhost:8080/query --data-binary "SELECT * FROM users WHERE id = 1;"
+
+make test                      # Windows: 단위(동시 정확성 포함)·CLI / Linux: 여기에 서버 테스트까지
 docker run --rm --security-opt seccomp=unconfined -v "$PWD:/src" -w /src gcc:13 make tsan       # 데이터 경쟁 검사
 docker run --rm --security-opt seccomp=unconfined -v "$PWD:/src" -w /src gcc:13 make race-demo  # 잠금 없는 엔진 관찰 실험
 ```

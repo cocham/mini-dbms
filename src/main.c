@@ -175,34 +175,16 @@ static int print_row(const Row *row, void *ctx) {
  *   INDEX RANGE SCAN (id BETWEEN 10 AND 20, B+ 트리 높이 2)    조건은 사용자가 쓴 형태 그대로
  */
 static int print_plan(const QueryPlan *plan, void *ctx) {
-    static const char *const ops[] = {"=", "<", "<=", ">", ">="}; /* CmpOp 순서 */
     char cond[96];
     int n;
 
     (void)ctx;
-    switch (plan->where) {
-    case WHERE_ID: snprintf(cond, sizeof cond, "id = %" PRId64, plan->where_value); break;
-    case WHERE_AGE: snprintf(cond, sizeof cond, "age = %" PRId64, plan->where_value); break;
-    case WHERE_ID_RANGE:
-        if (plan->where_op == CMP_BETWEEN) {
-            snprintf(cond, sizeof cond, "id BETWEEN %" PRId64 " AND %" PRId64, plan->where_value,
-                     plan->where_value2);
-        } else {
-            snprintf(cond, sizeof cond, "id %s %" PRId64, ops[plan->where_op], plan->where_value);
-        }
-        break;
-    default: snprintf(cond, sizeof cond, "조건 없음"); break;
-    }
-    switch (plan->kind) {
-    case PLAN_INDEX_LOOKUP:
-        n = printf("INDEX LOOKUP (%s, B+ 트리 높이 %d)\n", cond, plan->stats.tree_height);
-        break;
-    case PLAN_INDEX_RANGE_SCAN:
-        n = printf("INDEX RANGE SCAN (%s, B+ 트리 높이 %d)\n", cond, plan->stats.tree_height);
-        break;
-    default:
-        n = printf("FULL SCAN (%s, 전체 행 수 %" PRId64 ")\n", cond, plan->stats.total_rows);
-        break;
+    executor_plan_condition(plan, cond, sizeof cond);
+    if (plan->kind == PLAN_FULL_SCAN) {
+        n = printf("%s (%s, 전체 행 수 %" PRId64 ")\n", executor_plan_name(plan->kind), cond,
+                   plan->stats.total_rows);
+    } else {
+        n = printf("%s (%s, B+ 트리 높이 %d)\n", executor_plan_name(plan->kind), cond, plan->stats.tree_height);
     }
     return n < 0 ? -1 : 0;
 }

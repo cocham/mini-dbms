@@ -2,15 +2,15 @@
 
 ## 현재 상태
 
-**P3-01 완료(2026-11-16).** 다음은 P3-02(단일 스레드 HTTP 서버). P3-02가 끝나면 `walkthrough.md`로 요청·응답 실습을 시작할 수 있다.
+**P3-02 완료(2026-11-16).** 최소 서버가 동작한다. 학습은 [walkthrough.md](walkthrough.md)의 요청·응답 실습에서 시작한다. 다음 단위(P3-03)는 사용자 검증(PASS)을 받은 뒤 진행한다.
 
-진행 방식(Phase 2 DB-P2-D10 유지): 한 단위를 구현한다 → 테스트와 ASan·TSan 검사로 검증한다 → 통과하면 바로 커밋하고 다음 단위로 간다. 사용자 동작이나 공개 인터페이스를 바꾸는 결정은 구현 전에 짧게 제안한다.
+진행 방식: 한 단위를 구현한다 → 테스트와 ASan·TSan 검사로 검증한다 → 통과하면 커밋한다 → **사용자가 검증 결과(PASS)를 전하면** 다음 단위로 간다(2026-11-16 사용자 지시, P3-01부터). 사용자 동작이나 공개 인터페이스를 바꾸는 결정은 구현 전에 짧게 제안한다.
 
 | ID | 기능 | 완료 기준 | 상태 |
 |---|---|---|---|
 | P3-00 | 구현 전 결정 | design.md DB-P3-D01~D11 확정 | 완료(2026-11-16) |
 | P3-01 | 엔진 진입점과 전역 잠금 | S1, S1x | 완료 |
-| P3-02 | 단일 스레드 HTTP 서버 | S2, 실행 예시와 요청 경로 지도 | 대기 |
+| P3-02 | 단일 스레드 HTTP 서버 | S2, 실행 예시와 요청 경로 지도 | 완료 |
 | P3-03 | 스레드 풀과 작업 큐 | S3 | 대기 |
 | P3-04 | 읽기 병렬화 | S4 | 대기 |
 | P3-05 | 부하 측정과 마무리 | S5 | 대기 |
@@ -78,7 +78,33 @@ spec 대응:
 - `--max-rows 3`으로 띄우고 SELECT를 여러 개 보내면 `RESULT_TOO_LARGE`가 오고, 앞 결과만 남는다.
 - 서버를 끄고 다시 띄워도 데이터가 그대로다.
 
-**파일:** 새 `src/server.c`, `src/http.{h,c}`, `src/json.{h,c}`, `tests/server_test.py`, `docs/phase3/walkthrough.md`. 바뀌는 곳: `Makefile`(`minidb-server`, POSIX에서만).
+**파일:** 새 `src/server.c`, `src/http.{h,c}`, `src/json.{h,c}`, `tests/server_test.py`, `docs/phase3/walkthrough.md`, `examples/phase3_seed.sql`, `examples/phase3_partial.sql`. 바뀌는 곳: `src/executor.{h,c}`(EXPLAIN 문구 `executor_plan_name`·`executor_plan_condition`을 CLI와 서버가 함께 씀), `src/main.c`(그 함수 사용, 출력 불변), `tests/test_unit.c`(JSON 버퍼), `Makefile`(`minidb-server`, 테스트 전용 `minidb-server-test`, `server` 대상. POSIX에서만 `all`·`test`에 들어감).
+
+**구현 메모:**
+- 기한(호출 5초, 수신·전송 전체 10초)은 단일 스레드 서버가 연결 하나에 영영 묶이지 않도록 이 단위에서 이미 넣었다. 자동 테스트는 P3-03에서 추가한다. 수동으로는 walkthrough "직접 해 볼 것 5"에서 확인했다(다른 요청이 5.3초 기다린 뒤 응답, 덜 보낸 요청은 408).
+- 응답은 머리(`{"ok":...,"results":[`)·결과·`]}` 세 조각으로 보낸다. 결과를 다 만든 뒤에야 성공·실패를 알기 때문이다. 조각을 이어 붙이는 복사는 하지 않는다.
+- 저장 후 실패는 테스트 전용 빌드 `minidb-server-test`에서 환경 변수 `MINIDB_TEST_FAULT=index|write`로 재현한다. 배포용 `minidb-server`에는 이 코드가 없다.
+- `500 INTERNAL`(응답을 만들 메모리 부족)은 자동 테스트가 없다. 고정 본문을 보내는 경로만 있다.
+- spec에 추가한 것: `BAD_REQUEST` 코드, `statement`·`results`를 넣는 조건, 올바르지 않은 UTF-8의 `�` 치환, 예비 공간 2 KiB와 `--max-response` 최솟값 4096, `--port 0`, 로그 형식.
+
+**P3-02 검증 기록(2026-11-16)**
+
+| 명령 | 환경 | 결과 |
+|---|---|---|
+| `mingw32-make`, `mingw32-make test` | Windows, TDM-GCC 10.3 | 경고 0, 단위 26,052개 검사 실패 0, CLI 46개 실패 0(서버는 빌드하지 않음) |
+| `make`, `make test` | Docker `gcc:13` | 경고 0, 단위 26,052개·CLI 46개·서버 15개 실패 0 |
+| `make sanitize` | Docker `gcc:13`, ASan/UBSan/LSan | 단위·CLI·서버 실패 0, 검사 도구 보고 없음(서버는 SIGTERM 종료 뒤 누수 검사까지) |
+| `docker run --security-opt seccomp=unconfined ... make tsan` | Docker `gcc:13`, TSan | 단위·서버 실패 0, 보고 없음 |
+| 서버 변이 8개 | Docker `gcc:13` | 모두 잡힘: 행 예산을 문장마다 초기화, INSERT 자리 선확인 제거, 실패 문장 결과를 되돌리지 않음, `WRITE_FAILED`에 `stored_id`, 파싱하며 실행, 따옴표 이스케이프 안 함, 잘못된 UTF-8 그대로, `Transfer-Encoding` 허용 |
+| walkthrough의 명령 전부 | Windows PowerShell `curl.exe` → Docker 서버 | 문서의 응답과 같음. CLI로 서버가 쓴 파일을 읽으면 같은 행 |
+
+검증 중 고친 결함 2개: JSON 버퍼의 첫 할당이 상한보다 커질 수 있었다(단위 테스트가 잡음). 길이 0 쓰기에서 `memcpy`에 NULL이 넘어갔다(UBSan이 잡음).
+
+spec 대응:
+
+| ID | 테스트 |
+|---|---|
+| S2 | 서버 테스트 15개: `health_and_empty_body`, `insert_select_explain_match_cli`(JSON 결과 전체 비교, 같은 디렉터리를 CLI로 읽기), `query_string_ignored_and_routes`(404·405·`Allow`), `syntax_error_executes_nothing`(선파싱, NUL), `runtime_error_keeps_earlier_results`, `json_escaping_and_invalid_utf8`, `row_budget_counts_whole_request`(SELECT 여러 개로 우회 불가, 넘긴 SELECT는 통째로 버림), `byte_budget_and_insert_reservation`(응답 ≤ 4096바이트, 응답에 보인 INSERT 수 = 저장된 행 수), `http_level_errors`(413·431·400 형식·chunked·Content-Length 충돌, HTTP/1.0·LF만), `expect_100_continue`, `client_disconnect_does_not_stop_server`, `shutdown_and_restart_keep_data`(SIGTERM → 0, 다음 id 이어짐), `usage_and_start_errors`, `index_failure_halts_and_restart_recovers`(`stored_id` 64, 503 `HALTED`, 재시작 뒤 64 조회), `write_failure_halts_and_restart_is_refused`(`stored_id` 없음, 재시작 거부). 단위: `test_json_escape_and_utf8`, `test_json_budget` |
 
 ### P3-03 — 스레드 풀과 작업 큐
 

@@ -55,6 +55,12 @@ typedef struct {
  */
 int executor_plan(const Table *t, const Statement *st, QueryPlan *out, DbError *err);
 
+/* 계획을 사람이 읽는 문구로. CLI(EXPLAIN 한 줄)와 서버(JSON 필드)가 같은 문구를 쓴다.
+ *   executor_plan_name:      "INDEX LOOKUP" / "INDEX RANGE SCAN" / "FULL SCAN"
+ *   executor_plan_condition: 사용자가 쓴 조건 형태. "id = 3", "id BETWEEN 10 AND 20", "age = 25", "조건 없음" */
+const char *executor_plan_name(PlanKind kind);
+void executor_plan_condition(const QueryPlan *plan, char *buf, size_t cap);
+
 /* ---------- 실행 ---------- */
 
 typedef struct {

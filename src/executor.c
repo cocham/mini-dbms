@@ -1,7 +1,34 @@
 #include "executor.h"
 
+#include <inttypes.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
+
+const char *executor_plan_name(PlanKind kind) {
+    switch (kind) {
+    case PLAN_INDEX_LOOKUP: return "INDEX LOOKUP";
+    case PLAN_INDEX_RANGE_SCAN: return "INDEX RANGE SCAN";
+    default: return "FULL SCAN";
+    }
+}
+
+void executor_plan_condition(const QueryPlan *plan, char *buf, size_t cap) {
+    static const char *const ops[] = {"=", "<", "<=", ">", ">="}; /* CmpOp 순서 */
+
+    switch (plan->where) {
+    case WHERE_ID: snprintf(buf, cap, "id = %" PRId64, plan->where_value); break;
+    case WHERE_AGE: snprintf(buf, cap, "age = %" PRId64, plan->where_value); break;
+    case WHERE_ID_RANGE:
+        if (plan->where_op == CMP_BETWEEN) {
+            snprintf(buf, cap, "id BETWEEN %" PRId64 " AND %" PRId64, plan->where_value, plan->where_value2);
+        } else {
+            snprintf(buf, cap, "id %s %" PRId64, ops[plan->where_op], plan->where_value);
+        }
+        break;
+    default: snprintf(buf, cap, "조건 없음"); break;
+    }
+}
 
 static int validate_insert(const Statement *st, DbError *err) {
     size_t n;

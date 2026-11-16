@@ -12,6 +12,7 @@
 #include "bptree.h"
 #include "db.h"
 #include "executor.h"
+#include "json.h"
 #include "parser.h"
 #include "storage.h"
 
@@ -2055,6 +2056,60 @@ static void test_db_concurrent_correctness(void) {
     CHECK(db_close(db, &err) == 0);
 }
 
+/* ---------- Phase 3 / P3-02: JSON 응답 버퍼 ---------- */
+
+static int jb_is(const JsonBuf *b, const char *want) {
+    return b->len == strlen(want) && (b->len == 0 || memcmp(b->data, want, b->len) == 0);
+}
+
+static void test_json_escape_and_utf8(void) {
+    JsonBuf b;
+
+    jb_init(&b, 1024);
+    CHECK(jb_str(&b, "a\"b\\c") == 0 && jb_is(&b, "\"a\\\"b\\\\c\""));
+    jb_truncate(&b, 0);
+    CHECK(jb_strn(&b, "\x01\t\n\x1f", 4) == 0 && jb_is(&b, "\"\\u0001\\u0009\\u000a\\u001f\""));
+    jb_truncate(&b, 0);
+    CHECK(jb_str(&b, "민수 😀 é") == 0 && jb_is(&b, "\"민수 😀 é\"")); /* 올바른 UTF-8은 그대로 */
+    jb_truncate(&b, 0);
+    /* 잘못된 바이트·너무 긴 표현·서로게이트·잘린 글자 → 대체 문자 */
+    CHECK(jb_str(&b, "a\xff" "b") == 0 && jb_is(&b, "\"a\\ufffdb\""));
+    jb_truncate(&b, 0);
+    CHECK(jb_str(&b, "\xc0\x80") == 0 && jb_is(&b, "\"\\ufffd\\ufffd\""));
+    jb_truncate(&b, 0);
+    CHECK(jb_str(&b, "\xed\xa0\x80") == 0 && jb_is(&b, "\"\\ufffd\\ufffd\\ufffd\""));
+    jb_truncate(&b, 0);
+    CHECK(jb_str(&b, "x\xea\xb0") == 0 && jb_is(&b, "\"x\\ufffd\\ufffd\""));
+    jb_truncate(&b, 0);
+    CHECK(jb_str(&b, "\xf4\x90\x80\x80") == 0 && jb_is(&b, "\"\\ufffd\\ufffd\\ufffd\\ufffd\""));
+    jb_truncate(&b, 0);
+    CHECK(jb_i64(&b, INT64_MIN) == 0 && jb_is(&b, "-9223372036854775808"));
+    CHECK(!b.over && !b.oom);
+    jb_free(&b);
+}
+
+static void test_json_budget(void) {
+    JsonBuf b;
+
+    jb_init(&b, 10);
+    CHECK(jb_lit(&b, "12345") == 0);
+    CHECK(jb_lit(&b, "678901") == -1 && b.over && jb_is(&b, "12345")); /* 넘치는 쓰기는 통째로 거절 */
+    b.over = 0;
+    CHECK(jb_lit(&b, "67890") == 0 && jb_is(&b, "1234567890") && !b.over); /* 딱 상한까지는 됨 */
+    CHECK(jb_reserve(&b, 1) == -1 && b.over);
+    CHECK(b.cap <= 10);
+    jb_truncate(&b, 3);
+    b.over = 0;
+    CHECK(jb_reserve(&b, 7) == 0 && jb_reserve(&b, 8) == -1);
+    /* 문자열이 중간에 넘치면 앞부분도 남기지 않는다 */
+    b.over = 0;
+    CHECK(jb_str(&b, "abcdefgh") == -1 && b.over && jb_is(&b, "123"));
+    jb_free(&b);
+    jb_init(&b, 0);
+    CHECK(jb_lit(&b, "") == 0 && jb_lit(&b, "x") == -1);
+    jb_free(&b);
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "사용법: test_unit <임시 디렉터리>\n");
@@ -2118,6 +2173,9 @@ int main(int argc, char **argv) {
     test_db_halt_after_index_failure();
     test_db_halt_after_write_failure();
     test_db_concurrent_correctness();
+
+    test_json_escape_and_utf8();
+    test_json_budget();
 
     printf("단위 테스트: %d개 검사 중 %d개 실패\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
