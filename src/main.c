@@ -1,5 +1,5 @@
 /*
- * CLI: 인자와 SQL 파일을 읽고, 문장을 하나씩 Parser → Executor로 넘기며
+ * CLI: 인자와 SQL 파일을 읽고, 문장을 하나씩 Parser → DB 진입점(db_exec → Executor)으로 넘기며
  * 결과(stdout)·오류(stderr)·종료 코드를 책임진다.
  *
  * 종료 코드: 0 성공, 1 SQL·데이터·파일 오류, 2 잘못된 사용법
@@ -13,9 +13,9 @@
 #include <string.h>
 #include <time.h>
 
+#include "db.h"
 #include "executor.h"
 #include "parser.h"
-#include "storage.h"
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -76,10 +76,10 @@ static double now_ms(void) {
 }
 
 /* 측정 줄은 stderr로. 앞선 stdout 결과가 먼저 보이도록 flush한다(측정 구간 밖에서). */
-static void print_timing_start(double ms, const Table *t) {
+static void print_timing_start(double ms, Db *db) {
     IndexStats ix;
 
-    table_index_stats(t, &ix);
+    db_stats(db, &ix);
     fflush(stdout);
     fprintf(stderr, "[측정] 시작: %.3f ms (파일 전체 읽기 + 인덱스 구축, %" PRId64 "행)\n", ms, ix.keys);
     fprintf(stderr, "[측정] 인덱스: 높이 %d, 리프 %zu개, 내부 노드 %zu개, 약 %.1f MB\n", ix.height,
@@ -223,7 +223,7 @@ int main(int argc, char **argv) {
     char *sql;
     size_t sql_len = 0;
     size_t pos = 0;
-    Table *table = NULL;
+    Db *db = NULL;
     ExecStats es = {0.0, 0};
     ResultSink sink = {print_insert, print_row, NULL, print_plan};
     long stmt_no = 0;
@@ -277,13 +277,13 @@ int main(int argc, char **argv) {
     }
 
     t0 = now_ms();
-    if (table_open(data_dir, &table, &err) != 0) {
+    if (db_open(data_dir, &db, &err) != 0) {
         report(0, &err);
         free(sql);
         return EXIT_FAIL;
     }
     if (timing) {
-        print_timing_start(now_ms() - t0, table);
+        print_timing_start(now_ms() - t0, db);
     }
     sink.ctx = &es;
 
@@ -312,7 +312,7 @@ int main(int argc, char **argv) {
         if (rc == 0) {
             es.rows_returned = 0;
             t0 = now_ms();
-            rc = executor_run(table, &st, &sink, &err);
+            rc = db_exec(db, &st, &sink, NULL, &err);
             es.elapsed_ms = now_ms() - t0;
             if (rc == 0 && timing) {
                 print_timing_stmt(stmt_no, &st, &es);
@@ -326,7 +326,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (table_close(table, &err) != 0 && status == 0) {
+    if (db_close(db, &err) != 0 && status == 0) {
         report(0, &err);
         status = EXIT_FAIL;
     }

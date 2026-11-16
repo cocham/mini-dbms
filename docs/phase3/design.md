@@ -124,7 +124,7 @@ accept 스레드: poll(listen, self-pipe) → accept
 
 | 종류 | 들어가는 곳 | 내용 | 판정 |
 |---|---|---|---|
-| 동시 정확성 | `make test`(POSIX) | 스레드 N개가 `db_exec`로 INSERT·SELECT를 무작위로 섞는다. 끝나면 id가 1..M으로 이어지는지, 트리 불변식, 모든 행 조회, 재시작 뒤 동일성을 본다(C1~C4) | 통과해야 함 |
+| 동시 정확성 | `make test`(Windows·Linux 모두) | 스레드 N개가 `db_exec`로 INSERT·SELECT를 무작위로 섞는다. 끝나면 id가 1..M으로 이어지는지, 트리 불변식, 모든 행 조회, 재시작 뒤 동일성을 본다(C1~C4) | 통과해야 함 |
 | TSan | `make tsan`(Linux) | 위 테스트와 서버 테스트를 `-fsanitize=thread`로 실행(C5, C7) | 보고 없어야 함 |
 | 서버 | `make test`(POSIX) `tests/server_test.py` | JSON, 오류 코드, 예산 우회 시도(SELECT 여러 개), INSERT 자리 선확인, 선파싱, 중단 상태 두 사유(테스트 빌드의 메모리 부족·쓰기 실패 주입), 동시 클라이언트, `BUSY`, 기한, 종료 | 통과해야 함 |
 | 경쟁 재현 실험 | `make race-demo`(Linux, `test`에 넣지 않음) | `-DMINIDB_NO_LOCK` 빌드로 같은 작업을 여러 번 돌려, 이상이 나타난 횟수와 종류를 출력한다. 같은 빌드를 TSan으로 한 번 돌려 보고 내용을 보여 준다 | **판정 없음.** 결과는 문서에 관찰 기록으로 남긴다 |

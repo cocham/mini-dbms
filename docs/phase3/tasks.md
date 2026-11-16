@@ -2,14 +2,14 @@
 
 ## 현재 상태
 
-**결정 확정(2026-11-16, 사용자).** P3-01부터 진행한다.
+**P3-01 완료(2026-11-16).** 다음은 P3-02(단일 스레드 HTTP 서버). P3-02가 끝나면 `walkthrough.md`로 요청·응답 실습을 시작할 수 있다.
 
 진행 방식(Phase 2 DB-P2-D10 유지): 한 단위를 구현한다 → 테스트와 ASan·TSan 검사로 검증한다 → 통과하면 바로 커밋하고 다음 단위로 간다. 사용자 동작이나 공개 인터페이스를 바꾸는 결정은 구현 전에 짧게 제안한다.
 
 | ID | 기능 | 완료 기준 | 상태 |
 |---|---|---|---|
 | P3-00 | 구현 전 결정 | design.md DB-P3-D01~D11 확정 | 완료(2026-11-16) |
-| P3-01 | 엔진 진입점과 전역 잠금 | S1, S1x | 대기 |
+| P3-01 | 엔진 진입점과 전역 잠금 | S1, S1x | 완료 |
 | P3-02 | 단일 스레드 HTTP 서버 | S2, 실행 예시와 요청 경로 지도 | 대기 |
 | P3-03 | 스레드 풀과 작업 큐 | S3 | 대기 |
 | P3-04 | 읽기 병렬화 | S4 | 대기 |
@@ -32,7 +32,40 @@
 - `make race-demo`로 잠금을 끈 빌드를 돌려 id 중복 같은 이상이 나타나는 모습을 본다(나타나지 않는 실행도 있을 수 있다).
 - 같은 작업을 정상 빌드로 돌리면 id가 1..M으로 이어진다.
 
-**파일:** 새 `src/db.{h,c}`. 바뀌는 곳: `src/common.h`(오류 종류, `db_errstr`), `src/storage.c`(append 실패 구분, `last_id` 분리), `src/main.c`(진입점 사용), `tests/test_unit.c`, `Makefile`(`-pthread`, `tsan`, `race-demo`, Windows 제외).
+**파일:** 새 `src/db.{h,c}`, `tools/race_demo.c`. 바뀌는 곳: `src/common.{h,c}`(오류 종류 `DbErrorKind`, `db_error_setk`, `db_errstr`), `src/storage.{h,c}`(append 실패 3가지 구분, 인덱스 중복과 메모리 부족 문구 구분, `last_id` 분리, `table_last_id`, 테스트 전용 쓰기 실패 주입·인덱스 검사), `src/executor.c`(오류 종류 표시), `src/main.c`(진입점 사용), `tests/test_unit.c`, `Makefile`(`-pthread`, `tsan`, `race-demo`).
+
+**구현 메모:**
+- `db.c`는 TDM-GCC의 winpthreads로 Windows에서도 빌드된다(정적 링크, 추가 DLL 없음). 그래서 동시 정확성 테스트도 Windows와 Linux 양쪽에서 돈다.
+- `scan_file`은 `out_last_id`를 받는다. `table_open`만 넘기고 `table_scan`은 NULL을 넘긴다. 외부 동작은 같아서 이 변경을 단독으로 잡는 테스트는 없다. 효과는 P3-04(공유 잠금 아래 선형 탐색)에서 드러난다.
+- 기존 CLI 출력·오류 문구는 바뀌지 않았다. 바뀐 문구는 잠금 없이만 생기는 인덱스 중복 경우("id N가 이미 인덱스에 있어 ...") 하나뿐이다.
+
+**P3-01 검증 기록(2026-11-16)**
+
+| 명령 | 환경 | 결과 |
+|---|---|---|
+| `mingw32-make`, `mingw32-make test` | Windows, TDM-GCC 10.3 | 경고 0, 단위 26,034개 검사 실패 0, CLI 46개 실패 0 |
+| `make sanitize` | Docker `gcc:13`, ASan/UBSan/LSan | 경고 0, 단위·CLI 실패 0, 검사 도구 보고 없음 |
+| `docker run --security-opt seccomp=unconfined ... make tsan` | Docker `gcc:13`, TSan | 단위 26,034개 실패 0, TSan 보고 없음(C5) |
+| 변이 7개 | Windows | 모두 잡힘: 잠금 제거(정확성 테스트가 실패하거나 프로세스가 죽음), `stored_id` 미설정, `WRITE_FAILED`에 `stored_id` 설정, 인덱스 실패 뒤 중단 안 함, 중단 상태 검사 제거, 쓰기 실패를 `STORAGE`로 분류, 결과 콜백 실패를 `SQL`로 분류 |
+| 예제 `phase2_*` | Windows | 정상 |
+
+TSan 메모: GCC 13의 TSan은 최근 커널(mmap 무작위 비트 32)에서 "unexpected memory mapping"으로 시작하지 못한다. 그래서 `tsan`·`race-demo`는 `setarch -R`로 주소 무작위화를 끄고 실행하며, Docker에서는 `--security-opt seccomp=unconfined`가 필요하다.
+
+spec 대응:
+
+| ID | 테스트·기록 |
+|---|---|
+| S1 | `test_db_concurrent_correctness`: 스레드 8개 × 400개 작업(INSERT 40%, id 조회, BETWEEN, 전체 조회, EXPLAIN). id 1..M 중복·누락 없음(C1), 범위·전체 결과에 빈틈 없음(C2), 방금 넣은 행 즉시 조회(C3), 트리 불변식·행 수·재시작 후 내용 일치(C4). `make tsan` 보고 없음(C5). `test_db_exec_basic_and_kinds`(오류 종류, 선형 탐색 뒤 다음 id), `test_db_halt_after_index_failure`(`stored_id` 64, 중단, 재시작으로 복구), `test_db_halt_after_write_failure`(`stored_id` 없음, 중단, 줄 일부가 남아 재시작 거부). CLI 46개 출력 불변 |
+| S1x | `make race-demo` 관찰 기록(아래). 판정에는 쓰지 않는다 |
+
+**S1x 관찰 기록(2026-11-16, Docker `gcc:13`, 잠금 없는 빌드, 스레드 8개):**
+
+| 단계 | 관찰(일반 실행 8번 + TSan 실행 2번) |
+|---|---|
+| 읽기만(미리 넣은 2,000행을 16,000번 id 조회) | 매번 65~298번 "인덱스와 데이터 파일이 일치하지 않습니다". 공유 `FILE*`의 `fseek`·`getc`가 스레드끼리 섞여 다른 위치의 줄을 읽었고, 읽은 줄의 id 재확인이 엉뚱한 행 대신 오류를 냈다. 파일은 바뀌지 않았다 |
+| 동시 INSERT(4,000번) | 매번 처음 몇 건(2~17건) 안에 같은 id를 두 스레드가 받았다. 두 번째 줄은 파일에 기록됐지만 인덱스 등록이 중복으로 실패했고(`INDEX_FAILED`), 엔진은 중단 상태가 되어 나머지 INSERT를 모두 거절했다 |
+| 재시작 | 매번 거부. 같은 id의 줄이 두 번 기록되어 "id가 증가 순서가 아닙니다"(데이터 파일 손상) |
+| TSan(같은 빌드) | 경고 6개. 모두 `table_append`의 `last_id` 읽기·쓰기(storage.c)다. **읽기 단계의 오류는 TSan이 보고하지 않았다.** stdio 함수는 호출 하나마다 내부 잠금이 있어서 메모리 경쟁은 없지만, `fseek`와 `getc`의 묶음은 원자적이지 않다. TSan이 잡는 것은 메모리 접근 경쟁이고, 이런 논리적 경쟁은 잡지 못한다. 그래서 P3-04의 `pread` 전환은 TSan 결과와 별개로 필요하다 |
 
 ### P3-02 — 단일 스레드 HTTP 서버
 

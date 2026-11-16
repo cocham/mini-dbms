@@ -30,8 +30,17 @@ typedef int (*RowFn)(const Row *row, void *ctx);
  * 기존 레코드 전체를 한 번 검증하고 최대 ID를 복원하며, id 인덱스를 만든다. */
 int table_open(const char *data_dir, Table **out, DbError *err);
 
-/* 다음 ID(최대 ID + 1)를 부여해 레코드 한 건을 파일 끝에 추가하고 인덱스에 등록한다. */
+/*
+ * 다음 ID(최대 ID + 1)를 부여해 레코드 한 건을 파일 끝에 추가하고 인덱스에 등록한다.
+ * 실패하면 err->kind로 어디서 실패했는지 구분한다.
+ *   DBE_STORAGE      파일을 바꾸기 전 실패. *out_id = 0
+ *   DBE_WRITE_FAILED 쓰기 도중 실패. 그 줄이 기록됐는지 알 수 없다. *out_id = 0
+ *   DBE_INDEX_FAILED 파일 기록 완료 뒤 인덱스 등록 실패(메모리 부족). *out_id = 기록된 id
+ */
 int table_append(Table *t, const char *name, int age, int64_t *out_id, DbError *err);
+
+/* 파일에 있는 최대 id(빈 테이블이면 0). 시작 시 복원되고 table_append만 바꾼다. */
+int64_t table_last_id(const Table *t);
 
 /* 저장 순서대로 레코드를 하나씩 읽어 fn을 호출한다. fn이 NULL이면 검증만 한다. */
 int table_scan(Table *t, RowFn fn, void *ctx, DbError *err);
@@ -63,6 +72,13 @@ typedef struct {
 } IndexStats;
 
 void table_index_stats(const Table *t, IndexStats *out);
+
+#ifdef MINIDB_TESTING
+/* 테스트 전용: 1이면 다음 table_append가 줄의 앞부분만 쓰고 DBE_WRITE_FAILED로 실패한다(한 번). */
+void table_test_fail_write(int on);
+/* 테스트 전용: 메모리 인덱스의 불변식 검사(bpt_validate). 0이면 정상 */
+int table_test_validate_index(const Table *t, char *why, size_t cap);
+#endif
 
 /* 파일을 닫고 메모리를 해제한다. 실패해도 t는 해제된다. t가 NULL이면 0. */
 int table_close(Table *t, DbError *err);

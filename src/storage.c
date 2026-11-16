@@ -130,7 +130,7 @@ static int parse_record(char *line, size_t len, int64_t prev_id, Row *row, const
     return 0;
 }
 
-static int scan_file(Table *t, BpTree *build, RowFn fn, void *ctx, DbError *err);
+static int scan_file(Table *t, BpTree *build, RowFn fn, void *ctx, int64_t *out_last_id, DbError *err);
 
 /* ---------- 공개 함수 ---------- */
 
@@ -138,17 +138,18 @@ int table_open(const char *data_dir, Table **out, DbError *err) {
     Table *t;
     size_t path_len;
     int saved_errno;
+    char eb[128];
 
     *out = NULL;
     t = calloc(1, sizeof *t);
     if (t == NULL) {
-        db_error_set(err, "메모리가 부족합니다");
+        db_error_setk(err, DBE_STORAGE, "메모리가 부족합니다");
         return -1;
     }
     path_len = strlen(data_dir) + 1 + strlen(TABLE_FILE) + 1;
     t->path = malloc(path_len);
     if (t->path == NULL) {
-        db_error_set(err, "메모리가 부족합니다");
+        db_error_setk(err, DBE_STORAGE, "메모리가 부족합니다");
         goto fail;
     }
     snprintf(t->path, path_len, "%s/%s", data_dir, TABLE_FILE);
@@ -161,7 +162,7 @@ int table_open(const char *data_dir, Table **out, DbError *err) {
             saved_errno = errno;
         }
         if (t->fp == NULL) {
-            db_error_set(err, "데이터 파일을 열 수 없습니다: %s (%s)", t->path, strerror(saved_errno));
+            db_error_setk(err, DBE_STORAGE, "데이터 파일을 열 수 없습니다: %s (%s)", t->path, db_errstr(saved_errno, eb, sizeof eb));
             goto fail;
         }
     }
@@ -169,10 +170,10 @@ int table_open(const char *data_dir, Table **out, DbError *err) {
     /* 시작할 때 한 번만 전체를 검증하며 최대 ID를 복원하고, id 인덱스를 메모리에 다시 만든다. */
     t->index = bpt_create(BPT_DEFAULT_ORDER);
     if (t->index == NULL) {
-        db_error_set(err, "메모리가 부족합니다");
+        db_error_setk(err, DBE_STORAGE, "메모리가 부족합니다");
         goto fail;
     }
-    if (scan_file(t, t->index, NULL, NULL, err) != 0) {
+    if (scan_file(t, t->index, NULL, NULL, &t->last_id, err) != 0) {
         goto fail;
     }
     *out = t;
@@ -192,9 +193,12 @@ fail:
  * 파일을 처음부터 끝까지 한 줄씩 읽어 검증하고 fn을 호출한다.
  * build가 NULL이 아니면 각 레코드의 (id, 줄 시작 바이트 위치)를 build 인덱스에 넣는다.
  * 위치는 ftell 대신 직접 센다: 줄 길이 + LF 1바이트. 바이너리 모드라 바이트 수가 정확하다.
+ * out_last_id가 NULL이 아니면 마지막 id를 담는다. 시작 시 복원(table_open)만 넘기고,
+ * 일반 조회(table_scan)는 NULL을 넘겨 공유 상태(Table)를 바꾸지 않는다(Phase 3, DB-P3-D05).
  */
-static int scan_file(Table *t, BpTree *build, RowFn fn, void *ctx, DbError *err) {
+static int scan_file(Table *t, BpTree *build, RowFn fn, void *ctx, int64_t *out_last_id, DbError *err) {
     char line[LINE_CAP];
+    char eb[128];
     size_t len;
     long lineno = 0;
     int64_t prev_id = 0;
@@ -202,7 +206,7 @@ static int scan_file(Table *t, BpTree *build, RowFn fn, void *ctx, DbError *err)
 
     /* 쓰기 직후 읽기로 바꿀 때는 flush/seek가 필요하다(C 표준 규칙). */
     if (fflush(t->fp) != 0 || fseek(t->fp, 0, SEEK_SET) != 0) {
-        db_error_set(err, "데이터 파일 읽기 준비 실패: %s (%s)", t->path, strerror(errno));
+        db_error_setk(err, DBE_STORAGE, "데이터 파일 읽기 준비 실패: %s (%s)", t->path, db_errstr(errno, eb, sizeof eb));
         return -1;
     }
     for (;;) {
@@ -216,35 +220,38 @@ static int scan_file(Table *t, BpTree *build, RowFn fn, void *ctx, DbError *err)
         }
         lineno++;
         if (r == -2) {
-            db_error_set(err, "데이터 파일 읽기 실패: %s", t->path);
+            db_error_setk(err, DBE_STORAGE, "데이터 파일 읽기 실패: %s", t->path);
             return -1;
         }
         if (r == -1 || parse_record(line, len, prev_id, &row, &why) != 0) {
-            db_error_set(err, "데이터 파일 손상: %s %ld번째 줄: %s", t->path, lineno, why);
+            db_error_setk(err, DBE_STORAGE, "데이터 파일 손상: %s %ld번째 줄: %s", t->path, lineno, why);
             return -1;
         }
         offset += (int64_t)len + 1;
         prev_id = row.id;
         if (build != NULL && bpt_insert(build, row.id, line_start) != BPT_OK) {
             /* id는 위에서 증가 순서를 확인했으므로 중복은 없다. 남은 원인은 메모리 부족뿐이다. */
-            db_error_set(err, "메모리가 부족해 인덱스를 만들 수 없습니다");
+            db_error_setk(err, DBE_STORAGE, "메모리가 부족해 인덱스를 만들 수 없습니다");
             return -1;
         }
         if (fn != NULL && fn(&row, ctx) != 0) {
-            db_error_set(err, "조회 결과 처리에 실패했습니다");
+            db_error_setk(err, DBE_SINK, "조회 결과 처리에 실패했습니다");
             return -1;
         }
     }
-    t->last_id = prev_id;
+    if (out_last_id != NULL) {
+        *out_last_id = prev_id;
+    }
     return 0;
 }
 
 int table_scan(Table *t, RowFn fn, void *ctx, DbError *err) {
-    return scan_file(t, NULL, fn, ctx, err);
+    return scan_file(t, NULL, fn, ctx, NULL, err);
 }
 
 int table_find_by_id(Table *t, int64_t id, RowFn fn, void *ctx, DbError *err) {
     char line[LINE_CAP];
+    char eb[128];
     size_t len;
     int64_t offset;
     const char *why = NULL;
@@ -256,27 +263,27 @@ int table_find_by_id(Table *t, int64_t id, RowFn fn, void *ctx, DbError *err) {
         return 0;
     }
     if (offset > LONG_MAX) {
-        db_error_set(err, "데이터 파일이 너무 커서 위치로 이동할 수 없습니다: %s", t->path);
+        db_error_setk(err, DBE_STORAGE, "데이터 파일이 너무 커서 위치로 이동할 수 없습니다: %s", t->path);
         return -1;
     }
     /* 2) 그 위치로 바로 이동해 한 줄만 읽는다. */
     if (fflush(t->fp) != 0 || fseek(t->fp, (long)offset, SEEK_SET) != 0) {
-        db_error_set(err, "데이터 파일 위치 이동 실패: %s (%s)", t->path, strerror(errno));
+        db_error_setk(err, DBE_STORAGE, "데이터 파일 위치 이동 실패: %s (%s)", t->path, db_errstr(errno, eb, sizeof eb));
         return -1;
     }
     r = read_line(t->fp, line, sizeof line, &len, &why);
     if (r == -2) {
-        db_error_set(err, "데이터 파일 읽기 실패: %s", t->path);
+        db_error_setk(err, DBE_STORAGE, "데이터 파일 읽기 실패: %s", t->path);
         return -1;
     }
     /* 3) 읽은 줄이 정말 그 id인지 확인한다. 열린 뒤 파일이 바뀌었으면 여기서 드러난다. */
     if (r != 1 || parse_record(line, len, 0, &row, &why) != 0 || row.id != id) {
-        db_error_set(err, "인덱스와 데이터 파일이 일치하지 않습니다: %s (id %" PRId64 ", 위치 %" PRId64 ")",
+        db_error_setk(err, DBE_STORAGE, "인덱스와 데이터 파일이 일치하지 않습니다: %s (id %" PRId64 ", 위치 %" PRId64 ")",
                      t->path, id, offset);
         return -1;
     }
     if (fn != NULL && fn(&row, ctx) != 0) {
-        db_error_set(err, "조회 결과 처리에 실패했습니다");
+        db_error_setk(err, DBE_SINK, "조회 결과 처리에 실패했습니다");
         return -1;
     }
     return 0;
@@ -300,6 +307,7 @@ typedef struct {
 static int range_visit(int64_t id, int64_t offset, void *vctx) {
     RangeRead *rr = vctx;
     char line[LINE_CAP];
+    char eb[128];
     size_t len;
     const char *why = NULL;
     Row row;
@@ -307,29 +315,29 @@ static int range_visit(int64_t id, int64_t offset, void *vctx) {
 
     if (offset != rr->next_pos) {
         if (offset > LONG_MAX) {
-            db_error_set(rr->err, "데이터 파일이 너무 커서 위치로 이동할 수 없습니다: %s", rr->t->path);
+            db_error_setk(rr->err, DBE_STORAGE, "데이터 파일이 너무 커서 위치로 이동할 수 없습니다: %s", rr->t->path);
             return 1;
         }
         if ((rr->next_pos < 0 && fflush(rr->t->fp) != 0) ||
             fseek(rr->t->fp, (long)offset, SEEK_SET) != 0) {
-            db_error_set(rr->err, "데이터 파일 위치 이동 실패: %s (%s)", rr->t->path, strerror(errno));
+            db_error_setk(rr->err, DBE_STORAGE, "데이터 파일 위치 이동 실패: %s (%s)", rr->t->path, db_errstr(errno, eb, sizeof eb));
             return 1;
         }
     }
     r = read_line(rr->t->fp, line, sizeof line, &len, &why);
     if (r == -2) {
-        db_error_set(rr->err, "데이터 파일 읽기 실패: %s", rr->t->path);
+        db_error_setk(rr->err, DBE_STORAGE, "데이터 파일 읽기 실패: %s", rr->t->path);
         return 1;
     }
     /* table_find_by_id와 같은 재확인: 열린 뒤 파일이 바뀌었으면 엉뚱한 행 대신 오류 */
     if (r != 1 || parse_record(line, len, 0, &row, &why) != 0 || row.id != id) {
-        db_error_set(rr->err, "인덱스와 데이터 파일이 일치하지 않습니다: %s (id %" PRId64 ", 위치 %" PRId64 ")",
+        db_error_setk(rr->err, DBE_STORAGE, "인덱스와 데이터 파일이 일치하지 않습니다: %s (id %" PRId64 ", 위치 %" PRId64 ")",
                      rr->t->path, id, offset);
         return 1;
     }
     rr->next_pos = offset + (int64_t)len + 1;
     if (rr->fn != NULL && rr->fn(&row, rr->ctx) != 0) {
-        db_error_set(rr->err, "조회 결과 처리에 실패했습니다");
+        db_error_setk(rr->err, DBE_SINK, "조회 결과 처리에 실패했습니다");
         return 1;
     }
     return 0;
@@ -346,43 +354,83 @@ int table_find_id_range(Table *t, int64_t lo, int64_t hi, RowFn fn, void *ctx, D
     return bpt_range(t->index, lo, hi, range_visit, &rr) == 0 ? 0 : -1;
 }
 
+#ifdef MINIDB_TESTING
+static int g_fail_write; /* 1이면 다음 append가 줄의 앞부분만 쓰고 쓰기 실패로 끝난다 */
+void table_test_fail_write(int on) { g_fail_write = on; }
+#endif
+
 int table_append(Table *t, const char *name, int age, int64_t *out_id, DbError *err) {
     size_t name_len = strlen(name);
     int64_t id;
     long offset;
+    char eb[128];
 
+    if (out_id != NULL) {
+        *out_id = 0;
+    }
     /* 파일 형식을 깨는 값은 Executor 검증과 별개로 여기서도 막는다. */
     if (name_len == 0 || name_len > NAME_MAX_BYTES || strpbrk(name, "\t\r\n") != NULL ||
         age < AGE_MIN || age > AGE_MAX) {
-        db_error_set(err, "저장할 수 없는 레코드입니다");
+        db_error_setk(err, DBE_STORAGE, "저장할 수 없는 레코드입니다");
         return -1;
     }
     if (t->last_id == INT64_MAX) {
-        db_error_set(err, "더 이상 부여할 ID가 없습니다");
+        db_error_setk(err, DBE_STORAGE, "더 이상 부여할 ID가 없습니다");
         return -1;
     }
     id = t->last_id + 1;
 
-    /* 새 줄이 시작할 위치(= 현재 파일 크기)를 기록 전에 구해 둔다. */
-    if (fseek(t->fp, 0, SEEK_END) != 0 || (offset = ftell(t->fp)) < 0 ||
-        fprintf(t->fp, "%" PRId64 "\t%s\t%d\n", id, name, age) < 0 ||
-        fflush(t->fp) != 0) {
-        db_error_set(err, "데이터 파일 쓰기 실패: %s (%s)", t->path, strerror(errno));
+    /* 새 줄이 시작할 위치(= 현재 파일 크기)를 기록 전에 구해 둔다. 여기까지는 파일을 바꾸지 않았다. */
+    if (fseek(t->fp, 0, SEEK_END) != 0 || (offset = ftell(t->fp)) < 0) {
+        db_error_setk(err, DBE_STORAGE, "데이터 파일 위치 확인 실패: %s (%s)", t->path,
+                      db_errstr(errno, eb, sizeof eb));
         return -1;
     }
+#ifdef MINIDB_TESTING
+    if (g_fail_write) {
+        g_fail_write = 0;
+        fprintf(t->fp, "%" PRId64 "\t", id); /* 줄의 앞부분만 남긴다 */
+        fflush(t->fp);
+        errno = EIO;
+        db_error_setk(err, DBE_WRITE_FAILED, "데이터 파일 쓰기 실패: %s (%s)", t->path,
+                      db_errstr(errno, eb, sizeof eb));
+        return -1;
+    }
+#endif
+    /* 쓰기 도중 실패하면 줄 전체·일부·없음 중 무엇이 남았는지 알 수 없다. */
+    if (fprintf(t->fp, "%" PRId64 "\t%s\t%d\n", id, name, age) < 0 || fflush(t->fp) != 0) {
+        db_error_setk(err, DBE_WRITE_FAILED, "데이터 파일 쓰기 실패: %s (%s)", t->path,
+                      db_errstr(errno, eb, sizeof eb));
+        return -1;
+    }
+    /* 여기부터는 파일 기록 완료(운영체제에 넘어감, fsync는 하지 않음). */
     t->last_id = id;
-    /* 파일에 기록한 뒤 인덱스에 등록한다. 실패는 메모리 부족뿐이고, 이때 레코드는 파일에 남는다.
-     * 다음 실행의 table_open이 파일에서 인덱스를 다시 만들므로 파일 기준으로는 일관된다. */
-    if (bpt_insert(t->index, id, (int64_t)offset) != BPT_OK) {
-        db_error_set(err, "메모리가 부족해 id %" PRId64 "를 인덱스에 등록하지 못했습니다 "
-                     "(레코드는 저장됨, 다시 실행하면 인덱스가 재구성됨)", id);
-        return -1;
-    }
     if (out_id != NULL) {
         *out_id = id;
     }
+    /* 파일에 기록한 뒤 인덱스에 등록한다. 실패해도 레코드는 파일에 남는다.
+     * 다음 실행의 table_open이 파일에서 인덱스를 다시 만든다. *out_id는 기록된 id 그대로 둔다.
+     * 정상이라면 실패 원인은 메모리 부족뿐이다. 중복은 last_id 갱신이 동시에 일어난 경우(잠금 없음)에만 생긴다. */
+    switch (bpt_insert(t->index, id, (int64_t)offset)) {
+    case BPT_OK: break;
+    case BPT_DUPLICATE:
+        db_error_setk(err, DBE_INDEX_FAILED,
+                      "id %" PRId64 "가 이미 인덱스에 있어 등록하지 못했습니다 (레코드는 저장됨)", id);
+        return -1;
+    default:
+        db_error_setk(err, DBE_INDEX_FAILED,
+                      "메모리가 부족해 id %" PRId64 "를 인덱스에 등록하지 못했습니다 "
+                      "(레코드는 저장됨, 다시 실행하면 인덱스가 재구성됨)", id);
+        return -1;
+    }
     return 0;
 }
+
+int64_t table_last_id(const Table *t) { return t->last_id; }
+
+#ifdef MINIDB_TESTING
+int table_test_validate_index(const Table *t, char *why, size_t cap) { return bpt_validate(t->index, why, cap); }
+#endif
 
 int table_index_height(const Table *t) { return bpt_height(t->index); }
 
@@ -401,6 +449,7 @@ void table_index_stats(const Table *t, IndexStats *out) {
 }
 
 int table_close(Table *t, DbError *err) {
+    char eb[128];
     int rc;
 
     if (t == NULL) {
@@ -408,7 +457,7 @@ int table_close(Table *t, DbError *err) {
     }
     rc = fclose(t->fp);
     if (rc != 0) {
-        db_error_set(err, "데이터 파일 닫기 실패: %s (%s)", t->path, strerror(errno));
+        db_error_setk(err, DBE_STORAGE, "데이터 파일 닫기 실패: %s (%s)", t->path, db_errstr(errno, eb, sizeof eb));
     }
     bpt_destroy(t->index);
     free(t->path);

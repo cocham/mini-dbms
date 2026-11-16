@@ -2,6 +2,20 @@
 
 C로 SQL 파일을 실행하고 데이터를 파일에 저장하는 CLI(Phase 1)에, id B+ 트리 인덱스(Phase 2)를 붙였다.
 
+## Phase 3 — API 서버 (진행 중)
+
+현재 상태: **P3-01(엔진 진입점과 전역 잠금)까지 완료.** CLI 동작은 그대로이고, 엔진 앞에 잠금을 가진 진입점(`src/db.h`)이 생겼다. 다음 단위(P3-02)에서 `curl`로 요청을 보낼 수 있는 최소 서버가 나온다.
+
+1. [개발 명세](docs/phase3/spec.md): API 계약, 오류 코드, 크기 제한, 저장 후 실패, 동시성 계약
+2. [설계와 결정](docs/phase3/design.md): 엔진 연결, 지금 코드의 동시성 문제, 잠금 단계, 서버 구조
+3. [작업 순서](docs/phase3/tasks.md): P3-01~P3-05, 단위별 흐름·확인 시나리오·검증 기록
+
+```bash
+make test                      # Windows·Linux: 단위(동시 정확성 포함)·CLI 테스트
+docker run --rm --security-opt seccomp=unconfined -v "$PWD:/src" -w /src gcc:13 make tsan       # 데이터 경쟁 검사
+docker run --rm --security-opt seccomp=unconfined -v "$PWD:/src" -w /src gcc:13 make race-demo  # 잠금 없는 엔진 관찰 실험
+```
+
 ## Phase 2 — B+ 트리 인덱스 (완료)
 
 현재 상태: **P2-01~P2-05 완료.** `WHERE id = ?`는 B+ 트리에서 바이트 위치를 찾아 그 한 줄만 읽고, `WHERE id BETWEEN a AND b`·`id < v` 등은 리프 연결을 따라 범위 안의 줄만 읽고, `EXPLAIN SELECT ...`는 조회 없이 실행 계획(INDEX LOOKUP / INDEX RANGE SCAN / FULL SCAN과 계획 시점 통계)을 보여 준다.

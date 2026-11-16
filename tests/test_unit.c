@@ -7,7 +7,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <pthread.h>
+
 #include "bptree.h"
+#include "db.h"
 #include "executor.h"
 #include "parser.h"
 #include "storage.h"
@@ -110,7 +113,7 @@ static int parse_one(const char *sql, Statement *st, DbError *err) {
 #define EXPECT_PARSE_ERROR(sql, needle)                                                   \
     do {                                                                                  \
         Statement st_;                                                                    \
-        DbError e_ = {{0}};                                                               \
+        DbError e_ = {{0}, DBE_NONE};                                                               \
         int r_ = parse_one((sql), &st_, &e_);                                             \
         CHECK(r_ == -1);                                                                  \
         CHECK(strstr(e_.msg, (needle)) != NULL);                                          \
@@ -127,7 +130,7 @@ static int parse_one(const char *sql, Statement *st, DbError *err) {
 static void test_parse_insert_basic(void) {
     const char *sql = "INSERT INTO users (name, age) VALUES ('민수', 25);";
     Statement st;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     size_t pos = 0;
 
     CHECK(parser_next(sql, &pos, &st, &err) == 1);
@@ -142,7 +145,7 @@ static void test_parse_insert_basic(void) {
 
 static void test_parse_column_order_and_case(void) {
     Statement st;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
 
     CHECK(parse_one("insert into USERS (Age, NAME) values (30, 'O''Brien');", &st, &err) == 1);
     CHECK(st.kind == STMT_INSERT);
@@ -153,7 +156,7 @@ static void test_parse_column_order_and_case(void) {
 
 static void test_parse_string_special_and_multiline(void) {
     Statement st;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
 
     CHECK(parse_one("INSERT\n  INTO users\n(name,\tage)\r\nVALUES\n('a;b ''c''',\n 0)\n;", &st,
                     &err) == 1);
@@ -170,7 +173,7 @@ static void test_parse_string_special_and_multiline(void) {
 static void test_parse_select_and_sequence(void) {
     const char *sql = "SELECT * FROM users; insert into users (name, age) values ('x', 1);\n  \n";
     Statement st;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     size_t pos = 0;
 
     CHECK(parser_next(sql, &pos, &st, &err) == 1);
@@ -188,7 +191,7 @@ static void test_parse_select_and_sequence(void) {
 
 static void test_parse_empty_input(void) {
     Statement st;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
 
     CHECK(parse_one("", &st, &err) == 0);
     CHECK(parse_one(" \n\t\r\n ", &st, &err) == 0);
@@ -196,7 +199,7 @@ static void test_parse_empty_input(void) {
 
 static void test_parse_comment_only(void) {
     Statement st;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
 
     CHECK(parse_one("-- 주석만 있음", &st, &err) == 0);           /* 줄 끝 LF 없이 입력 끝 */
     CHECK(parse_one("-- a\n-- b\n", &st, &err) == 0);
@@ -212,7 +215,7 @@ static void test_parse_comments_around_and_inside(void) {
         "(name, /* 컬럼 사이 */ age) VALUES ('a', 1);-- 바로 뒤\n"
         "SELECT*/**/FROM/*x*/users;/* 뒤 */ -- 마지막";
     Statement st;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     size_t pos = 0;
 
     CHECK(parser_next(sql, &pos, &st, &err) == 1);
@@ -231,7 +234,7 @@ static void test_parse_comments_around_and_inside(void) {
 
 static void test_parse_comment_symbols_in_string(void) {
     Statement st;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
 
     CHECK(parse_one("INSERT INTO users (name, age) VALUES ('a--b /* c */ d', 1);", &st, &err) ==
           1);
@@ -255,7 +258,7 @@ static void test_parse_comment_errors(void) {
 
 static void expect_where(const char *sql, WhereKind kind, int64_t value) {
     Statement st;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     int r = parse_one(sql, &st, &err);
 
     CHECK(r == 1);
@@ -313,7 +316,7 @@ static void test_parse_next_statement_error_isolated(void) {
     /* 첫 문장은 성공해야 하고, 두 번째 문장의 잘못된 문자는 두 번째에서만 보고된다. */
     const char *sql = "SELECT * FROM users; SELECT # FROM users;";
     Statement st;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     size_t pos = 0;
 
     CHECK(parser_next(sql, &pos, &st, &err) == 1);
@@ -355,7 +358,7 @@ static void test_parse_errors(void) {
 
 static void test_parse_explain(void) {
     Statement st;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
 
     CHECK(parse_one("EXPLAIN SELECT * FROM users WHERE id = 3;", &st, &err) == 1);
     CHECK(st.kind == STMT_SELECT && st.explain == 1 && st.where == WHERE_ID && st.where_value == 3);
@@ -398,7 +401,7 @@ static void test_parse_explain_errors(void) {
 
 static void expect_range(const char *sql, CmpOp op, int64_t v1, int64_t v2) {
     Statement st;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     int r = parse_one(sql, &st, &err);
 
     CHECK(r == 1);
@@ -415,7 +418,7 @@ static void expect_range(const char *sql, CmpOp op, int64_t v1, int64_t v2) {
 
 static void test_parse_id_range(void) {
     Statement st;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
 
     expect_range("SELECT * FROM users WHERE id BETWEEN 10 AND 20;", CMP_BETWEEN, 10, 20);
     expect_range("select * from users where ID between -5 and 3;", CMP_BETWEEN, -5, 3);
@@ -466,7 +469,7 @@ static void test_parse_id_range_errors(void) {
 static void test_storage_empty_then_append(void) {
     const char *dir = fresh_dir("empty");
     Table *t = NULL;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     Collected c;
     int64_t id = 0;
 
@@ -483,7 +486,7 @@ static void test_storage_empty_then_append(void) {
 static void test_storage_persist_and_restore_id(void) {
     const char *dir = fresh_dir("persist");
     Table *t = NULL;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     Collected c;
     int64_t id = 0;
     char buf[256];
@@ -515,7 +518,7 @@ static void test_storage_persist_and_restore_id(void) {
 static void expect_corrupt(const char *data, size_t len, const char *needle) {
     const char *dir = fresh_dir("corrupt");
     Table *t = NULL;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
 
     write_file(dir, data, len);
     CHECK(table_open(dir, &t, &err) == -1);
@@ -562,7 +565,7 @@ static void test_storage_max_id(void) {
     const char *dir = fresh_dir("maxid");
     const char data[] = "9223372036854775807\ta\t1\n";
     Table *t = NULL;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     int64_t id = 0;
 
     write_file(dir, data, sizeof data - 1);
@@ -575,7 +578,7 @@ static void test_storage_max_id(void) {
 static void test_storage_rejects_bad_record(void) {
     const char *dir = fresh_dir("badrec");
     Table *t = NULL;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     char buf[64];
     int64_t id = 0;
 
@@ -591,7 +594,7 @@ static void test_storage_callback_stop(void) {
     const char *dir = fresh_dir("stop");
     const char data[] = "1\ta\t1\n2\tb\t2\n3\tc\t3\n";
     Table *t = NULL;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     Collected c;
 
     write_file(dir, data, sizeof data - 1);
@@ -607,7 +610,7 @@ static void test_storage_open_failure(void) {
     char path[512];
     FILE *fp;
     Table *t = NULL;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
 
     /* 데이터 디렉터리 자리에 일반 파일이 있으면 열 수 없다. */
     snprintf(path, sizeof path, "%s/not_a_dir", g_base);
@@ -632,7 +635,7 @@ static int count_insert(int64_t id, void *ctx) {
 static void expect_exec_error(Table *t, const char *name, int age, const char *needle) {
     char buf[300];
     Statement st = {STMT_INSERT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0};
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
 
     snprintf(buf, sizeof buf, "%s", name);
     st.kind = STMT_INSERT;
@@ -648,7 +651,7 @@ static void expect_exec_error(Table *t, const char *name, int age, const char *n
 static void test_executor_validation(void) {
     const char *dir = fresh_dir("exec_valid");
     Table *t = NULL;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     char name255[256];
     char name256[257];
     char buf[64];
@@ -690,7 +693,7 @@ static void test_executor_validation(void) {
 static void test_executor_insert_select(void) {
     const char *dir = fresh_dir("exec_flow");
     Table *t = NULL;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     Collected c;
     int64_t last = 0;
     char kim[] = "kim";
@@ -724,7 +727,7 @@ static void test_executor_insert_select(void) {
 static int select_where(Table *t, WhereKind kind, int64_t value, int64_t *ids) {
     Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0};
     ResultSink sink = {NULL, collect_row, NULL, NULL};
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     Collected c;
     int i;
 
@@ -743,7 +746,7 @@ static void test_executor_where(void) {
     const char *dir = fresh_dir("exec_where");
     const char data[] = "1\ta\t25\n2\tb\t30\n3\tc\t25\n5\td\t40\n6\te\t25\n";
     Table *t = NULL;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     int64_t ids[8];
 
     write_file(dir, data, sizeof data - 1); /* id 4가 빠진 파일(증가 순서만 요구) */
@@ -794,7 +797,7 @@ static void test_executor_id_uses_index_age_scans(void) {
     const char *dir = fresh_dir("exec_where_corrupt");
     const char good[] = "1\ta\t25\n2\tb\t30\n";
     Table *t = NULL;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     Statement by_id = {STMT_SELECT, NULL, 0, WHERE_ID, 1, 0, CMP_EQ, 0};
     Statement by_id2 = {STMT_SELECT, NULL, 0, WHERE_ID, 2, 0, CMP_EQ, 0};
     Statement by_age = {STMT_SELECT, NULL, 0, WHERE_AGE, 25, 0, CMP_EQ, 0};
@@ -848,7 +851,7 @@ static int row_must_not_be_called(const Row *row, void *ctx) {
 static void test_executor_plan_paths_and_stats(void) {
     const char *dir = fresh_dir("exec_plan");
     Table *t = NULL;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0};
     Statement ins = {STMT_INSERT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0};
     QueryPlan plan;
@@ -908,7 +911,7 @@ static void test_executor_explain_does_not_execute(void) {
     const char *dir = fresh_dir("exec_explain");
     const char good[] = "1\ta\t25\n2\tb\t30\n";
     Table *t = NULL;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     Statement ex_age = {STMT_SELECT, NULL, 0, WHERE_AGE, 25, 1, CMP_EQ, 0};
     Statement ex_id = {STMT_SELECT, NULL, 0, WHERE_ID, 2, 1, CMP_EQ, 0};
     Statement sel_age = {STMT_SELECT, NULL, 0, WHERE_AGE, 25, 0, CMP_EQ, 0};
@@ -954,7 +957,7 @@ static void test_executor_explain_does_not_execute(void) {
 static int select_range(Table *t, CmpOp op, int64_t v1, int64_t v2, int64_t *out, int cap) {
     Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 0, 0, CMP_EQ, 0};
     ResultSink sink = {NULL, collect_row, NULL, NULL};
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     Collected c;
     int i;
 
@@ -976,7 +979,7 @@ static void test_executor_id_range(void) {
     const char *dir = fresh_dir("exec_range");
     const char data[] = "1\ta\t25\n2\tb\t30\n3\tc\t25\n5\td\t40\n6\te\t25\n9\tf\t1\n";
     Table *t = NULL;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     int64_t ids[8];
     QueryPlan plan;
     Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 2, 0, CMP_BETWEEN, 5};
@@ -1037,7 +1040,7 @@ static void test_executor_id_range(void) {
 static void test_executor_range_matches_scan(void) {
     const char *dir = fresh_dir("exec_range_scan");
     Table *t = NULL;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     char name[64];
     int64_t id;
     int i;
@@ -1086,7 +1089,7 @@ static void test_executor_range_reads_only_inside(void) {
     const char *dir = fresh_dir("exec_range_corrupt");
     const char good[] = "1\ta\t25\n2\tb\t30\n";
     Table *t = NULL;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     Statement r11 = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 1, 0, CMP_BETWEEN, 1};
     Statement r12 = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 1, 0, CMP_BETWEEN, 2};
     Statement empty = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 2, 0, CMP_BETWEEN, 1};
@@ -1475,7 +1478,7 @@ static void test_bpt_range(void) {
 static void test_storage_index_lookup(void) {
     const char *dir = fresh_dir("index_lookup");
     Table *t = NULL;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     Collected c;
     int64_t id;
 
@@ -1510,7 +1513,7 @@ static void test_storage_index_rebuilt_on_open(void) {
     const char *dir = fresh_dir("index_rebuild");
     const char data[] = "1\t가\t1\n2\tbb\t22\n5\t다라마\t150\n9\tz\t0\n";
     Table *t = NULL;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     Collected c;
     int64_t id;
 
@@ -1541,7 +1544,7 @@ static void test_storage_index_many_records(void) {
     enum { N = 5000 };
     const char *dir = fresh_dir("index_many");
     Table *t = NULL;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     char name[300];
     int pass;
     int i;
@@ -1616,7 +1619,7 @@ static void test_bpt_mem_stats(void) {
 static void test_storage_index_stats(void) {
     const char *dir = fresh_dir("index_stats");
     Table *t = NULL;
-    DbError err = {{0}};
+    DbError err = {{0}, DBE_NONE};
     IndexStats ix;
     int64_t id;
     int i;
@@ -1631,6 +1634,425 @@ static void test_storage_index_stats(void) {
     CHECK(ix.height == 2 && ix.keys == 64 && ix.leaves == 2 && ix.internals == 1);
     CHECK(ix.height == table_index_height(t) && ix.keys == table_row_count(t));
     CHECK(table_close(t, &err) == 0);
+}
+
+
+/* ---------- Phase 3 / P3-01: DB 진입점, 중단 상태, 동시 정확성 ---------- */
+
+static int count_row(const Row *row, void *ctx) {
+    (void)row;
+    (*(int *)ctx)++;
+    return 0;
+}
+
+static int remember_id(int64_t id, void *ctx) {
+    *(int64_t *)ctx = id;
+    return 0;
+}
+
+static int db_insert(Db *db, const char *name, int age, int64_t *out_id, int64_t *stored, DbError *err) {
+    Statement st = {STMT_INSERT, (char *)name, age, WHERE_NONE, 0, 0, CMP_EQ, 0};
+    ResultSink sink = {remember_id, NULL, out_id, NULL};
+    return db_exec(db, &st, &sink, stored, err);
+}
+
+static int db_count(Db *db, WhereKind where, int64_t v, DbError *err) {
+    Statement st = {STMT_SELECT, NULL, 0, where, v, 0, CMP_EQ, 0};
+    int n = 0;
+    ResultSink sink = {NULL, count_row, &n, NULL};
+    return db_exec(db, &st, &sink, NULL, err) == 0 ? n : -1;
+}
+
+/* CLI와 같은 결과: db_exec는 executor_run을 잠금 안에서 부를 뿐이다. 오류 종류도 구분된다. */
+static void test_db_exec_basic_and_kinds(void) {
+    const char *dir = fresh_dir("p3_db_basic");
+    DbError err = {{0}, DBE_NONE};
+    Db *db = NULL;
+    int64_t id = 0, stored = -1;
+
+    CHECK(db_open(dir, &db, &err) == 0);
+    CHECK(db_state(db) == DB_OK);
+    CHECK(db_insert(db, "a", 1, &id, &stored, &err) == 0 && id == 1 && stored == 0);
+    CHECK(db_insert(db, "b", 2, &id, &stored, &err) == 0 && id == 2);
+    CHECK(db_count(db, WHERE_ID, 2, &err) == 1);
+    CHECK(db_count(db, WHERE_NONE, 0, &err) == 2);
+
+    /* 값 오류: DBE_SQL, 상태는 그대로, 파일 변화 없음 */
+    CHECK(db_insert(db, "c", 151, &id, &stored, &err) == -1);
+    CHECK(err.kind == DBE_SQL && stored == 0);
+    CHECK(db_state(db) == DB_OK);
+    /* INSERT에 EXPLAIN 계획 요청 같은 엔진 쪽 문장 오류도 DBE_SQL */
+    {
+        Statement st = {STMT_INSERT, (char *)"x", 1, WHERE_NONE, 0, 1, CMP_EQ, 0};
+        QueryPlan plan;
+        CHECK(executor_plan(NULL, &st, &plan, &err) == -1 && err.kind == DBE_SQL);
+    }
+    /* 결과 콜백 실패: DBE_SINK */
+    {
+        Statement st = {STMT_SELECT, NULL, 0, WHERE_ID, 1, 0, CMP_EQ, 0};
+        Collected c;
+        ResultSink sink = {NULL, collect_row, &c, NULL};
+        c.count = 0;
+        c.stop_after = 1;
+        CHECK(db_exec(db, &st, &sink, NULL, &err) == -1 && err.kind == DBE_SINK);
+        CHECK(db_state(db) == DB_OK);
+    }
+    /* 선형 탐색이 last_id를 바꾸지 않음: 조회 뒤에도 다음 id는 3 */
+    CHECK(db_count(db, WHERE_AGE, 2, &err) == 1);
+    CHECK(db_insert(db, "c", 3, &id, &stored, &err) == 0 && id == 3);
+    CHECK(db_close(db, &err) == 0);
+    CHECK(db_close(NULL, &err) == 0);
+}
+
+/* 파일 기록 완료 뒤 인덱스 등록 실패 → stored_id, DB_HALTED_INDEX, 이후 실행 거부, 재시작으로 복구 */
+static void test_db_halt_after_index_failure(void) {
+    const char *dir = fresh_dir("p3_db_halt_index");
+    DbError err = {{0}, DBE_NONE};
+    Db *db = NULL;
+    int64_t id = 0, stored = -1;
+    char name[16];
+    int i, n = 0;
+    Collected c;
+
+    CHECK(db_open(dir, &db, &err) == 0);
+    /* 차수 64: 리프에 63개가 차면 64번째 삽입이 분할(메모리 할당)을 한다 */
+    for (i = 1; i <= 63; i++) {
+        snprintf(name, sizeof name, "u%d", i);
+        CHECK(db_insert(db, name, i % 151, &id, &stored, &err) == 0);
+    }
+    bpt_test_fail_alloc_after(0);
+    CHECK(db_insert(db, "lost-index", 30, &id, &stored, &err) == -1);
+    bpt_test_fail_alloc_after(-1);
+    CHECK(err.kind == DBE_INDEX_FAILED);
+    CHECK(stored == 64);
+    CHECK(strstr(err.msg, "레코드는 저장됨") != NULL);
+    CHECK(db_state(db) == DB_HALTED_INDEX);
+
+    /* 중단 상태: 조회도 INSERT도 실행하지 않는다 */
+    {
+        Statement st = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0};
+        ResultSink sink = {NULL, count_row, &n, NULL};
+        CHECK(db_exec(db, &st, &sink, &stored, &err) == -1);
+        CHECK(err.kind == DBE_HALTED && stored == 0 && n == 0);
+        CHECK(strstr(err.msg, "인덱스를 다시 만듭니다") != NULL);
+    }
+    CHECK(db_insert(db, "after", 1, &id, &stored, &err) == -1 && err.kind == DBE_HALTED);
+    CHECK(db_close(db, &err) == 0);
+
+    /* 파일은 온전하므로 재시작하면 64번이 인덱스로 보인다. "after"는 없다 */
+    CHECK(db_open(dir, &db, &err) == 0);
+    {
+        Statement st = {STMT_SELECT, NULL, 0, WHERE_ID, 64, 0, CMP_EQ, 0};
+        ResultSink sink = {NULL, collect_row, &c, NULL};
+        c.count = 0;
+        c.stop_after = 0;
+        CHECK(db_exec(db, &st, &sink, NULL, &err) == 0);
+        CHECK(c.count == 1 && c.ids[0] == 64 && strcmp(c.names[0], "lost-index") == 0);
+    }
+    CHECK(db_count(db, WHERE_NONE, 0, &err) == 64);
+    CHECK(db_state(db) == DB_OK);
+    CHECK(db_close(db, &err) == 0);
+}
+
+/* 쓰기 도중 실패 → stored_id 없음, DB_HALTED_WRITE. 줄 일부가 남으면 재시작이 손상으로 거부된다 */
+static void test_db_halt_after_write_failure(void) {
+    const char *dir = fresh_dir("p3_db_halt_write");
+    DbError err = {{0}, DBE_NONE};
+    Db *db = NULL;
+    int64_t id = 0, stored = -1;
+    char buf[256];
+
+    CHECK(db_open(dir, &db, &err) == 0);
+    CHECK(db_insert(db, "a", 1, &id, &stored, &err) == 0);
+    table_test_fail_write(1);
+    CHECK(db_insert(db, "b", 2, &id, &stored, &err) == -1);
+    CHECK(err.kind == DBE_WRITE_FAILED);
+    CHECK(stored == 0); /* 기록 여부를 모르므로 알려 주지 않는다 */
+    CHECK(db_state(db) == DB_HALTED_WRITE);
+    CHECK(db_count(db, WHERE_ID, 1, &err) == -1 && err.kind == DBE_HALTED);
+    CHECK(strstr(err.msg, "쓰기 실패 이후") != NULL);
+    CHECK(db_close(db, &err) == 0);
+
+    read_file(dir, buf, sizeof buf);
+    CHECK(strcmp(buf, "1\ta\t1\n2\t") == 0);
+    CHECK(db_open(dir, &db, &err) == -1);
+    CHECK(strstr(err.msg, "데이터 파일 손상") != NULL);
+}
+
+/*
+ * 동시 정확성 (C1~C4). 스레드 여러 개가 db_exec로 INSERT와 여러 조회를 섞어 실행한다.
+ * 각 스레드는 자기가 확실히 아는 사실만 검사한다(삭제가 없으므로 id는 1..최대까지 빈틈없음).
+ * 검사 결과는 스레드별 카운터에 담고, CHECK는 모든 스레드가 끝난 뒤 메인 스레드에서 한다.
+ */
+#define CT_THREADS 8
+#define CT_OPS 400
+#define CT_MAX_INS CT_OPS
+
+typedef struct {
+    Db *db;
+    int tid;
+    uint32_t seed;
+    int n_ins;
+    int64_t ids[CT_MAX_INS];
+    char names[CT_MAX_INS][32];
+    int bad_insert;    /* INSERT 실패 */
+    int bad_readback;  /* 방금 넣은 행을 id로 못 찾음 (C3) */
+    int bad_lookup;    /* 이미 있다고 아는 id를 못 찾거나 엉뚱한 행 */
+    int bad_range;     /* 범위 결과가 a부터 빈틈없이 이어지지 않음, 아는 최대보다 짧음 */
+    int bad_scan;      /* 전체 결과가 1부터 빈틈없지 않음, 아는 최대보다 짧음 */
+    int bad_plan;      /* EXPLAIN 행 수가 아는 최대보다 작음 */
+    int errors;        /* 그 밖의 엔진 오류 */
+    char first_error[256];
+} CtState;
+
+typedef struct {
+    int64_t expect_next; /* 다음에 와야 하는 id */
+    int64_t count;
+    int broken;
+    const char *want_name; /* NULL이 아니면 첫 행의 이름도 확인 */
+} SeqCheck;
+
+static int seq_row(const Row *row, void *ctx) {
+    SeqCheck *s = ctx;
+    if (row->id != s->expect_next) {
+        s->broken = 1;
+    }
+    if (s->want_name != NULL && s->count == 0 && strcmp(row->name, s->want_name) != 0) {
+        s->broken = 1;
+    }
+    s->expect_next = row->id + 1;
+    s->count++;
+    return 0;
+}
+
+typedef struct {
+    int64_t total_rows;
+} PlanSeen;
+
+static int plan_seen(const QueryPlan *plan, void *ctx) {
+    ((PlanSeen *)ctx)->total_rows = plan->stats.total_rows;
+    return 0;
+}
+
+static uint32_t ct_rand(uint32_t *s) {
+    *s = *s * 1664525u + 1013904223u;
+    return *s >> 8;
+}
+
+static void ct_error(CtState *cs, const DbError *err) {
+    if (cs->errors++ == 0) {
+        snprintf(cs->first_error, sizeof cs->first_error, "%s", err->msg);
+    }
+}
+
+static void *ct_worker(void *arg) {
+    CtState *cs = arg;
+    int64_t known_max = 0; /* 이 스레드가 "이미 있다"고 확신하는 가장 큰 id */
+    int op;
+
+    for (op = 0; op < CT_OPS; op++) {
+        uint32_t k = ct_rand(&cs->seed) % 100;
+        DbError err = {{0}, DBE_NONE};
+
+        if (k < 40) {
+            char name[32];
+            int64_t id = 0;
+            SeqCheck sc = {0, 0, 0, NULL};
+            Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID, 0, 0, CMP_EQ, 0};
+            ResultSink rs = {NULL, seq_row, &sc, NULL};
+
+            snprintf(name, sizeof name, "t%d_%d", cs->tid, op);
+            if (db_insert(cs->db, name, (cs->tid * 7 + op) % 151, &id, NULL, &err) != 0) {
+                cs->bad_insert++;
+                ct_error(cs, &err);
+                continue;
+            }
+            snprintf(cs->names[cs->n_ins], sizeof cs->names[0], "%s", name);
+            cs->ids[cs->n_ins++] = id;
+            if (id > known_max) {
+                known_max = id;
+            }
+            /* C3: 성공을 받은 INSERT는 바로 다음 조회에 보인다 */
+            sel.where_value = id;
+            sc.expect_next = id;
+            sc.want_name = name;
+            if (db_exec(cs->db, &sel, &rs, NULL, &err) != 0) {
+                ct_error(cs, &err);
+            } else if (sc.count != 1 || sc.broken) {
+                cs->bad_readback++;
+            }
+        } else if (k < 60) {
+            int64_t x;
+            SeqCheck sc = {0, 0, 0, NULL};
+            Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID, 0, 0, CMP_EQ, 0};
+            ResultSink rs = {NULL, seq_row, &sc, NULL};
+
+            if (known_max == 0) {
+                continue;
+            }
+            x = 1 + (int64_t)(ct_rand(&cs->seed) % (uint32_t)known_max);
+            sel.where_value = x;
+            sc.expect_next = x;
+            if (db_exec(cs->db, &sel, &rs, NULL, &err) != 0) {
+                ct_error(cs, &err);
+            } else if (sc.count != 1 || sc.broken) {
+                cs->bad_lookup++;
+            }
+        } else if (k < 80) {
+            int64_t a, b, want;
+            SeqCheck sc = {0, 0, 0, NULL};
+            Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 0, 0, CMP_BETWEEN, 0};
+            ResultSink rs = {NULL, seq_row, &sc, NULL};
+
+            if (known_max == 0) {
+                continue;
+            }
+            a = 1 + (int64_t)(ct_rand(&cs->seed) % (uint32_t)known_max);
+            b = a + 20;
+            sel.where_value = a;
+            sel.where_value2 = b;
+            sc.expect_next = a;
+            want = (b < known_max ? b : known_max) - a + 1; /* 적어도 이만큼은 있어야 한다 */
+            if (db_exec(cs->db, &sel, &rs, NULL, &err) != 0) {
+                ct_error(cs, &err);
+            } else if (sc.broken || sc.count < want || sc.count > 21) {
+                cs->bad_range++;
+            }
+        } else if (k < 90) {
+            SeqCheck sc = {1, 0, 0, NULL};
+            Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0};
+            ResultSink rs = {NULL, seq_row, &sc, NULL};
+
+            if (db_exec(cs->db, &sel, &rs, NULL, &err) != 0) {
+                ct_error(cs, &err);
+            } else if (sc.broken || sc.count < known_max) {
+                cs->bad_scan++;
+            } else {
+                known_max = sc.count; /* 전체를 봤으므로 그만큼은 확실히 있다 */
+            }
+        } else {
+            PlanSeen ps = {-1};
+            Statement sel = {STMT_SELECT, NULL, 0, WHERE_AGE, 30, 1, CMP_EQ, 0};
+            ResultSink rs = {NULL, NULL, &ps, plan_seen};
+
+            if (db_exec(cs->db, &sel, &rs, NULL, &err) != 0) {
+                ct_error(cs, &err);
+            } else if (ps.total_rows < known_max) {
+                cs->bad_plan++;
+            }
+        }
+    }
+    return NULL;
+}
+
+typedef struct {
+    int64_t count;
+    int64_t next;
+    int broken;
+    int64_t total;
+    const char *const *names; /* names[1..total] */
+} FinalCheck;
+
+static int final_row(const Row *row, void *ctx) {
+    FinalCheck *f = ctx;
+    if (row->id != f->next || row->id > f->total || f->names[row->id] == NULL ||
+        strcmp(row->name, f->names[row->id]) != 0) {
+        f->broken = 1;
+    }
+    f->next++;
+    f->count++;
+    return 0;
+}
+
+static void test_db_concurrent_correctness(void) {
+    const char *dir = fresh_dir("p3_db_concurrent");
+    static CtState st[CT_THREADS];
+    static const char *names[CT_THREADS * CT_MAX_INS + 1];
+    static unsigned char seen[CT_THREADS * CT_MAX_INS + 1];
+    pthread_t th[CT_THREADS];
+    DbError err = {{0}, DBE_NONE};
+    Db *db = NULL;
+    int64_t total = 0, dup = 0, out_of_range = 0;
+    char why[200] = "";
+    int i, j;
+
+    CHECK(db_open(dir, &db, &err) == 0);
+    for (i = 0; i < CT_THREADS; i++) {
+        memset(&st[i], 0, sizeof st[i]);
+        st[i].db = db;
+        st[i].tid = i;
+        st[i].seed = 0x9E3779B9u * (uint32_t)(i + 1);
+        CHECK(pthread_create(&th[i], NULL, ct_worker, &st[i]) == 0);
+    }
+    for (i = 0; i < CT_THREADS; i++) {
+        pthread_join(th[i], NULL);
+    }
+
+    memset(seen, 0, sizeof seen);
+    memset(names, 0, sizeof names);
+    for (i = 0; i < CT_THREADS; i++) {
+        CtState *cs = &st[i];
+        if (cs->errors != 0) {
+            fprintf(stderr, "    스레드 %d 첫 오류: %s\n", i, cs->first_error);
+        }
+        CHECK(cs->errors == 0);
+        CHECK(cs->bad_insert == 0);
+        CHECK(cs->bad_readback == 0);
+        CHECK(cs->bad_lookup == 0);
+        CHECK(cs->bad_range == 0);
+        CHECK(cs->bad_scan == 0);
+        CHECK(cs->bad_plan == 0);
+        total += cs->n_ins;
+    }
+    /* C1: 받은 id를 모두 모으면 1..total이 정확히 한 번씩 */
+    for (i = 0; i < CT_THREADS; i++) {
+        for (j = 0; j < st[i].n_ins; j++) {
+            int64_t id = st[i].ids[j];
+            if (id < 1 || id > total) {
+                out_of_range++;
+                continue;
+            }
+            if (seen[id]++) {
+                dup++;
+            }
+            names[id] = st[i].names[j];
+        }
+    }
+    CHECK(total > 0);
+    CHECK(dup == 0);
+    CHECK(out_of_range == 0);
+
+    /* 각 id가 그 id를 받은 스레드가 넣은 이름을 가리킨다 (인덱스 → 위치 → 줄) */
+    for (i = 0; i < CT_THREADS; i++) {
+        for (j = 0; j < st[i].n_ins; j++) {
+            Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID, st[i].ids[j], 0, CMP_EQ, 0};
+            Collected c;
+            ResultSink rs = {NULL, collect_row, &c, NULL};
+
+            c.count = 0;
+            c.stop_after = 0;
+            CHECK(db_exec(db, &sel, &rs, NULL, &err) == 0);
+            CHECK(c.count == 1 && strcmp(c.names[0], st[i].names[j]) == 0);
+        }
+    }
+    /* C4: 트리 불변식, 행 수, 재시작 뒤 같은 내용 */
+    CHECK(db_test_validate(db, why, sizeof why) == 0);
+    if (why[0] != '\0') {
+        fprintf(stderr, "    트리 검사: %s\n", why);
+    }
+    CHECK(db_count(db, WHERE_NONE, 0, &err) == total);
+    CHECK(db_state(db) == DB_OK);
+    CHECK(db_close(db, &err) == 0);
+
+    CHECK(db_open(dir, &db, &err) == 0);
+    {
+        FinalCheck f = {0, 1, 0, total, names};
+        Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0};
+        ResultSink rs = {NULL, final_row, &f, NULL};
+        CHECK(db_exec(db, &sel, &rs, NULL, &err) == 0);
+        CHECK(f.count == total && !f.broken);
+    }
+    CHECK(db_close(db, &err) == 0);
 }
 
 int main(int argc, char **argv) {
@@ -1691,6 +2113,11 @@ int main(int argc, char **argv) {
     test_storage_index_many_records();
     test_bpt_mem_stats();
     test_storage_index_stats();
+
+    test_db_exec_basic_and_kinds();
+    test_db_halt_after_index_failure();
+    test_db_halt_after_write_failure();
+    test_db_concurrent_correctness();
 
     printf("단위 테스트: %d개 검사 중 %d개 실패\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
