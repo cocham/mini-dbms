@@ -48,18 +48,26 @@ def one_request(port, body, timeout=60):
         s.close()
 
 
+def parse_loadgen(out):
+    """loadgen 출력 한 줄 → 사전. 처리량은 '구간 안에서 완료된 성공 수 / 구간 길이'(loadgen이 정한 구간).
+    구간이 끝난 뒤 완료된 요청(late)은 성공 수에도 분모에도 넣지 않는다."""
+    v = dict(kv.split("=") for kv in out.split())
+    num = lambda k: float(v[k]) / 1000.0 if float(v[k]) >= 0 else float("nan")  # ms → 초
+    window = float(v["window"])
+    return {
+        "ok": int(v["ok"]), "busy": int(v["busy"]), "other": int(v["other"]),
+        "incomplete": int(v["incomplete"]), "connfail": int(v["connfail"]), "late": int(v["late"]),
+        "window": window, "rps": int(v["ok"]) / window,
+        "p50": num("p50"), "p95": num("p95"), "p99": num("p99"), "max": num("max"),
+    }
+
+
 def loadgen(port, kind, clients, seconds, rows):
     p = subprocess.run([LOADGEN, str(port), kind, str(clients), str(seconds), str(rows)],
                        capture_output=True, text=True, timeout=seconds + 300)
     if p.returncode != 0:
         raise RuntimeError("loadgen 실패: " + p.stderr)
-    v = dict(kv.split("=") for kv in p.stdout.split())
-    num = lambda k: float(v[k]) / 1000.0 if float(v[k]) >= 0 else float("nan")  # ms → 초
-    return {
-        "ok": int(v["ok"]), "busy": int(v["busy"]), "reset": int(v["reset"]), "other": int(v["other"]),
-        "rps": int(v["ok"]) / seconds,
-        "p50": num("p50"), "p95": num("p95"), "p99": num("p99"), "max": num("max"),
-    }
+    return parse_loadgen(p.stdout)
 
 
 # ---------- 서버 ----------
@@ -172,13 +180,13 @@ def ms(v):
 
 def row(label, r):
     lo, hi = r["spread"]
-    return "| %s | %.0f | %.0f ~ %.0f | %s | %s | %s | %s | %d | %d |" % (
+    return "| %s | %.0f | %.0f ~ %.0f | %s | %s | %s | %s | %d | %d | %d |" % (
         label, r["rps"], lo, hi, ms(r["p50"]), ms(r["p95"]), ms(r["p99"]), ms(r["max"]), r["busy"],
-        r["reset"] + r["other"])
+        r["incomplete"] + r["connfail"] + r["other"], r["late"])
 
 
-HEAD = ("| 설정 | 처리량 (성공/초) | 3회 범위 | p50 ms | p95 ms | p99 ms | 최대 ms | 503 | 끊김·기타 |\n"
-        "|---|---|---|---|---|---|---|---|---|")
+HEAD = ("| 설정 | 처리량 (성공/초) | 3회 범위 | p50 ms | p95 ms | p99 ms | 최대 ms | 503 | 불완전·실패·기타 | 늦음(제외) |\n"
+        "|---|---|---|---|---|---|---|---|---|---|")
 
 
 def cli_once(cli, d, sql_path):
@@ -219,8 +227,14 @@ def main():
     say("- 데이터: %d행. 측정마다 같은 원본 파일의 복사본으로 서버를 새로 띄운다. 묶음마다 %.0f초 동안 잰다" % (a.rows, a.seconds))
     say("- 설정마다 같은 서버에 %d회 반복하고 처리량이 가운데인 회차의 값을 쓴다(3회 범위도 함께 적는다)" % REPEAT)
     say("- 요청마다 새 연결(keep-alive 없음). 부하 생성기는 응답을 끝까지 받은 뒤 연결을 재설정(RST)으로 닫아"
-        " TIME_WAIT 연결이 쌓이지 않게 한다(쌓이면 측정끼리 영향을 준다. benchmark.md 참고)")
-    say("- 응답 시간은 클라이언트에서 잰 값(연결부터 응답 끝까지, 큐 대기 포함). 성공(200)만 집계한다\n")
+        " TIME_WAIT 연결이 쌓이지 않게 한다(쌓이면 측정끼리 영향을 준다. benchmark.md 참고)."
+        " 연결 정리 방식이 정상 FIN 종료 클라이언트와 다르므로 그 조건의 처리량과 같다고 보지 않는다")
+    say("- 성공 = 상태 200이고 헤더와 Content-Length만큼의 본문을 끝까지 받은 응답. 덜 받고 끊기거나 30초 기한을 넘기면"
+        " '불완전', 연결·전송 실패는 '실패'로 따로 센다")
+    say("- 처리량 = 측정 구간(%.0f초) 안에서 **완료된** 성공 수 / 구간 길이. 구간이 끝나면 새 요청을 보내지 않고,"
+        " 그때 진행 중이던 요청은 끝까지 받되 집계하지 않는다('늦음(제외)', 드레인 시간은 분모에 넣지 않음)" % a.seconds)
+    say("- p50·p95·p99는 구간 안에서 완료된 성공 요청만의 응답 시간(연결부터 응답 끝까지, 큐 대기 포함)."
+        " 503·불완전·늦음 요청의 대기 시간은 들어가지 않는다\n")
 
     # 1. Phase 2 비교
     d = fresh_copy(base, a.workdir, "cli")

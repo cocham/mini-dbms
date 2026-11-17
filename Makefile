@@ -36,6 +36,7 @@ DEMO_BIN = build/bpt_demo$(EXE)
 
 SERVER_BIN = build/minidb-server
 SERVER_TEST_BIN = build/minidb-server-test
+LOADGEN_BIN = build/loadgen
 
 .PHONY: all test unit cli server sanitize tsan race-demo read-bench load-bench bench clean
 
@@ -73,8 +74,13 @@ unit: $(TEST_BIN)
 cli: $(BIN)
 	$(PYTHON) tests/cli_test.py $(BIN)
 
-server: $(SERVER_BIN) $(SERVER_TEST_BIN) $(BIN)
+server: $(SERVER_BIN) $(SERVER_TEST_BIN) $(BIN) $(LOADGEN_BIN)
 	$(PYTHON) tests/server_test.py $(SERVER_BIN) $(SERVER_TEST_BIN) $(BIN)
+	$(PYTHON) tests/loadgen_test.py $(LOADGEN_BIN)
+
+# 부하 생성기 (P3-05, POSIX). 측정 도구지만 집계가 틀리면 측정이 틀리므로 make test에서 가짜 서버로 검사한다.
+$(LOADGEN_BIN): tools/loadgen.c | build
+	$(CC) $(CFLAGS) $(THREAD_FLAGS) -o $@ tools/loadgen.c
 
 # Linux 전용: ASan/UBSan과 LeakSanitizer로 단위·CLI 테스트를 다시 실행한다.
 sanitize:
@@ -88,6 +94,8 @@ sanitize:
 	$(CC) $(CFLAGS) $(SAN_FLAGS) $(THREAD_FLAGS) -o build/san/minidb-server $(SRC) $(SERVER_SRC)
 	$(CC) $(CFLAGS) $(SAN_FLAGS) $(THREAD_FLAGS) -DMINIDB_TESTING -Isrc -o build/san/minidb-server-test $(SRC) $(SERVER_SRC)
 	ASAN_OPTIONS=detect_leaks=1 $(PYTHON) tests/server_test.py build/san/minidb-server build/san/minidb-server-test build/san/minidb
+	$(CC) $(CFLAGS) $(SAN_FLAGS) $(THREAD_FLAGS) -o build/san/loadgen tools/loadgen.c
+	ASAN_OPTIONS=detect_leaks=1 $(PYTHON) tests/loadgen_test.py build/san/loadgen
 
 # Linux 전용: ThreadSanitizer로 단위 테스트(동시 정확성 테스트 포함)를 다시 실행한다. 보고가 있으면 실패.
 #   최근 커널(mmap 무작위 비트 32)에서는 GCC 13의 TSan이 주소 배치를 받아들이지 못해 시작하지 못한다.
@@ -139,11 +147,10 @@ read-bench: $(SERVER_BIN)
 #   make load-bench LOAD_ROWS=200000 처럼 줄여 볼 수 있다.
 LOAD_ROWS ?= 1000000
 LOAD_SECONDS ?= 2
-load-bench: $(SERVER_BIN) $(BIN)
+load-bench: $(SERVER_BIN) $(BIN) $(LOADGEN_BIN)
 	$(CC) $(CFLAGS) $(THREAD_FLAGS) -DMINIDB_GLOBAL_LOCK -o build/minidb-server-global $(SRC) $(SERVER_SRC)
-	$(CC) $(CFLAGS) $(THREAD_FLAGS) -o build/loadgen tools/loadgen.c
 	$(PYTHON) tools/load.py --server $(SERVER_BIN) --global build/minidb-server-global --cli $(BIN) \
-		--loadgen build/loadgen --rows $(LOAD_ROWS) --seconds $(LOAD_SECONDS)
+		--loadgen $(LOADGEN_BIN) --rows $(LOAD_ROWS) --seconds $(LOAD_SECONDS)
 
 # 100만 건 생성·삽입 후 인덱스 조회 vs 선형 탐색 측정 (P2-04). 느리므로 test에 넣지 않는다.
 #   make bench BENCH_ROWS=100000 처럼 건수를 줄여 볼 수 있다. 결과는 docs/phase2/benchmark.md로 옮긴다.

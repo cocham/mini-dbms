@@ -6,7 +6,7 @@ C로 SQL 파일을 실행하고 데이터를 파일에 저장하는 CLI(Phase 1)
 
 현재 상태: **P3-01~P3-05 구현 완료.** `POST /query`로 SQL을 보내면 JSON으로 답하는 서버(`build/minidb-server`, POSIX 전용)가 워커 여러 개로 연결을 동시에 처리한다. 큐가 가득 차면 503 `BUSY`로 바로 거절한다. 엔진은 읽기·쓰기 잠금이라 SELECT끼리는 동시에 실행되고 INSERT는 혼자 실행된다(쓰기 우선).
 
-측정([benchmark.md](docs/phase3/benchmark.md), 100만 행, Docker CPU 8개): id 하나 조회가 CLI 한 번 실행 189 ms → 떠 있는 서버 0.23 ms. id 조회 처리량 워커 1개 5,966 → 4개 20,311건/초. 선형 탐색 4개 동시 전역 잠금 493 ms → 읽기·쓰기 잠금 100 ms.
+측정([benchmark.md](docs/phase3/benchmark.md), 100만 행, Docker CPU 8개, 같은 환경 안의 상대 비교): id 하나 조회가 CLI 한 번 실행 346 ms → 떠 있는 서버 0.18 ms. id 조회 처리량 워커 1개 7,434 → 8개 30,109건/초. 선형 탐색 4개 동시 전역 잠금 304 ms → 읽기·쓰기 잠금 88 ms.
 
 1. [실습](docs/phase3/walkthrough.md): 서버 띄우기 → `curl`로 요청·응답 → 요청 하나가 엔진까지 가는 지도 → (6장) 스레드 풀 → (7장) 읽기 병렬화 → (8장) 부하 측정. **여기서 시작**
 2. [개발 명세](docs/phase3/spec.md): API 계약, 오류 코드, 크기 제한, 저장 후 실패, 동시성 계약

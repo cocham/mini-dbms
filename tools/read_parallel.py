@@ -46,11 +46,16 @@ def post(port, body, timeout=120):
             chunks.append(c)
     finally:
         s.close()
+    took = time.perf_counter() - t
     resp = b"".join(chunks)
+    head, sep, body = resp.partition(b"\r\n\r\n")
+    m = re.search(rb"(?im)^content-length:\s*(\d+)\s*$", head)
+    if not sep or m is None or len(body) != int(m.group(1)):  # 본문까지 끝까지 받은 응답만 인정한다
+        raise RuntimeError("응답이 불완전함 (%d바이트): %r" % (len(resp), resp[:200]))
     status = int(resp.split(b" ", 2)[1])
     if status != 200:
         raise RuntimeError("HTTP %d: %r" % (status, resp[:300]))
-    return time.perf_counter() - t
+    return took
 
 
 def make_data(d, rows):

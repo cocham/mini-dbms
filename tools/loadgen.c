@@ -7,29 +7,41 @@
  *         scan  SELECT ... WHERE age = 150 (선형 탐색)
  *
  * 클라이언트마다 스레드 하나. 응답을 받자마자 다음 요청을 보낸다(닫힌 고리).
- * 요청마다 새 연결: 연결 → 요청 보내기 → 서버가 닫을 때까지 응답 받기. 이 전체 시간을 잰다.
+ * 요청마다 새 연결: 연결 → 요청 보내기 → 응답(헤더 + Content-Length만큼의 본문) 받기. 이 전체 시간을 잰다.
  * 파이썬 클라이언트는 요청마다 쓰는 CPU가 커서 클라이언트가 먼저 병목이 됐다. 그래서 C로 만들었다.
  *
- * 출력(한 줄): ok=성공 busy=503 reset=끊김 other=기타 p50=.. p95=.. p99=.. max=.. (ms)
+ * 집계 기준 (P3-05 Codex 재검증 반영):
+ *   - 완전한 응답만 분류한다: 상태 줄, 헤더 끝(빈 줄), Content-Length, 그 길이만큼의 본문을 모두 받아야 한다.
+ *     덜 받은 채 끊기거나(EOF·연결 재설정) 기한(30초)을 넘기면 "불완전"이다. 상태 줄도 못 받았으면 "연결 실패".
+ *   - 측정 구간은 시작 시각부터 정확히 '초'만큼이다. 구간 안에서 **완료된** 요청만 센다.
+ *     구간이 끝나면 새 요청을 보내지 않고, 이미 보낸 요청은 끝까지 받되(드레인) 집계하지 않고 "늦음"으로만 센다.
+ *     그래서 처리량 = 구간 안 성공 수 / 구간 길이이고, 드레인 시간은 들어가지 않는다.
+ *   - 백분위는 구간 안에서 완료된 성공(200) 요청만의 응답 시간이다.
+ *
+ * 출력(한 줄): ok=.. busy=.. other=.. incomplete=.. connfail=.. late=.. window=초 p50=.. p95=.. p99=.. max=.. (ms)
  */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
-#include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
+#define IO_TIMEOUT_S 30
+#define HEAD_MAX 4096
+
 typedef struct {
     int id;
-    double *lat; /* 성공한 요청의 응답 시간(ms) */
+    double *lat; /* 구간 안에서 완료된 성공 요청의 응답 시간(ms) */
     size_t n, cap;
-    long ok, busy, reset, other;
+    long ok, busy, other, incomplete, connfail, late;
     uint64_t rnd;
 } Client;
 
@@ -67,62 +79,109 @@ static int make_body(Client *c, long seq, char *buf, size_t cap) {
     return snprintf(buf, cap, "SELECT * FROM users WHERE id = %ld;", id);
 }
 
-/* 상태 코드, 연결이 끊기면 -1 */
-static int one_request(const char *req, size_t len) {
+/* 헤더 블록 [h, h+len)에서 Content-Length 값. 없거나 잘못되면 -1 */
+static long content_length(const char *h, size_t len) {
+    const char *p = h, *end = h + len;
+    while (p < end) {
+        const char *eol = memchr(p, '\n', (size_t)(end - p));
+        size_t ll = (size_t)((eol ? eol : end) - p);
+        if (ll > 15 && strncasecmp(p, "Content-Length:", 15) == 0) {
+            const char *v = p + 15;
+            long n = 0;
+            while (v < p + ll && *v == ' ') {
+                v++;
+            }
+            if (v >= p + ll || *v < '0' || *v > '9') {
+                return -1;
+            }
+            while (v < p + ll && *v >= '0' && *v <= '9') {
+                n = n * 10 + (*v++ - '0');
+            }
+            return n;
+        }
+        p = eol ? eol + 1 : end;
+    }
+    return -1;
+}
+
+enum { R_COMPLETE, R_INCOMPLETE, R_CONNFAIL };
+
+/* 요청 하나. 완전한 응답이면 R_COMPLETE와 *status. */
+static int one_request(const char *req, size_t len, int *status) {
     struct sockaddr_in a;
+    struct timeval tv = {IO_TIMEOUT_S, 0};
+    struct linger lg = {1, 0};
+    char head[HEAD_MAX + 1];
     char buf[65536];
-    char first[16];
-    size_t got_first = 0;
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    size_t hlen = 0, sent = 0;
+    long clen = -1, body = 0;
+    int fd = socket(AF_INET, SOCK_STREAM, 0), rc = R_CONNFAIL;
     ssize_t n;
-    size_t sent = 0;
 
     if (fd < 0) {
-        return -1;
+        return R_CONNFAIL;
     }
+    /* 연결·보내기·받기 모두 기한: 잘못된 서버가 측정기를 붙잡지 못하게 (connect에는 SO_SNDTIMEO가 적용된다) */
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     memset(&a, 0, sizeof a);
     a.sin_family = AF_INET;
     a.sin_port = htons((unsigned short)g_port);
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) {
         close(fd);
-        return -1;
+        return R_CONNFAIL;
     }
     while (sent < len) {
         n = send(fd, req + sent, len - sent, 0);
         if (n <= 0) {
             close(fd);
-            return -1;
+            return R_CONNFAIL;
         }
         sent += (size_t)n;
     }
     for (;;) {
         n = recv(fd, buf, sizeof buf, 0);
         if (n <= 0) {
-            /* 0: 서버가 응답을 다 보내고 닫음(정상 끝), <0: 끊김 — 상태 줄을 받았으면 그것으로 판정.
-               응답을 끝까지 받은 뒤에는 SO_LINGER 0으로 닫아 연결 재설정(RST)을 보낸다. 그러면 서버와
-               클라이언트 어느 쪽에도 TIME_WAIT 연결이 남지 않는다. 서버가 먼저 닫는 구조라 보통은 서버 쪽에
-               60초씩 남는데, 초당 수천 개가 쌓여 상한(32,768)에 닿으면 처리량이 절반 가까이 떨어졌다.
-               측정하는 일(연결·요청·응답 받기)은 같고, 응답을 다 받은 뒤의 정리 방식만 다르다(실제 클라이언트와 다름). */
-            struct linger lg = {1, 0};
-            setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
-            break;
+            break; /* EOF·연결 재설정·기한 초과: 여기까지 받은 것으로 판정 */
         }
-        if (got_first < sizeof first - 1) { /* 상태 줄 앞부분("HTTP/1.1 200")만 모아 둔다 */
-            size_t k = sizeof first - 1 - got_first;
-            if (k > (size_t)n) {
-                k = (size_t)n;
+        if (clen < 0) { /* 아직 헤더를 다 받지 못함 */
+            size_t take = (size_t)n < HEAD_MAX - hlen ? (size_t)n : HEAD_MAX - hlen;
+            char *hend;
+            memcpy(head + hlen, buf, take);
+            hlen += take;
+            head[hlen] = '\0';
+            hend = strstr(head, "\r\n\r\n");
+            if (hend == NULL) {
+                if (hlen == HEAD_MAX) {
+                    break; /* 헤더가 너무 김: 불완전으로 본다 */
+                }
+                continue;
             }
-            memcpy(first + got_first, buf, k);
-            got_first += k;
+            clen = content_length(head, (size_t)(hend - head));
+            if (clen < 0 || hlen < 12 || strncmp(head, "HTTP/1.", 7) != 0) {
+                break;
+            }
+            *status = atoi(head + 9);
+            /* 이번 recv에서 헤더 뒤에 온 본문 바이트 */
+            body = (long)((size_t)n - ((size_t)(hend + 4 - head) - (hlen - take)));
+        } else {
+            body += (long)n;
+        }
+        if (body >= clen) {
+            break; /* 본문까지 다 받음 */
         }
     }
-    close(fd);
-    first[got_first] = '\0';
-    if (got_first < 12 || strncmp(first, "HTTP/1.", 7) != 0) {
-        return -1;
+    if (clen >= 0 && body == clen) {
+        rc = R_COMPLETE;
+    } else if (hlen > 0) {
+        rc = R_INCOMPLETE;
     }
-    return atoi(first + 9);
+    /* 응답을 다 받은 뒤(또는 포기한 뒤) RST로 닫는다: 서버 쪽에 TIME_WAIT가 쌓이지 않게(benchmark.md 5).
+       정상 FIN 종료 클라이언트와는 다른 조건이다. */
+    setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+    close(fd);
+    return rc;
 }
 
 static void *client_main(void *arg) {
@@ -132,14 +191,23 @@ static void *client_main(void *arg) {
 
     while (now_s() < g_start) {
     }
-    while (now_s() < g_end) {
+    while (now_s() < g_end) { /* 구간이 끝나면 새 요청을 보내지 않는다 */
         int bl = make_body(c, seq++, body, sizeof body);
         int rl = snprintf(req, sizeof req, "POST /query HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n%s", bl, body);
+        int st = 0;
         double t = now_s();
-        int st = one_request(req, (size_t)rl);
-        double took = (now_s() - t) * 1000.0;
+        int r = one_request(req, (size_t)rl, &st);
+        double done = now_s();
 
-        if (st == 200) {
+        if (done > g_end) { /* 구간이 끝난 뒤 완료: 집계하지 않는다 */
+            c->late++;
+            break;
+        }
+        if (r == R_CONNFAIL) {
+            c->connfail++;
+        } else if (r == R_INCOMPLETE) {
+            c->incomplete++;
+        } else if (st == 200) {
             if (c->n == c->cap) {
                 size_t nc = c->cap ? c->cap * 2 : 4096;
                 double *g = realloc(c->lat, nc * sizeof *g);
@@ -149,12 +217,10 @@ static void *client_main(void *arg) {
                 c->lat = g;
                 c->cap = nc;
             }
-            c->lat[c->n++] = took;
+            c->lat[c->n++] = (done - t) * 1000.0;
             c->ok++;
         } else if (st == 503) {
             c->busy++;
-        } else if (st < 0) {
-            c->reset++;
         } else {
             c->other++;
         }
@@ -181,7 +247,7 @@ int main(int argc, char **argv) {
     pthread_t *th;
     double *all;
     size_t total = 0, k = 0;
-    long ok = 0, busy = 0, reset = 0, other = 0;
+    long ok = 0, busy = 0, other = 0, incomplete = 0, connfail = 0, late = 0;
     int i;
 
     if (argc != 6) {
@@ -217,21 +283,27 @@ int main(int argc, char **argv) {
         total += cs[i].n;
         ok += cs[i].ok;
         busy += cs[i].busy;
-        reset += cs[i].reset;
         other += cs[i].other;
+        incomplete += cs[i].incomplete;
+        connfail += cs[i].connfail;
+        late += cs[i].late;
     }
     all = malloc((total ? total : 1) * sizeof *all);
     if (all == NULL) {
         return 1;
     }
     for (i = 0; i < g_clients; i++) {
-        memcpy(all + k, cs[i].lat, cs[i].n * sizeof *all);
-        k += cs[i].n;
+        if (cs[i].n > 0) { /* 성공이 0건이면 lat는 NULL이다: memcpy에 NULL을 넘기지 않는다(UBSan) */
+            memcpy(all + k, cs[i].lat, cs[i].n * sizeof *all);
+            k += cs[i].n;
+        }
         free(cs[i].lat);
     }
     qsort(all, total, sizeof *all, cmp_double);
-    printf("ok=%ld busy=%ld reset=%ld other=%ld p50=%.3f p95=%.3f p99=%.3f max=%.3f\n", ok, busy, reset, other,
-           pct(all, total, 50), pct(all, total, 95), pct(all, total, 99), total ? all[total - 1] : -1.0);
+    printf("ok=%ld busy=%ld other=%ld incomplete=%ld connfail=%ld late=%ld window=%.3f "
+           "p50=%.3f p95=%.3f p99=%.3f max=%.3f\n",
+           ok, busy, other, incomplete, connfail, late, g_seconds, pct(all, total, 50), pct(all, total, 95),
+           pct(all, total, 99), total ? all[total - 1] : -1.0);
     free(all);
     free(cs);
     free(th);
