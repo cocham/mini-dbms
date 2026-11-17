@@ -1,0 +1,190 @@
+# Phase 3 실습 — 요청 하나가 DB 엔진까지 가는 길
+
+P3-02(단일 스레드 HTTP 서버) 기준이다. 잠금과 스레드 풀 이야기는 아직 하지 않는다. 먼저 서버를 띄우고 요청을 보내 응답을 본다. 그 다음 그 요청이 어느 파일의 어느 함수를 거쳐 `users.tsv`까지 갔다 오는지 지도로 따라간다.
+
+## 1. 서버 띄우기 (Windows에서 Docker로)
+
+서버는 POSIX 전용이라(DB-P3-D02) Docker 안에서 띄우고, 요청은 Windows에서 보낸다. 프로젝트 폴더에서 PowerShell을 연다.
+
+```powershell
+docker run --rm -it -p 127.0.0.1:8080:8080 -v "${PWD}:/src" -w /src gcc:13 `
+  bash -c "make build/minidb-server && mkdir -p data/p3 && build/minidb-server --host 0.0.0.0 --port 8080 --data-dir data/p3"
+```
+
+```text
+[서버] 시작: 2.6 ms (0행), 0.0.0.0:8080, 응답 상한 8388608바이트·100000행
+```
+
+- `--host 0.0.0.0`: 컨테이너 바깥(Windows)에서 들어오는 연결을 받으려면 컨테이너 안에서는 모든 주소로 열어야 한다. 대신 `-p 127.0.0.1:8080:8080`으로 **Windows 쪽은 이 컴퓨터에서만** 접속하게 묶었다.
+- 이 창은 서버 로그 창이다. 요청이 올 때마다 `[요청] ...` 줄이 찍힌다. 끌 때는 `Ctrl+C`(SIGINT)를 누른다. 그러면 `[서버] 종료`가 찍히고 파일을 닫는다.
+- 데이터는 `data/p3/users.tsv`에 쌓인다. Phase 1·2와 같은 파일 형식이다.
+
+## 2. 요청 보내기
+
+**새 PowerShell 창**을 열고, **먼저 프로젝트 폴더로 이동한다.** 새 창은 보통 홈 폴더(`C:\Users\USER`)에서 열린다. 그런데 `@examples/...`는 지금 폴더를 기준으로 파일을 찾으므로, 이동하지 않으면 `curl: option --data-binary: error encountered when reading a file`이 난다.
+
+```powershell
+cd C:\Users\USER\Desktop\KraftonJungle\miniDBMS
+```
+
+PowerShell의 `curl`은 다른 명령의 별칭이라 반드시 `curl.exe`라고 쓴다. 한글이 든 SQL은 파일로 보내는 것(`@파일`)이 안전하다. `-d` 대신 `--data-binary`를 쓰는 이유는 `-d`가 파일의 줄바꿈을 지우기 때문이다.
+
+### ① 살아 있나
+
+```powershell
+curl.exe -s http://localhost:8080/health
+```
+
+```json
+{"ok":true,"state":"ok","rows":0}
+```
+
+### ② INSERT 4개를 한 요청으로
+
+```powershell
+curl.exe -s http://localhost:8080/query --data-binary "@examples/phase3_seed.sql"
+```
+
+```json
+{"ok":true,"results":[{"type":"insert","id":1},{"type":"insert","id":2},{"type":"insert","id":3},{"type":"insert","id":4}]}
+```
+
+결과는 문장 순서대로 `results`에 하나씩 들어간다. CLI가 `INSERT 1`을 네 번 찍던 것과 같은 정보다. 대신 부여된 id까지 알려 준다.
+
+### ③ id 조회 (B+ 트리 경로)
+
+```powershell
+curl.exe -s http://localhost:8080/query --data-binary "SELECT * FROM users WHERE id = 2;"
+```
+
+```json
+{"ok":true,"results":[{"type":"select","columns":["id","name","age"],"rows":[[2,"Kim",30]]}]}
+```
+
+### ④ 선형 탐색과 그 실행 계획을 한 번에
+
+```powershell
+curl.exe -s http://localhost:8080/query --data-binary "SELECT * FROM users WHERE age = 25; EXPLAIN SELECT * FROM users WHERE age = 25;"
+```
+
+```json
+{"ok":true,"results":[
+  {"type":"select","columns":["id","name","age"],"rows":[[1,"민수",25],[3,"지영",25]]},
+  {"type":"explain","plan":"FULL SCAN","condition":"age = 25","tree_height":1,"total_rows":4}]}
+```
+
+(실제 응답은 한 줄이다. 읽기 쉽게 줄을 나눴다.)
+
+### ⑤ 중간에 실패하는 요청 — 상태 코드와 부분 실행
+
+`-i`를 붙이면 응답 헤더도 보인다.
+
+```powershell
+curl.exe -s -i http://localhost:8080/query --data-binary "@examples/phase3_partial.sql"
+```
+
+```text
+HTTP/1.1 400 Bad Request
+Content-Type: application/json; charset=utf-8
+Content-Length: 167
+Connection: close
+
+{"ok":false,"error":{"statement":2,"code":"SQL_ERROR","message":"age 값 200이(가) 허용 범위(0~150)를 벗어났습니다"},"results":[{"type":"insert","id":5}]}
+```
+
+- 1번 문장('성공')은 **이미 저장됐다**(`results`에 id 5). 2번 문장에서 멈췄고, 3번은 실행되지 않았다.
+- 트랜잭션이 없으므로 1번이 되돌려지지 않는다. 이 요청을 그대로 다시 보내면 '성공'이 한 번 더 들어간다. 다시 보낼 때는 `statement` 번호(2)부터 보낸다(spec "클라이언트 재시도의 의미").
+
+### ⑥ 구문 오류는 아무것도 실행하지 않는다
+
+```powershell
+curl.exe -s -i http://localhost:8080/query --data-binary "INSERT INTO users (name, age) VALUES ('x', 1); SELEC * FROM users;"
+```
+
+`400`과 `"code":"SQL_SYNTAX"`, `"statement":2`, `"results":[]`가 온다. 서버는 **실행하기 전에 본문 전체를 먼저 파싱**하므로 1번 INSERT도 들어가지 않는다. ①을 다시 보내 `rows`가 그대로인지 확인해 보자. CLI는 문장마다 파싱하고 실행하므로 이 점이 다르다.
+
+서버 로그 창에는 이렇게 찍혀 있을 것이다.
+
+```text
+[요청] GET /health → 200, 0.85 ms
+[요청] POST /query → 200, 문장 4개, 4.89 ms
+[요청] POST /query → 200, 문장 1개, 2.57 ms
+[요청] POST /query → 200, 문장 2개, 1.59 ms
+[요청] POST /query → 400 SQL_ERROR, 문장 3개, 2.10 ms
+[요청] POST /query → 400 SQL_SYNTAX, 문장 0개, 0.26 ms
+```
+
+## 3. 전체 지도 — ③번 요청 하나가 지나가는 길
+
+`curl.exe ... --data-binary "SELECT * FROM users WHERE id = 2;"` 하나를 따라간다. 왼쪽이 새로 생긴 서버 쪽(Phase 3), 오른쪽 아래가 Phase 1·2에서 만든 엔진이다.
+
+```mermaid
+flowchart TD
+    C["curl.exe (Windows)"] -->|"TCP 연결 + HTTP 요청 바이트"| ACC
+    subgraph SERVER["서버 (Phase 3, 새 코드)"]
+        ACC["server.c main<br/>poll → accept"] --> HC["server.c handle_connection"]
+        HC --> RR["http.c http_read_request<br/>요청 줄 · 헤더 · 본문"]
+        RR --> HQ["server.c handle_query"]
+        HQ --> PN["parser.c parser_next<br/>본문 전체를 Statement 배열로"]
+        PN --> EX["db.c db_exec<br/>잠금 → 실행 → 해제"]
+        EX -.->|"행 하나마다 콜백"| JS["server.c json_on_row<br/>→ json.c jb_str 등"]
+        HQ --> SR["http.c http_send_response<br/>상태 줄 · 헤더 · JSON"]
+        SR --> CL["http.c http_close"]
+    end
+    subgraph ENGINE["DB 엔진 (Phase 1·2, 그대로)"]
+        EX --> ER["executor.c executor_run"]
+        ER --> EP["executor_plan<br/>WHERE id → INDEX LOOKUP"]
+        ER --> FB["storage.c table_find_by_id"]
+        FB --> BS["bptree.c bpt_search<br/>id 2 → 바이트 위치"]
+        FB --> RL["fseek + read_line<br/>그 한 줄만"]
+        RL --> F[("data/p3/users.tsv")]
+    end
+    SR -->|"HTTP 응답 바이트"| C
+```
+
+| 순서 | 파일 · 함수 | 하는 일 | 이 요청에서 |
+|---|---|---|---|
+| 1 | `server.c` `main` | 시작할 때 `db_open`으로 파일 전체를 읽어 B+ 트리를 만든다(한 번만). 그 뒤 `poll`로 연결을 기다리다 `accept` | 시작 줄의 `2.6 ms`가 이 비용이다 |
+| 2 | `server.c` `handle_connection` | 연결 하나를 처리하고, 끝나면 로그 한 줄을 찍는다 | |
+| 3 | `http.c` `http_read_request` | 빈 줄(`\r\n\r\n`)까지 헤더를 읽고, `Content-Length`만큼 본문을 읽는다. 호출마다 5초, 전체 10초 기한 | 본문 = `SELECT * FROM users WHERE id = 2;` |
+| 4 | `server.c` 경로 확인 | `POST /query` → `handle_query`, `GET /health` → `handle_health`, 나머지 404·405 | |
+| 5 | `parser.c` `parser_next` (반복) | 본문의 문장을 **모두** `Statement`로 바꾼다. 하나라도 실패하면 400 `SQL_SYNTAX`로 끝, 실행 없음 | `{SELECT, WHERE_ID, 2}` 하나 |
+| 6 | `db.c` `db_exec` | 엔진 잠금을 잡고 `executor_run`을 부른 뒤 놓는다. 중단 상태면 실행하지 않는다 | (잠금은 P3-03부터 의미가 생긴다) |
+| 7 | `executor.c` `executor_run` → `executor_plan` | 조건 종류로 경로를 고른다. EXPLAIN이 보여 주는 바로 그 결정 | `INDEX LOOKUP` |
+| 8 | `storage.c` `table_find_by_id` → `bptree.c` `bpt_search` | 트리에서 id 2의 바이트 위치를 찾는다 | 위치 = 1번째 줄 길이 + 1 |
+| 9 | `storage.c` `read_line` | 그 위치로 `fseek` 해서 **한 줄만** 읽고, 읽은 줄의 id가 정말 2인지 다시 확인한다 | `2\tKim\t30` |
+| 10 | `server.c` `json_on_row` → `json.c` | `ResultSink`의 행 콜백. CLI는 같은 자리에서 TSV를 `printf` 했고, 서버는 JSON 버퍼에 `[2,"Kim",30]`을 쓴다. 요청 전체의 행 수·바이트 예산을 여기서 센다 | |
+| 11 | `server.c` `handle_query` 끝 | 머리(`{"ok":true,"results":[`) + 결과 + `]}`를 정한다. 실패했다면 머리에 `error` 객체가 들어간다 | |
+| 12 | `http.c` `http_send_response` → `http_close` | 상태 줄·헤더·본문을 보내고(전체 10초 기한), 쓰기 쪽을 닫는다 | `HTTP/1.1 200 OK` |
+
+**CLI와 비교하면** 바뀐 것은 1~5와 10~12뿐이다. 6번 아래, 즉 `executor_run`부터 `users.tsv`까지는 Phase 2 코드를 한 줄도 바꾸지 않고 그대로 쓴다. 엔진은 결과가 화면(TSV)으로 가는지 네트워크(JSON)로 가는지 모른다. `ResultSink` 콜백만 바꿔 끼웠다.
+
+```text
+CLI:   SQL 파일 → main.c ──────────── parser_next → db_exec → (엔진) → print_row     → stdout
+서버:  HTTP 요청 → http.c → server.c → parser_next → db_exec → (엔진) → json_on_row → HTTP 응답
+```
+
+## 4. 직접 해 볼 것
+
+각 항목은 먼저 결과를 예상해 보고 실행한다.
+
+1. **CLI로 같은 파일 읽기.** 서버를 `Ctrl+C`로 끈 뒤, 같은 데이터를 CLI로 읽어 본다. 서버가 쓴 행이 그대로 보이는가?
+   ```powershell
+   mingw32-make
+   "SELECT * FROM users;" | Out-File -Encoding ascii build\q.sql
+   .\build\minidb.exe --data-dir data/p3 build\q.sql
+   ```
+   Docker에서 `make clean`을 했다면 Windows용 `build\minidb.exe`도 지워진다. 그럴 때는 `mingw32-make`로 다시 만든다.
+2. **재시작.** 서버를 다시 띄우면 시작 줄의 행 수는 몇인가? 다음 INSERT는 몇 번 id를 받는가?
+3. **응답 예산.** 서버를 `--max-rows 2`로 다시 띄우고 `SELECT * FROM users WHERE id = 1; SELECT * FROM users;`를 보낸다. `statement`는 몇이고, `results`에는 무엇이 남는가? 행 상한은 문장마다 세는가, 요청 전체로 세는가?
+4. **HTTP 오류.** `curl.exe -s -i http://localhost:8080/query`(본문 없는 GET)와 `curl.exe -s -i http://localhost:8080/nope`의 상태 코드와 `Allow` 헤더를 보자.
+5. **한 번에 하나씩.** 지금 서버는 연결을 하나씩 처리한다. 한 창에서 본문을 덜 보내는 요청을 보낸다. 본문이 100바이트라고 해 놓고 6바이트만 보내므로 서버가 나머지를 기다린다.
+   ```powershell
+   curl.exe -s -i http://localhost:8080/query -H "Content-Length: 100" --data-binary "SELECT"
+   ```
+   곧바로 다른 창에서 ①을 보낸다. ①의 응답은 언제 오는가? 첫 번째 창에는 무엇이 오는가? (확인한 결과: ①은 약 5초 뒤에 왔고, 첫 창은 5초 뒤 `408`과 `TIMEOUT`을 받았다. 소켓 호출 하나의 기한이 5초다.) 이 현상이 P3-03(스레드 풀)을 하는 이유다.
+
+## 5. 다음 단위에서 이 지도가 바뀌는 곳
+
+- **P3-03 스레드 풀:** 1~2번이 "accept 스레드 → 작업 큐 → 워커 N개"로 나뉜다. 3번부터는 워커 하나 안에서 지금과 같다. 6번 `db_exec`의 잠금이 그때부터 실제로 다른 워커를 기다리게 한다.
+- **P3-04 읽기 병렬화:** 6번의 잠금이 읽기·쓰기 잠금으로 바뀐다. 9번의 `fseek` + `read_line`이 `pread`로 바뀐다. 이유는 [tasks.md](tasks.md) "S1x 관찰 기록"에 있다. 잠금 없이 동시에 읽으면 파일 위치가 섞였다.

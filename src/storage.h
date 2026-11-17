@@ -1,14 +1,16 @@
 #ifndef MINIDB_STORAGE_H
 #define MINIDB_STORAGE_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "common.h"
 
 /*
- * Storage: users.tsv 파일 열기, 순차 읽기, 추가, 다음 ID 관리.
+ * Storage: users.tsv 파일 열기, 순차 읽기, 추가, 다음 ID 관리, id 인덱스(B+ 트리) 관리.
  * SQL 문법은 알지 않는다.
  * 파일 형식: 헤더 없이 한 줄에 "id<TAB>name<TAB>age<LF>".
+ * 인덱스: id → 그 줄이 시작하는 바이트 위치. 메모리에만 두고 table_open마다 파일에서 다시 만든다.
  */
 
 typedef struct Table Table; /* 불투명 타입. 내부는 storage.c에만 있다 */
@@ -25,14 +27,58 @@ typedef int (*RowFn)(const Row *row, void *ctx);
 /* 반환 규칙: 0 성공, -1 실패(err에 원인) */
 
 /* data_dir/users.tsv를 연다. 없으면 만든다(data_dir 한 단계 포함).
- * 기존 레코드 전체를 한 번 검증하고 최대 ID를 복원한다. */
+ * 기존 레코드 전체를 한 번 검증하고 최대 ID를 복원하며, id 인덱스를 만든다. */
 int table_open(const char *data_dir, Table **out, DbError *err);
 
-/* 다음 ID(최대 ID + 1)를 부여해 레코드 한 건을 파일 끝에 추가한다. */
+/*
+ * 다음 ID(최대 ID + 1)를 부여해 레코드 한 건을 파일 끝에 추가하고 인덱스에 등록한다.
+ * 실패하면 err->kind로 어디서 실패했는지 구분한다.
+ *   DBE_STORAGE      파일을 바꾸기 전 실패. *out_id = 0
+ *   DBE_WRITE_FAILED 쓰기 도중 실패. 그 줄이 기록됐는지 알 수 없다. *out_id = 0
+ *   DBE_INDEX_FAILED 파일 기록 완료 뒤 인덱스 등록 실패(메모리 부족). *out_id = 기록된 id
+ */
 int table_append(Table *t, const char *name, int age, int64_t *out_id, DbError *err);
+
+/* 파일에 있는 최대 id(빈 테이블이면 0). 시작 시 복원되고 table_append만 바꾼다. */
+int64_t table_last_id(const Table *t);
 
 /* 저장 순서대로 레코드를 하나씩 읽어 fn을 호출한다. fn이 NULL이면 검증만 한다. */
 int table_scan(Table *t, RowFn fn, void *ctx, DbError *err);
+
+/* id 인덱스로 레코드 한 건을 찾는다. 있으면 그 위치의 한 줄만 읽어 fn을 한 번 호출하고,
+ * 없으면 파일을 읽지 않고 fn 없이 0을 반환한다. 읽은 줄의 id가 다르면 -1(인덱스 불일치). */
+int table_find_by_id(Table *t, int64_t id, RowFn fn, void *ctx, DbError *err);
+
+/* id 인덱스로 lo ≤ id ≤ hi인 레코드를 id 오름차순으로 찾아 하나씩 fn을 호출한다(양 끝 포함).
+ * lo > hi거나 범위에 키가 없으면 파일을 읽지 않고 0. 범위 밖의 줄은 읽지 않는다.
+ * 읽은 줄의 id가 인덱스와 다르면 -1(인덱스 불일치). fn이 0이 아니면 멈추고 -1. */
+int table_find_id_range(Table *t, int64_t lo, int64_t hi, RowFn fn, void *ctx, DbError *err);
+
+/*
+ * 인덱스 통계 (실행 계획용). 메모리의 B+ 트리에서 바로 읽는다.
+ * table_open이 시작 시 파일 전체를 읽어 인덱스를 만든 뒤로는, 이 함수들이 파일을 추가로 읽지 않는다.
+ * 실제로 조회를 실행해서 잰 값이 아니라 "지금 실행하면 얼마나 읽게 될지"의 근거다.
+ */
+int table_index_height(const Table *t); /* B+ 트리 높이 = id 조회 한 번이 방문하는 노드 수. 빈 테이블도 1 */
+int64_t table_row_count(const Table *t); /* 전체 행 수 = 인덱스 키 수 = 선형 탐색이 읽는 줄 수 */
+
+/* 인덱스 모양과 메모리 실측 (P2-04 측정 보고용). 노드를 모두 훑으므로 O(노드 수). 파일은 읽지 않는다. */
+typedef struct {
+    int height;
+    int64_t keys;
+    size_t leaves;
+    size_t internals;
+    size_t bytes; /* 트리에 요청한 바이트 합 (malloc 관리 오버헤드 제외) */
+} IndexStats;
+
+void table_index_stats(const Table *t, IndexStats *out);
+
+#ifdef MINIDB_TESTING
+/* 테스트 전용: 1이면 다음 table_append가 줄의 앞부분만 쓰고 DBE_WRITE_FAILED로 실패한다(한 번). */
+void table_test_fail_write(int on);
+/* 테스트 전용: 메모리 인덱스의 불변식 검사(bpt_validate). 0이면 정상 */
+int table_test_validate_index(const Table *t, char *why, size_t cap);
+#endif
 
 /* 파일을 닫고 메모리를 해제한다. 실패해도 t는 해제된다. t가 NULL이면 0. */
 int table_close(Table *t, DbError *err);

@@ -7,6 +7,8 @@
 사용법: python tests/cli_test.py <minidb 실행 파일>
 """
 import os
+import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -350,7 +352,8 @@ def a7_data_file_is_directory(env):
 
 @test
 def a7_corrupted_line_after_match_still_fails(env):
-    # 선형 탐색은 일치 행을 찾은 뒤에도 끝까지 읽어 뒤쪽 손상을 보고한다.
+    # Phase 2: id 조회는 한 줄만 읽지만, 시작할 때(table_open) 파일 전체를 검증하며
+    # 인덱스를 만들기 때문에 뒤쪽 손상은 여전히 보고된다.
     os.makedirs(env.data_dir)
     with open(env.data_file, "wb") as f:
         f.write(b"1\ta\t25\n2\tb\t30\n3\tc\n")
@@ -377,7 +380,392 @@ def a7_nul_byte_in_sql(env):
     expect_fail(env.run(b"SELECT * FROM users;\x00"), "NUL")
 
 
+# ---------- Phase 2 / P2-01: id 조회가 B+ 트리 인덱스를 거친다 ----------
+
+def many_people(n):
+    """이름 길이·문자 종류가 제각각인 n명. 바이트 위치가 줄마다 달라지게 한다."""
+    people = []
+    for i in range(1, n + 1):
+        name = ("민수" if i % 3 == 0 else "a" * (1 + i % 40)) + str(i)
+        if i % 7 == 0:
+            name = "O'Brien-" + name
+        people.append((i, name, i % 151))
+    return people
+
+
+def insert_sql(people):
+    return "".join("INSERT INTO users (name, age) VALUES ('%s', %d);\n" % (n.replace("'", "''"), a)
+                   for _, n, a in people)
+
+
+def row_bytes(person):
+    i, n, a = person
+    return u("%d\t%s\t%d\n" % (i, n, a))
+
+
+@test
+def p2_id_lookup_after_restart(env):
+    # 다른 실행에서 저장한 데이터: 시작할 때 파일에서 인덱스를 다시 만들어 찾는다.
+    people = many_people(300)
+    expect_ok(env.run(insert_sql(people)), b"INSERT 1\n" * 300)
+    for i in (1, 2, 150, 299, 300):
+        expect_ok(env.run("SELECT * FROM users WHERE id = %d;" % i), HEADER + row_bytes(people[i - 1]))
+    for i in (0, -5, 301, 9223372036854775807):
+        expect_ok(env.run("SELECT * FROM users WHERE id = %d;" % i), HEADER)
+
+
+@test
+def p2_id_lookup_same_run_after_insert(env):
+    # 같은 실행 안에서 INSERT 직후의 id도 인덱스에 등록돼 있어야 한다.
+    sql = ("INSERT INTO users (name, age) VALUES ('첫째', 10);"
+           "SELECT * FROM users WHERE id = 1;"
+           "INSERT INTO users (name, age) VALUES ('둘째', 20);"
+           "SELECT * FROM users WHERE id = 2;"
+           "SELECT * FROM users WHERE id = 3;")
+    expect_ok(env.run(sql), b"INSERT 1\n" + HEADER + u("1\t첫째\t10\n") +
+              b"INSERT 1\n" + HEADER + u("2\t둘째\t20\n") + HEADER)
+    expect_ok(env.run("INSERT INTO users (name, age) VALUES ('셋째', 30); SELECT * FROM users WHERE id = 3;"),
+              b"INSERT 1\n" + HEADER + u("3\t셋째\t30\n"))
+
+
+@test
+def p2_index_result_matches_full_scan(env):
+    # 인덱스 경로의 결과는 전체 조회에서 같은 id를 골라낸 것과 바이트 단위로 같아야 한다.
+    people = many_people(120)
+    expect_ok(env.run(insert_sql(people)), b"INSERT 1\n" * 120)
+    code, out, err = env.run("SELECT * FROM users;")
+    eq((code, err), (0, b""), "전체 조회")
+    lines = out.split(b"\n")[1:-1]
+    by_id = {int(line.split(b"\t")[0]): line + b"\n" for line in lines}
+    sql = "".join("SELECT * FROM users WHERE id = %d;" % i for i in range(1, 121, 9))
+    expected = b"".join(HEADER + by_id[i] for i in range(1, 121, 9))
+    expect_ok(env.run(sql), expected)
+
+
+@test
+def p2_id_lookup_with_gaps_in_file(env):
+    # 파일의 id는 증가 순서만 지키면 된다. 빈 번호는 인덱스에도 없다.
+    os.makedirs(env.data_dir)
+    with open(env.data_file, "wb") as f:
+        f.write(u("1\ta\t1\n4\t넷\t4\n10\tten\t100\n"))
+    expect_ok(env.run("SELECT * FROM users WHERE id = 4; SELECT * FROM users WHERE id = 5;"
+                      "SELECT * FROM users WHERE id = 10;"),
+              HEADER + u("4\t넷\t4\n") + HEADER + HEADER + b"10\tten\t100\n")
+    expect_ok(env.run("INSERT INTO users (name, age) VALUES ('b', 2); SELECT * FROM users WHERE id = 11;"),
+              b"INSERT 1\n" + HEADER + b"11\tb\t2\n")
+
+
 # ---------- 사용법 ----------
+
+# ---------- Phase 2 / P2-02: EXPLAIN 실행 계획 ----------
+
+@test
+def p2_explain_paths_and_stats(env):
+    # 빈 테이블: 리프 하나뿐인 트리(높이 1), 행 0
+    expect_ok(env.run("EXPLAIN SELECT * FROM users;"
+                      "EXPLAIN SELECT * FROM users WHERE id = 1;"),
+              u("FULL SCAN (조건 없음, 전체 행 수 0)\n"
+                "INDEX LOOKUP (id = 1, B+ 트리 높이 1)\n"))
+    # 기본 차수 64: 키 64개에서 첫 분할 → 높이 2. 같은 실행 안의 INSERT를 바로 반영한다
+    people = many_people(64)
+    expect_ok(env.run(insert_sql(people[:63]) +
+                      "EXPLAIN SELECT * FROM users WHERE id = 63;" +
+                      insert_sql(people[63:]) +
+                      "explain select * from users where ID = 64;"
+                      "EXPLAIN SELECT * FROM users WHERE age = 25;"
+                      "EXPLAIN SELECT * FROM users;"),
+              b"INSERT 1\n" * 63 +
+              u("INDEX LOOKUP (id = 63, B+ 트리 높이 1)\n") +
+              b"INSERT 1\n" +
+              u("INDEX LOOKUP (id = 64, B+ 트리 높이 2)\n"
+                "FULL SCAN (age = 25, 전체 행 수 64)\n"
+                "FULL SCAN (조건 없음, 전체 행 수 64)\n"))
+    # 재시작 후: 파일에서 다시 만든 인덱스의 통계. 없는 id·음수도 경로는 INDEX LOOKUP
+    expect_ok(env.run("EXPLAIN SELECT * FROM users WHERE id = 999;"
+                      "EXPLAIN SELECT * FROM users WHERE id = -5;"
+                      "EXPLAIN SELECT * FROM users WHERE age = 151;"),
+              u("INDEX LOOKUP (id = 999, B+ 트리 높이 2)\n"
+                "INDEX LOOKUP (id = -5, B+ 트리 높이 2)\n"
+                "FULL SCAN (age = 151, 전체 행 수 64)\n"))
+
+
+@test
+def p2_explain_does_not_execute(env):
+    # 행도 헤더도 출력하지 않고, 파일도 바꾸지 않는다. 일반 SELECT와 섞여도 각자 규칙대로 출력한다
+    expect_ok(env.run(TWO_INSERTS), b"INSERT 1\nINSERT 1\n")
+    expect_ok(env.run("EXPLAIN SELECT * FROM users WHERE id = 1;"
+                      "SELECT * FROM users WHERE id = 1;"
+                      "EXPLAIN SELECT * FROM users;"),
+              u("INDEX LOOKUP (id = 1, B+ 트리 높이 1)\n") + HEADER + u("1\t민수\t25\n") +
+              u("FULL SCAN (조건 없음, 전체 행 수 2)\n"))
+    eq(env.data(), TWO_ROWS, "EXPLAIN 후 파일")
+
+
+@test
+def p2_explain_errors(env):
+    # EXPLAIN은 SELECT에만. 실패한 문장 앞의 출력과 INSERT는 남는다(fail-fast)
+    expect_fail(env.run("INSERT INTO users (name, age) VALUES ('a', 1);"
+                        "EXPLAIN SELECT * FROM users;"
+                        "EXPLAIN INSERT INTO users (name, age) VALUES ('b', 2);"
+                        "INSERT INTO users (name, age) VALUES ('c', 3);"),
+                "문장 3", "SELECT 문에만",
+                stdout=u("INSERT 1\nFULL SCAN (조건 없음, 전체 행 수 1)\n"))
+    eq(env.data(), b"1\ta\t1\n", "실패 후 파일")
+    expect_fail(env.run("EXPLAIN;"), "문장 1", "EXPLAIN 뒤에 SELECT")
+    expect_fail(env.run("EXPLAIN EXPLAIN SELECT * FROM users;"), "EXPLAIN 뒤에 SELECT")
+    expect_fail(env.run("EXPLAIN SELECT * FROM users WHERE id <> 1;"), "BETWEEN만 지원")
+
+
+# ---------- Phase 2 / P2-03: id 범위 조회 ----------
+
+@test
+def p2_range_matches_full_scan(env):
+    # 인덱스 범위 조회 결과는 전체 조회에서 같은 범위를 골라낸 것과 바이트 단위로 같아야 한다.
+    people = many_people(300)
+    expect_ok(env.run(insert_sql(people)), b"INSERT 1\n" * 300)
+    code, out, err = env.run("SELECT * FROM users;")
+    eq((code, err), (0, b""), "전체 조회")
+    lines = out.split(b"\n")[1:-1]
+    by_id = {int(line.split(b"\t")[0]): line + b"\n" for line in lines}
+
+    def rows(lo, hi):
+        return b"".join(by_id[i] for i in sorted(by_id) if lo <= i <= hi)
+
+    cases = [
+        ("id BETWEEN 10 AND 20", 10, 20), ("id BETWEEN 1 AND 300", 1, 300),
+        ("id BETWEEN 0 AND 1", 0, 1), ("id BETWEEN 300 AND 999", 300, 999),
+        ("id BETWEEN 63 AND 65", 63, 65), ("id BETWEEN 20 AND 10", 1, 0),
+        ("id BETWEEN 301 AND 400", 1, 0), ("id < 5", -2**63, 4), ("id <= 5", -2**63, 5),
+        ("id > 295", 296, 2**63 - 1), ("id >= 295", 295, 2**63 - 1), ("id < 1", 1, 0),
+        ("id > 300", 1, 0), ("id <= -9223372036854775808", 1, 0),
+        ("id < -9223372036854775808", 1, 0), ("id > 9223372036854775807", 1, 0),
+        ("id >= -9223372036854775808", -2**63, 2**63 - 1),
+    ]
+    sql = "".join("SELECT * FROM users WHERE %s;" % c for c, _, _ in cases)
+    expected = b"".join(HEADER + rows(lo, hi) for _, lo, hi in cases)
+    expect_ok(env.run(sql), expected)
+
+
+@test
+def p2_range_same_run_and_restart(env):
+    # 같은 실행에서 방금 넣은 레코드도 범위에 보이고, 재시작 후에도 같다
+    expect_ok(env.run(TWO_INSERTS + "SELECT * FROM users WHERE id >= 2;"
+                      "INSERT INTO users (name, age) VALUES ('c', 3);"
+                      "SELECT * FROM users WHERE id between 2 and 3;"),
+              b"INSERT 1\nINSERT 1\n" + HEADER + u("2\tO'Brien\t30\n") +
+              b"INSERT 1\n" + HEADER + u("2\tO'Brien\t30\n3\tc\t3\n"))
+    expect_ok(env.run("SELECT * FROM users WHERE id <= 2;"), HEADER + TWO_ROWS)
+
+
+@test
+def p2_range_with_gaps_in_file(env):
+    os.makedirs(env.data_dir)
+    with open(env.data_file, "wb") as f:
+        f.write(u("1\ta\t1\n4\t넷\t4\n10\tten\t100\n"))
+    expect_ok(env.run("SELECT * FROM users WHERE id BETWEEN 2 AND 9;"
+                      "SELECT * FROM users WHERE id BETWEEN 5 AND 9;"
+                      "SELECT * FROM users WHERE id > 1;"),
+              HEADER + u("4\t넷\t4\n") + HEADER + HEADER + u("4\t넷\t4\n10\tten\t100\n"))
+
+
+@test
+def p2_range_explain(env):
+    expect_ok(env.run(TWO_INSERTS +
+                      "EXPLAIN SELECT * FROM users WHERE id BETWEEN 10 AND 20;"
+                      "explain select * from users where id between 20 and 10;"
+                      "EXPLAIN SELECT * FROM users WHERE id<5;"
+                      "EXPLAIN SELECT * FROM users WHERE id <= 5;"
+                      "EXPLAIN SELECT * FROM users WHERE id > -1;"
+                      "EXPLAIN SELECT * FROM users WHERE id >= 9223372036854775807;"
+                      "EXPLAIN SELECT * FROM users WHERE id = 5;"),
+              b"INSERT 1\nINSERT 1\n" +
+              u("INDEX RANGE SCAN (id BETWEEN 10 AND 20, B+ 트리 높이 1)\n"
+                "INDEX RANGE SCAN (id BETWEEN 20 AND 10, B+ 트리 높이 1)\n"
+                "INDEX RANGE SCAN (id < 5, B+ 트리 높이 1)\n"
+                "INDEX RANGE SCAN (id <= 5, B+ 트리 높이 1)\n"
+                "INDEX RANGE SCAN (id > -1, B+ 트리 높이 1)\n"
+                "INDEX RANGE SCAN (id >= 9223372036854775807, B+ 트리 높이 1)\n"
+                "INDEX LOOKUP (id = 5, B+ 트리 높이 1)\n"))
+
+
+RANGE_ERROR_CASES = [
+    ("SELECT * FROM users WHERE id <> 1;", "BETWEEN만 지원"),
+    ("SELECT * FROM users WHERE id != 1;", "BETWEEN만 지원"),
+    ("SELECT * FROM users WHERE id NOT BETWEEN 1 AND 2;", "BETWEEN만 지원"),
+    ("SELECT * FROM users WHERE age BETWEEN 1 AND 2;", "age 조건은 '='"),
+    ("SELECT * FROM users WHERE age < 3;", "age 조건은 '='"),
+    ("SELECT * FROM users WHERE id BETWEEN 1;", "BETWEEN의 AND"),
+    ("SELECT * FROM users WHERE id BETWEEN 1 AND 2 AND age = 1;", "AND/OR"),
+    ("SELECT * FROM users WHERE id BETWEEN 1 AND 9223372036854775808;", "64비트"),
+]
+
+
+@test
+def p2_range_errors(env):
+    for sql, needle in RANGE_ERROR_CASES:
+        expect_fail(env.run("INSERT INTO users (name, age) VALUES ('a', 1);" + sql +
+                            "INSERT INTO users (name, age) VALUES ('b', 2);"),
+                    "문장 2", needle, stdout=b"INSERT 1\n")
+    eq(env.data(), b"".join(u("%d\ta\t1\n" % (i + 1)) for i in range(len(RANGE_ERROR_CASES))),
+       "실패한 문장 뒤 INSERT는 실행되지 않음")
+
+
+# ---------- Phase 2 / P2-04: --timing, 대량 생성, 벤치마크 ----------
+
+TOOLS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools")
+TIMING_START = re.compile(u(r"^\[측정\] 시작: [0-9]+\.[0-9]{3} ms \(파일 전체 읽기 \+ 인덱스 구축, ([0-9]+)행\)$"))
+TIMING_INDEX = re.compile(u(r"^\[측정\] 인덱스: 높이 ([0-9]+), 리프 ([0-9]+)개, 내부 노드 ([0-9]+)개, 약 [0-9]+\.[0-9] MB$"))
+TIMING_STMT = re.compile(u(r"^\[측정\] 문장 ([0-9]+): [0-9]+\.[0-9]{4} ms, (결과 ([0-9]+)행|추가 1행|계획만)$"))
+
+
+def timing_lines(err):
+    lines = err.split(b"\n")
+    assert lines[-1] == b"", "stderr가 줄바꿈으로 끝나지 않음: %r" % err
+    return lines[:-1]
+
+
+@test
+def p2_timing_keeps_stdout(env):
+    # --timing은 stderr에만 쓴다. stdout은 옵션이 없을 때와 바이트 단위로 같다.
+    expect_ok(env.run(TWO_INSERTS), b"INSERT 1\nINSERT 1\n")
+    q = env.sql_file("SELECT * FROM users WHERE id = 2;"
+                     "SELECT * FROM users WHERE age = 25;"
+                     "EXPLAIN SELECT * FROM users;"
+                     "SELECT * FROM users WHERE id BETWEEN 1 AND 2;")
+    code, plain, err = env.run_args(["--data-dir", env.data_dir, q])
+    eq((code, err), (0, b""), "옵션 없음")
+    code, timed, err = env.run_args(["--timing", "--data-dir", env.data_dir, q])
+    eq(code, 0, "--timing 종료 코드")
+    eq(timed, plain, "--timing stdout")
+    lines = timing_lines(err)
+    eq(len(lines), 6, "측정 줄 수")
+    m = TIMING_START.match(lines[0])
+    assert m and m.group(1) == b"2", lines[0]
+    m = TIMING_INDEX.match(lines[1])
+    assert m and m.groups() == (b"1", b"1", b"0"), lines[1]
+    expected = [(b"1", b"1"), (b"2", b"1"), (b"3", None), (b"4", b"2")]
+    for line, (no, rows) in zip(lines[2:], expected):
+        m = TIMING_STMT.match(line)
+        assert m, line
+        eq(m.group(1), no, "문장 번호")
+        if rows is None:
+            eq(m.group(2), u("계획만"), "EXPLAIN 측정")
+        else:
+            eq(m.group(3), rows, "결과 행 수")
+
+
+@test
+def p2_timing_insert_and_failure(env):
+    # 새 디렉터리: 시작 0행. INSERT는 "추가 1행". 실패한 문장은 측정 줄 없이 오류만
+    q = env.sql_file("INSERT INTO users (name, age) VALUES ('a', 1);"
+                     "SELECT * FROM users WHERE age > 1;")
+    code, out, err = env.run_args([q, "--timing", "--data-dir", env.data_dir])
+    assert code == 1, code
+    eq(out, b"INSERT 1\n", "stdout")
+    lines = timing_lines(err)
+    eq(len(lines), 4, "줄 수: 시작, 인덱스, 문장 1, 오류")
+    assert TIMING_START.match(lines[0]).group(1) == b"0"
+    assert TIMING_INDEX.match(lines[1])
+    m = TIMING_STMT.match(lines[2])
+    assert m and m.group(1) == b"1" and m.group(2) == u("추가 1행"), lines[2]
+    assert lines[3].startswith(u("오류: 문장 2:")), lines[3]
+    eq(env.data(), b"1\ta\t1\n", "파일")
+
+
+@test
+def p2_timing_usage(env):
+    code, out, _ = env.run_args(["--help"])
+    eq(code, 0, "--help")
+    assert b"--timing" in out
+    code, _, err = env.run_args(["--timing"])
+    eq(code, 2, "SQL 파일 없음")
+    code, _, err = env.run_args(["--timings", "x.sql"])
+    eq(code, 2, "비슷한 이름의 알 수 없는 옵션")
+
+
+@test
+def p2_gen_sql_feeds_cli(env):
+    gen = subprocess.run([sys.executable, os.path.join(TOOLS, "gen_sql.py"), "152"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    eq((gen.returncode, gen.stderr), (0, b""), "gen_sql 실행")
+    assert b"\r" not in gen.stdout, "LF로만 써야 함"
+    expect_ok(env.run(gen.stdout), b"INSERT 1\n" * 152)
+    data = env.data().split(b"\n")
+    eq(data[0], b"1\tuser000001\t1", "첫 줄")
+    eq(data[150], b"151\tuser000151\t0", "151번째: age = 151 % 151")
+    eq(data[151], b"152\tuser000152\t1", "마지막 줄")
+    bad = subprocess.run([sys.executable, os.path.join(TOOLS, "gen_sql.py"), "x"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    eq(bad.returncode, 2, "잘못된 인자")
+
+
+@test
+def p2_bench_smoke(env):
+    # 작은 건수로 벤치마크 스크립트 전체 흐름(생성 → 삽입 → EXPLAIN → --timing 반복 → 표)을 확인
+    work = os.path.join(env.root, "bench")
+    p = subprocess.run([sys.executable, os.path.join(TOOLS, "bench.py"), "--rows", "300", "--repeat", "2",
+                        "--bin", BIN, "--workdir", work],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+    eq((p.returncode, p.stderr), (0, b""), "bench.py 실행")
+    out = p.stdout.decode("utf-8")
+    for needle in ("| 레코드 수 | 300건 |", "INDEX LOOKUP", "INDEX RANGE SCAN", "FULL SCAN",
+                   "| id 범위 1,000건 | `id BETWEEN 150 AND 1149` | INDEX RANGE SCAN | 151 |",
+                   "| age 단건 — 일치 없음 | `age = 151` | FULL SCAN | 0 |",
+                   "| id 단건 — 없음 | `id = 301` | INDEX LOOKUP | 0 |"):
+        assert needle in out, "출력에 %r 없음:\n%s" % (needle, out)
+
+
+# ---------- Phase 2 / P2-05: 전체 회귀 — 무작위 문장 묶음을 Python 모델과 비교 ----------
+
+@test
+def p2_random_model(env):
+    # 정해진 시드로 INSERT와 모든 조회 형태를 섞고, 실행을 세 번(재시작 두 번) 나눠
+    # 결과를 단순 모델(전체 목록을 걸러내기)과 바이트 단위로 비교한다.
+    rnd = random.Random(20261116)
+    model = []  # (id, name, age)
+    names = ["a", "민수", "O'Brien", "Alice", "지영"]
+
+    def rows(pred):
+        return b"".join(u("%d\t%s\t%d\n" % r) for r in model if pred(r))
+
+    for _round in range(3):
+        stmts, expected = [], b""
+        for _ in range(200):
+            k = rnd.random()
+            if k < 0.35:
+                rid = len(model) + 1
+                name = rnd.choice(names) + "_" * rnd.randint(0, 40) + str(rid)
+                age = rnd.randint(0, 150)
+                stmts.append("INSERT INTO users (name, age) VALUES ('%s', %d);" % (name.replace("'", "''"), age))
+                model.append((rid, name, age))
+                expected += b"INSERT 1\n"
+                continue
+            n = len(model)
+            a = rnd.randint(-2, n + 3)
+            b = rnd.randint(-2, n + 3)
+            kind = rnd.choice(["eq", "between", "lt", "le", "gt", "ge", "age", "none"])
+            if kind == "eq":
+                where, pred = "id = %d" % a, (lambda r, a=a: r[0] == a)
+            elif kind == "between":
+                where, pred = "id BETWEEN %d AND %d" % (a, b), (lambda r, a=a, b=b: a <= r[0] <= b)
+            elif kind == "lt":
+                where, pred = "id < %d" % a, (lambda r, a=a: r[0] < a)
+            elif kind == "le":
+                where, pred = "id <= %d" % a, (lambda r, a=a: r[0] <= a)
+            elif kind == "gt":
+                where, pred = "id > %d" % a, (lambda r, a=a: r[0] > a)
+            elif kind == "ge":
+                where, pred = "id >= %d" % a, (lambda r, a=a: r[0] >= a)
+            elif kind == "age":
+                age = rnd.choice([rnd.randint(0, 150), -1, 151])
+                where, pred = "age = %d" % age, (lambda r, age=age: r[2] == age)
+            else:
+                where, pred = None, (lambda r: True)
+            stmts.append("SELECT * FROM users%s;" % (" WHERE " + where if where else ""))
+            expected += HEADER + rows(pred)
+        expect_ok(env.run("\n".join(stmts)), expected)
+    eq(env.data(), rows(lambda r: True), "최종 파일")
+
 
 @test
 def usage_errors(env):
