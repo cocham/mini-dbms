@@ -316,6 +316,43 @@ def http_level_errors():
 
 
 @test
+def bad_bytes_in_target_or_headers_execute_nothing():
+    # 경로에 NUL이 있으면 문자열 비교가 "/query"까지만 보고 SQL을 실행하던 문제(P3-02 검증)
+    d = fresh("badtarget")
+    with Server(d) as s:
+        eq(query(s.port, ins("before", 1))[0], 200)
+        path = os.path.join(d, "users.tsv")
+        with open(path, "rb") as f:
+            before = f.read()
+        body = ins("x", 2).encode("utf-8")
+        cases = [
+            b"POST /query\x00/invalid HTTP/1.1",
+            b"POST /query\x00 HTTP/1.1",
+            b"POST /query?a=\x00 HTTP/1.1",
+            b"POST /query\x01 HTTP/1.1",
+            b"POST /query\t HTTP/1.1",
+            b"POST /query\x7f HTTP/1.1",
+            b"POST /query\xff HTTP/1.1",
+        ]
+        for line in cases:
+            req = line + b"\r\nContent-Length: %d\r\n\r\n" % len(body) + body
+            st, h, b = parse(raw(s.port, req))
+            eq((st, json.loads(b)["error"]["code"]), (400, "BAD_REQUEST"), repr(line))
+        for hdr in (b"X-A: a\x00b\r\n", b"X-A\x00: v\r\n", b"X-A: \x01\r\n"):
+            req = b"POST /query HTTP/1.1\r\n" + hdr + b"Content-Length: %d\r\n\r\n" % len(body) + body
+            st, h, b = parse(raw(s.port, req))
+            eq((st, json.loads(b)["error"]["code"]), (400, "BAD_REQUEST"), repr(hdr))
+        st, h, b = request(s.port, "GET", "/health")
+        eq(json.loads(b)["rows"], 1, "INSERT가 실행되지 않음")
+        st, h, b = request(s.port, "POST", "/query", ins("ok", 3), extra=b"X-Tab: a\tb\r\n")
+        eq(st, 200, "헤더 값의 탭은 허용")
+    with open(path, "rb") as f:
+        after = f.read()
+    ok(after.startswith(before) and after.count(b"\n") == before.count(b"\n") + 1,
+       "거부된 요청은 파일을 바꾸지 않음")
+
+
+@test
 def expect_100_continue():
     with Server(fresh("expect")) as s:
         body = ins("e", 5).encode()

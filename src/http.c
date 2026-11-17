@@ -208,6 +208,14 @@ int http_read_request(int fd, HttpRequest *req, char *why, size_t why_cap) {
         }
     }
     memcpy(req->method, line, sp1);
+    /* 요청 대상 전체(쿼리 문자열 포함)는 보이는 ASCII만 허용한다. NUL이 섞이면
+       뒤의 문자열 비교가 NUL 앞까지만 보고 "/query"로 오인할 수 있다. */
+    for (i = sp1 + 1; i < sp2; i++) {
+        if (!is_token_char((unsigned char)line[i])) {
+            set_why(why, why_cap, "요청 경로에 허용하지 않는 문자(NUL·제어 문자 등)가 있습니다");
+            return 400;
+        }
+    }
     {
         size_t tlen = sp2 - sp1 - 1;
         const char *q = memchr(line + sp1 + 1, '?', tlen);
@@ -229,6 +237,13 @@ int http_read_request(int fd, HttpRequest *req, char *why, size_t why_cap) {
         line = next_line(&cur, hend, &len);
         if (len == 0) {
             break;
+        }
+        for (i = 0; i < len; i++) {
+            unsigned char c = (unsigned char)line[i];
+            if ((c < 0x20 && c != '\t') || c == 0x7F) {
+                set_why(why, why_cap, "헤더에 허용하지 않는 문자(NUL·제어 문자 등)가 있습니다");
+                return 400;
+            }
         }
         colon = memchr(line, ':', len);
         if (colon == NULL || colon == line) {

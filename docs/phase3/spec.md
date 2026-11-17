@@ -91,7 +91,7 @@ flowchart LR
 | `SQL_SYNTAX` | 400 | 구문 오류(전체 파싱 단계) | 아무것도 실행 안 함 |
 | `SQL_ERROR` | 400 | 실행 단계의 값·조건 오류 | 앞 문장만 실행됨 |
 | `RESULT_TOO_LARGE` | 400 | 응답 예산 초과(아래) | 앞 문장만 실행됨, 그 문장의 결과는 버림 |
-| `BAD_REQUEST` | 400 | HTTP 요청 형식 오류: 요청 줄·헤더·`Content-Length` 형식, 서로 다른 `Content-Length`, `Transfer-Encoding`(chunked 등 미지원) [P3-02] | 아무것도 실행 안 함 |
+| `BAD_REQUEST` | 400 | HTTP 요청 형식 오류: 요청 줄·헤더·`Content-Length` 형식, 요청 대상(경로·쿼리 문자열)에 보이는 ASCII(0x21~0x7E) 밖의 바이트(NUL·제어 문자·0x80 이상), 헤더 줄의 NUL·제어 문자(탭 제외), 서로 다른 `Content-Length`, `Transfer-Encoding`(chunked 등 미지원) [P3-02] | 아무것도 실행 안 함 |
 | `NOT_FOUND` / `METHOD` | 404 / 405 | 경로 없음 / 메서드 틀림(`Allow` 헤더로 허용 메서드 안내) | 아무것도 실행 안 함 |
 | `BODY_TOO_LARGE` / `HEADER_TOO_LARGE` | 413 / 431 | 요청 크기 상한 초과 | 아무것도 실행 안 함 |
 | `TIMEOUT` | 408 | 요청 수신 기한 초과(보낼 수 있을 때만) | 아무것도 실행 안 함 |

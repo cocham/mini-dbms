@@ -2,7 +2,7 @@
 
 ## 현재 상태
 
-**P3-02 완료(2026-11-16).** 최소 서버가 동작한다. 학습은 [walkthrough.md](walkthrough.md)의 요청·응답 실습에서 시작한다. 다음 단위(P3-03)는 사용자 검증(PASS)을 받은 뒤 진행한다.
+**P3-02 완료(2026-11-16), 검증 지적 1건 수정(2026-11-17).** 최소 서버가 동작한다. 학습은 [walkthrough.md](walkthrough.md)의 요청·응답 실습에서 시작한다. 다음 단위(P3-03)는 사용자 검증(PASS)을 받은 뒤 진행한다.
 
 진행 방식: 한 단위를 구현한다 → 테스트와 ASan·TSan 검사로 검증한다 → 통과하면 커밋한다 → **사용자가 검증 결과(PASS)를 전하면** 다음 단위로 간다(2026-11-16 사용자 지시, P3-01부터). 사용자 동작이나 공개 인터페이스를 바꾸는 결정은 구현 전에 짧게 제안한다.
 
@@ -98,13 +98,15 @@ spec 대응:
 | 서버 변이 8개 | Docker `gcc:13` | 모두 잡힘: 행 예산을 문장마다 초기화, INSERT 자리 선확인 제거, 실패 문장 결과를 되돌리지 않음, `WRITE_FAILED`에 `stored_id`, 파싱하며 실행, 따옴표 이스케이프 안 함, 잘못된 UTF-8 그대로, `Transfer-Encoding` 허용 |
 | walkthrough의 명령 전부 | Windows PowerShell `curl.exe` → Docker 서버 | 문서의 응답과 같음. CLI로 서버가 쓴 파일을 읽으면 같은 행 |
 
+**검증 지적 수정(2026-11-17):** 요청 대상에 NUL이 있으면(`POST /query<NUL>/invalid`) 경로를 그대로 복사해 이후 `strcmp`가 `/query`까지만 보고 SQL을 실행했다(200, 데이터 저장). 이제 요청 대상 전체(쿼리 문자열 포함)는 0x21~0x7E만 받고, 헤더 줄은 NUL·제어 문자(탭 제외)를 거부해 400 `BAD_REQUEST`를 돌려준다. 회귀 테스트 `bad_bytes_in_target_or_headers_execute_nothing`: 경로 7가지·헤더 3가지가 모두 400이고, `/health` 행 수와 `users.tsv` 내용이 바뀌지 않는다. 수정 전 `http.c`로 돌리면 이 테스트가 실패한다. 재실행: Windows 단위 26,052개·CLI 46개, Docker `make test`·`make sanitize`·`make tsan` 서버 16개 실패 0, 검사 도구 보고 없음.
+
 검증 중 고친 결함 2개: JSON 버퍼의 첫 할당이 상한보다 커질 수 있었다(단위 테스트가 잡음). 길이 0 쓰기에서 `memcpy`에 NULL이 넘어갔다(UBSan이 잡음).
 
 spec 대응:
 
 | ID | 테스트 |
 |---|---|
-| S2 | 서버 테스트 15개: `health_and_empty_body`, `insert_select_explain_match_cli`(JSON 결과 전체 비교, 같은 디렉터리를 CLI로 읽기), `query_string_ignored_and_routes`(404·405·`Allow`), `syntax_error_executes_nothing`(선파싱, NUL), `runtime_error_keeps_earlier_results`, `json_escaping_and_invalid_utf8`, `row_budget_counts_whole_request`(SELECT 여러 개로 우회 불가, 넘긴 SELECT는 통째로 버림), `byte_budget_and_insert_reservation`(응답 ≤ 4096바이트, 응답에 보인 INSERT 수 = 저장된 행 수), `http_level_errors`(413·431·400 형식·chunked·Content-Length 충돌, HTTP/1.0·LF만), `expect_100_continue`, `client_disconnect_does_not_stop_server`, `shutdown_and_restart_keep_data`(SIGTERM → 0, 다음 id 이어짐), `usage_and_start_errors`, `index_failure_halts_and_restart_recovers`(`stored_id` 64, 503 `HALTED`, 재시작 뒤 64 조회), `write_failure_halts_and_restart_is_refused`(`stored_id` 없음, 재시작 거부). 단위: `test_json_escape_and_utf8`, `test_json_budget` |
+| S2 | 서버 테스트 16개: `health_and_empty_body`, `insert_select_explain_match_cli`(JSON 결과 전체 비교, 같은 디렉터리를 CLI로 읽기), `query_string_ignored_and_routes`(404·405·`Allow`), `syntax_error_executes_nothing`(선파싱, NUL), `runtime_error_keeps_earlier_results`, `json_escaping_and_invalid_utf8`, `row_budget_counts_whole_request`(SELECT 여러 개로 우회 불가, 넘긴 SELECT는 통째로 버림), `byte_budget_and_insert_reservation`(응답 ≤ 4096바이트, 응답에 보인 INSERT 수 = 저장된 행 수), `http_level_errors`(413·431·400 형식·chunked·Content-Length 충돌, HTTP/1.0·LF만), `bad_bytes_in_target_or_headers_execute_nothing`(경로·헤더의 NUL·제어 문자 → 400, 파일 변화 없음), `expect_100_continue`, `client_disconnect_does_not_stop_server`, `shutdown_and_restart_keep_data`(SIGTERM → 0, 다음 id 이어짐), `usage_and_start_errors`, `index_failure_halts_and_restart_recovers`(`stored_id` 64, 503 `HALTED`, 재시작 뒤 64 조회), `write_failure_halts_and_restart_is_refused`(`stored_id` 없음, 재시작 거부). 단위: `test_json_escape_and_utf8`, `test_json_budget` |
 
 ### P3-03 — 스레드 풀과 작업 큐
 
