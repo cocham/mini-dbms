@@ -15,6 +15,9 @@
 #include "json.h"
 #include "parser.h"
 #include "storage.h"
+#include "workqueue.h"
+
+#include <sched.h>
 
 #ifdef _WIN32
 #include <direct.h>
@@ -2110,6 +2113,133 @@ static void test_json_budget(void) {
     jb_free(&b);
 }
 
+/* ---------- 작업 큐 (P3-03) ---------- */
+
+static void test_workqueue_basic(void) {
+    WorkQueue q;
+    int fd = -1, rest[3], i;
+
+    CHECK(wq_init(&q, 0) == -1);
+    CHECK(wq_init(&q, 3) == 0);
+    /* 넣은 순서대로 나온다(고리 버퍼가 한 바퀴 돌아도) */
+    for (i = 0; i < 3; i++) {
+        CHECK(wq_try_push(&q, 10 + i) == 0);
+    }
+    CHECK(wq_try_push(&q, 99) == 1); /* 가득 참: 기다리지 않고 바로 실패 */
+    CHECK(wq_pop(&q, &fd) == 0 && fd == 10);
+    CHECK(wq_try_push(&q, 13) == 0); /* 빈자리 하나 → 다시 들어감 (끝을 넘어 처음 칸에) */
+    CHECK(wq_pop(&q, &fd) == 0 && fd == 11);
+    /* 닫으면 아무도 꺼내지 않은 것만 순서대로 돌려준다 */
+    CHECK(wq_close(&q, rest) == 2 && rest[0] == 12 && rest[1] == 13);
+    CHECK(wq_close(&q, rest) == 0);
+    CHECK(wq_pop(&q, &fd) == -1);       /* 닫힌 뒤에는 기다리지 않고 -1 */
+    CHECK(wq_try_push(&q, 20) == 2);    /* 닫힌 뒤에는 넣을 수 없다 */
+    wq_destroy(&q);
+}
+
+#define WQ_PRODUCERS 4
+#define WQ_CONSUMERS 4
+#define WQ_PER_PRODUCER 5000
+
+typedef struct {
+    WorkQueue *q;
+    int base;
+    int full; /* 가득 차서 다시 시도한 횟수 */
+} WqProducer;
+
+typedef struct {
+    WorkQueue *q;
+    unsigned char *seen; /* 소비자끼리 겹치지 않는 값만 쓰므로 잠금이 필요 없다 */
+    int got;
+    int dup;
+} WqConsumer;
+
+static void *wq_producer_main(void *p) {
+    WqProducer *w = p;
+    int i, r;
+
+    for (i = 0; i < WQ_PER_PRODUCER; i++) {
+        while ((r = wq_try_push(w->q, w->base + i)) == 1) {
+            w->full++;
+            sched_yield();
+        }
+    }
+    return NULL;
+}
+
+static void *wq_consumer_main(void *p) {
+    WqConsumer *c = p;
+    int v;
+
+    while (wq_pop(c->q, &v) == 0) {
+        if (v < 0 || v >= WQ_PRODUCERS * WQ_PER_PRODUCER || c->seen[v]) {
+            c->dup++;
+        } else {
+            c->seen[v] = 1;
+        }
+        c->got++;
+    }
+    return NULL;
+}
+
+/* 여러 생산자·소비자가 동시에 써도 값이 빠지거나 두 번 나오지 않는다. 닫으면 잠든 소비자가 모두 깨어난다. */
+static void test_workqueue_threads(void) {
+    WorkQueue q;
+    pthread_t pt[WQ_PRODUCERS], ct[WQ_CONSUMERS];
+    WqProducer pr[WQ_PRODUCERS];
+    WqConsumer co[WQ_CONSUMERS];
+    unsigned char *seen = calloc(WQ_PRODUCERS * WQ_PER_PRODUCER, 1);
+    int rest[8], i, total = 0, dup = 0, missing = 0, created = 1;
+    size_t nrest;
+
+    CHECK(seen != NULL && wq_init(&q, 8) == 0);
+    if (seen == NULL) {
+        return;
+    }
+    for (i = 0; i < WQ_CONSUMERS; i++) {
+        co[i].q = &q;
+        co[i].seen = seen;
+        co[i].got = co[i].dup = 0;
+        created &= pthread_create(&ct[i], NULL, wq_consumer_main, &co[i]) == 0;
+    }
+    for (i = 0; i < WQ_PRODUCERS; i++) {
+        pr[i].q = &q;
+        pr[i].base = i * WQ_PER_PRODUCER;
+        pr[i].full = 0;
+        created &= pthread_create(&pt[i], NULL, wq_producer_main, &pr[i]) == 0;
+    }
+    CHECK(created);
+    for (i = 0; i < WQ_PRODUCERS; i++) {
+        pthread_join(pt[i], NULL);
+    }
+    /* 생산이 끝난 뒤 소비자가 큐를 비울 때까지 기다린 다음 닫는다 */
+    for (;;) {
+        size_t len;
+        pthread_mutex_lock(&q.mu);
+        len = q.len;
+        pthread_mutex_unlock(&q.mu);
+        if (len == 0) {
+            break;
+        }
+        sched_yield();
+    }
+    nrest = wq_close(&q, rest);
+    for (i = 0; i < WQ_CONSUMERS; i++) {
+        pthread_join(ct[i], NULL); /* 닫지 않으면 여기서 영영 멈춘다 */
+        total += co[i].got;
+        dup += co[i].dup;
+    }
+    for (i = 0; i < WQ_PRODUCERS * WQ_PER_PRODUCER; i++) {
+        missing += !seen[i];
+    }
+    CHECK(nrest == 0);
+    CHECK(total == WQ_PRODUCERS * WQ_PER_PRODUCER);
+    CHECK(dup == 0);
+    CHECK(missing == 0);
+    wq_destroy(&q);
+    free(seen);
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "사용법: test_unit <임시 디렉터리>\n");
@@ -2176,6 +2306,9 @@ int main(int argc, char **argv) {
 
     test_json_escape_and_utf8();
     test_json_budget();
+
+    test_workqueue_basic();
+    test_workqueue_threads();
 
     printf("단위 테스트: %d개 검사 중 %d개 실패\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

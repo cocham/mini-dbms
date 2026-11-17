@@ -10,8 +10,8 @@ TSAN_FLAGS = -fsanitize=thread -fno-omit-frame-pointer -O1 -g
 # DB 진입점(db.c)이 pthread mutex를 쓴다. Windows는 TDM-GCC의 winpthreads (Phase 3, DB-P3-D04)
 THREAD_FLAGS = -pthread
 
-SRC = src/common.c src/parser.c src/bptree.c src/storage.c src/executor.c src/db.c src/json.c
-HDR = src/common.h src/parser.h src/bptree.h src/storage.h src/executor.h src/db.h src/json.h
+SRC = src/common.c src/parser.c src/bptree.c src/storage.c src/executor.c src/db.c src/json.c src/workqueue.c
+HDR = src/common.h src/parser.h src/bptree.h src/storage.h src/executor.h src/db.h src/json.h src/workqueue.h
 # API 서버 (Phase 3, POSIX 전용). Windows에서는 빌드하지 않는다 (DB-P3-D02)
 SERVER_SRC = src/http.c src/server.c
 SERVER_HDR = src/http.h

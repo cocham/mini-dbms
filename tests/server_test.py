@@ -400,7 +400,8 @@ def shutdown_and_restart_keep_data():
 def usage_and_start_errors():
     d = fresh("usage")
     for args in (["--port", "70000"], ["--port", "x"], ["--max-rows", "0"], ["--max-response", "100"],
-                 ["--host", "localhost"], ["--threads", "4"], ["--data-dir"]):
+                 ["--host", "localhost"], ["--threads", "0"], ["--threads", "257"], ["--queue", "0"],
+                 ["--queue", "4097"], ["--queue", "x"], ["--data-dir"]):
         code, out, err = run_start_fail(d, *args)
         eq(code, 2, "사용법 오류 %r: %s" % (args, err))
         ok("사용법" in err, err)
@@ -410,6 +411,228 @@ def usage_and_start_errors():
     open(f, "w").close()
     code, out, err = run_start_fail(f, "--port", "0")
     eq(code, 1, "시작 실패: " + err)
+
+
+# ---------- 스레드 풀 · 큐 · 기한 · 종료 (P3-03) ----------
+
+def cli_rows(d):
+    q = os.path.join(TMP, "rows.sql")
+    open(q, "w", encoding="utf-8").write("SELECT * FROM users;")
+    p = subprocess.run([CLI, "--data-dir", d, q], capture_output=True, timeout=30)
+    eq(p.returncode, 0, p.stderr.decode("utf-8", "replace"))
+    return p.stdout.decode("utf-8").splitlines()[1:]
+
+
+def read_all(sock, timeout):
+    """닫힐 때까지 읽는다. 연결 재설정도 '닫힘'으로 본다."""
+    sock.settimeout(timeout)
+    chunks = []
+    try:
+        while True:
+            c = sock.recv(65536)
+            if not c:
+                break
+            chunks.append(c)
+    except (ConnectionResetError, BrokenPipeError):
+        pass
+    return b"".join(chunks)
+
+
+def timed_health(port):
+    t = time.time()
+    st, h, b = request(port, "GET", "/health")
+    return st, time.time() - t
+
+
+def in_thread(fn, *args):
+    box = {}
+
+    def run():
+        try:
+            box["value"] = fn(*args)
+        except Exception as e:  # noqa: BLE001
+            box["error"] = e
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    return th, box
+
+
+@test
+def slow_client_does_not_block_others():
+    with Server(fresh("slow")) as s:
+        ok("워커 4개, 큐 64" in "".join(s.log), "시작 줄: " + "".join(s.log))
+        slow = socket.create_connection(("127.0.0.1", s.port))
+        slow.sendall(b"POST /query HTTP/1.1\r\nContent-Length: 100\r\n\r\nSELECT")  # 나머지를 영영 안 보냄
+        time.sleep(0.3)
+        st, took = timed_health(s.port)
+        eq(st, 200)
+        ok(took < 2.0, "느린 연결이 있어도 다른 요청은 바로 처리: %.2f초" % took)
+        eq(query(s.port, ins("a", 1))[0], 200)
+        slow.close()
+
+
+@test
+def busy_is_immediate_when_queue_full():
+    with Server(fresh("busy"), "--threads", "1", "--queue", "1") as s:
+        hold = socket.create_connection(("127.0.0.1", s.port))  # 워커 하나를 붙잡는다(아무것도 안 보냄)
+        time.sleep(0.3)
+        queued = socket.create_connection(("127.0.0.1", s.port))  # 큐의 한 칸을 채운다
+        queued.sendall(b"GET /health HTTP/1.1\r\n\r\n")
+        time.sleep(0.3)
+        t = time.time()
+        extra = socket.create_connection(("127.0.0.1", s.port))  # 큐가 가득 참
+        resp = read_all(extra, 10)
+        took = time.time() - t
+        st, h, b = parse(resp)
+        eq((st, json.loads(b)), (503, {"ok": False, "error": {"code": "BUSY", "message": "서버가 바쁩니다"}}))
+        ok(took < 2.0, "503은 기다리지 않음: %.2f초" % took)
+        ok(len(resp) < 200, "고정 응답 200바이트 미만: %d" % len(resp))
+        # 붙잡힌 워커는 호출 기한(5초)이 지나면 풀려나고, 큐에서 기다리던 요청이 처리된다
+        st, h, b = parse(read_all(queued, 15))
+        eq(st, 200, "큐에서 기다린 요청은 처리됨")
+        hold.close()
+        extra.close()
+        queued.close()
+    ok(any("503 BUSY" in ln for ln in s.log), "BUSY 로그")
+
+
+@test
+def concurrent_inserts_over_http():
+    clients, per = 16, 15
+    d = fresh("concurrent")
+    with Server(d) as s:
+        def worker(c):
+            seen = []
+            for i in range(per):
+                name = "c%d_%d" % (c, i)
+                st, r = query(s.port, ins(name, c))
+                eq(st, 200, name)
+                new_id = r["results"][0]["id"]
+                # 성공 응답을 받은 INSERT는 그 뒤의 SELECT에 보인다 (C3)
+                st, r = query(s.port, "SELECT * FROM users WHERE id = %d;" % new_id)
+                eq(r["results"][0]["rows"], [[new_id, name, c]], "방금 넣은 행")
+                seen.append(new_id)
+            return seen
+        threads = [in_thread(worker, c) for c in range(clients)]
+        ids = []
+        for th, box in threads:
+            th.join(120)
+            ok(not th.is_alive(), "클라이언트가 끝나지 않음")
+            if "error" in box:
+                raise box["error"]
+            ids += box["value"]
+        eq(sorted(ids), list(range(1, clients * per + 1)), "id 중복·빠짐 없음 (C1)")
+        st, h, b = request(s.port, "GET", "/health")
+        eq(json.loads(b)["rows"], clients * per)
+    eq(len(cli_rows(d)), clients * per, "재시작(CLI)해도 같은 행 수 (C4)")
+
+
+@test
+def receive_deadlines():
+    with Server(fresh("deadline")) as s:
+        def stalled():  # 헤더 일부만 보내고 멈춤 → 호출 하나의 기한(5초)
+            sock = socket.create_connection(("127.0.0.1", s.port))
+            t = time.time()
+            sock.sendall(b"GET /health HTTP/1.1\r\nX-A: ")
+            resp = read_all(sock, 20)
+            sock.close()
+            return resp, time.time() - t
+
+        def slowloris():  # 1초마다 1바이트씩 → 호출 기한은 안 넘지만 전체 기한(10초)에서 끊김
+            import select
+            sock = socket.create_connection(("127.0.0.1", s.port))
+            t = time.time()
+            payload = b"GET /health HTTP/1.1\r\nX-Pad: " + b"a" * 100
+            i = 0
+            while time.time() - t < 20:
+                r, _, _ = select.select([sock], [], [], 1.0)
+                if r:
+                    break
+                try:
+                    sock.sendall(payload[i:i + 1])
+                except (BrokenPipeError, ConnectionResetError):
+                    break
+                i += 1
+            resp = read_all(sock, 5)
+            sock.close()
+            return resp, time.time() - t
+
+        a = in_thread(stalled)
+        b = in_thread(slowloris)
+        time.sleep(1)
+        st, took = timed_health(s.port)  # 느린 연결 둘이 있어도 다른 요청은 바로 처리
+        eq(st, 200)
+        ok(took < 2.0, "다른 요청 %.2f초" % took)
+        for (th, box), lo, hi, what in ((a, 4.5, 8.0, "호출 기한"), (b, 9.5, 14.0, "전체 기한")):
+            th.join(30)
+            if "error" in box:
+                raise box["error"]
+            resp, took = box["value"]
+            st, h, body = parse(resp)
+            eq((st, json.loads(body)["error"]["code"]), (408, "TIMEOUT"), what)
+            ok(lo <= took <= hi, "%s: %.2f초" % (what, took))
+
+
+@test
+def shutdown_finishes_running_and_rejects_queued():
+    d = fresh("shutdown_queue")
+    s = Server(d, "--threads", "1", "--queue", "4", binary=SERVER_TEST,
+               env={"MINIDB_TEST_STMT_DELAY_MS": "300"})
+    running = in_thread(query, s.port, ins("a1", 1) + ins("a2", 2) + ins("a3", 3))  # 약 0.9초 걸림
+    time.sleep(0.2)
+    queued = socket.create_connection(("127.0.0.1", s.port))
+    body = ins("b", 9).encode()
+    queued.sendall(b"POST /query HTTP/1.1\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+    time.sleep(0.2)
+    s.proc.send_signal(signal.SIGTERM)
+    st, h, b = parse(read_all(queued, 10))
+    eq((st, json.loads(b)["error"]["code"]), (503, "SHUTTING_DOWN"), "큐에서 기다리던 요청")
+    queued.close()
+    th, box = running
+    th.join(30)
+    if "error" in box:
+        raise box["error"]
+    st, r = box["value"]
+    eq((st, [x["id"] for x in r["results"]]), (200, [1, 2, 3]), "처리 중이던 요청은 끝까지")
+    eq(s.proc.wait(timeout=30), 0, "종료 코드 0")
+    s.reader.join(timeout=5)
+    ok(any("대기하던 연결 1개에 503" in ln for ln in s.log), "".join(s.log))
+    eq(cli_rows(d), ["1\ta1\t1", "2\ta2\t2", "3\ta3\t3"], "큐에서 거절된 INSERT는 저장 안 됨")
+
+
+@test
+def shutdown_grace_stops_at_statement_boundary():
+    d = fresh("shutdown_grace")
+    s = Server(d, binary=SERVER_TEST, env={"MINIDB_TEST_GRACE_MS": "2000", "MINIDB_TEST_STMT_DELAY_MS": "1500"})
+    # 문장 1은 1.5초, 문장 2는 3.0초에 시작할 차례. 유예는 신호(0.3초) + 2초 = 2.3초에 끝난다.
+    sock = socket.create_connection(("127.0.0.1", s.port))
+    body = (ins("s1", 1) + ins("s2", 2) + ins("s3", 3)).encode()
+    sock.sendall(b"POST /query HTTP/1.1\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+    time.sleep(0.3)
+    t = time.time()
+    s.proc.send_signal(signal.SIGTERM)
+    eq(s.proc.wait(timeout=30), 0, "종료 코드 0")
+    took = time.time() - t
+    s.reader.join(timeout=5)
+    eq(read_all(sock, 5), b"", "유예 뒤에는 연결을 끊는다(응답 없음 → 결과 불명)")
+    sock.close()
+    ok(1.8 <= took <= 6.0, "유예 2초 + 실행 중 문장: %.2f초" % took)
+    ok(any("유예 시간이 지나 연결 1개를 끊음" in ln for ln in s.log), "".join(s.log))
+    eq(cli_rows(d), ["1\ts1\t1"], "문장 경계에서 멈춤: 문장 1만 저장")
+
+
+@test
+def shutdown_grace_closes_slow_connection():
+    s = Server(fresh("shutdown_slow"), binary=SERVER_TEST, env={"MINIDB_TEST_GRACE_MS": "500"})
+    slow = socket.create_connection(("127.0.0.1", s.port))
+    slow.sendall(b"POST /query HTTP/1.1\r\nContent-Length: 100\r\n\r\nSELECT")
+    time.sleep(0.3)
+    t = time.time()
+    s.proc.send_signal(signal.SIGTERM)
+    eq(s.proc.wait(timeout=30), 0)
+    took = time.time() - t
+    ok(took < 3.0, "느린 연결의 기한(5·10초)까지 기다리지 않음: %.2f초" % took)
+    slow.close()
 
 
 # ---------- 저장 후 실패 (테스트 전용 빌드) ----------

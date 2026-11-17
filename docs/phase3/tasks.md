@@ -2,7 +2,7 @@
 
 ## 현재 상태
 
-**P3-02 완료(2026-11-16), 검증 지적 1건 수정(2026-11-17).** 최소 서버가 동작한다. 학습은 [walkthrough.md](walkthrough.md)의 요청·응답 실습에서 시작한다. 다음 단위(P3-03)는 사용자 검증(PASS)을 받은 뒤 진행한다.
+**P3-03 완료(2026-11-17).** 워커 N개가 연결을 동시에 처리하고, 큐가 가득 차면 503 `BUSY`, 종료 때는 대기 요청에 503 `SHUTTING_DOWN`을 보낸다. 실습은 [walkthrough.md](walkthrough.md) 6장. P3-02는 사용자 검증 PASS(2026-11-17, `36ea7a8`). 다음 단위(P3-04)는 사용자 검증(PASS)을 받은 뒤 진행한다.
 
 진행 방식: 한 단위를 구현한다 → 테스트와 ASan·TSan 검사로 검증한다 → 통과하면 커밋한다 → **사용자가 검증 결과(PASS)를 전하면** 다음 단위로 간다(2026-11-16 사용자 지시, P3-01부터). 사용자 동작이나 공개 인터페이스를 바꾸는 결정은 구현 전에 짧게 제안한다.
 
@@ -11,7 +11,7 @@
 | P3-00 | 구현 전 결정 | design.md DB-P3-D01~D11 확정 | 완료(2026-11-16) |
 | P3-01 | 엔진 진입점과 전역 잠금 | S1, S1x | 완료 |
 | P3-02 | 단일 스레드 HTTP 서버 | S2, 실행 예시와 요청 경로 지도 | 완료 |
-| P3-03 | 스레드 풀과 작업 큐 | S3 | 대기 |
+| P3-03 | 스레드 풀과 작업 큐 | S3 | 완료 |
 | P3-04 | 읽기 병렬화 | S4 | 대기 |
 | P3-05 | 부하 측정과 마무리 | S5 | 대기 |
 
@@ -118,6 +118,31 @@ spec 대응:
 - 긴 요청 도중 Ctrl+C를 누르면 처리 중이던 요청은 끝나고, 대기 중이던 요청은 503 `SHUTTING_DOWN`을 받고, 서버가 종료 코드 0으로 끝난다.
 
 **파일:** 새 `src/workqueue.{h,c}`. 바뀌는 곳: `src/server.c`, `tests/server_test.py`.
+
+**구현 메모 (2026-11-17):**
+- 큐(`workqueue.c`): 고리 버퍼 + mutex + 조건 변수. `wq_try_push`는 기다리지 않고 가득 차면 실패, `wq_pop`은 빌 때 잠든다. `wq_close`는 닫으면서 아무도 꺼내지 않은 fd를 한꺼번에 돌려준다(종료 때 503용). 이후 `wq_pop`은 바로 -1. pthread만 쓰므로 Windows 단위 테스트에서도 검사한다.
+- 워커는 SIGINT·SIGTERM을 막은 채 만든다. 신호는 accept 스레드(main)만 받는다.
+- 종료 유예: main이 20 ms 간격으로 살아 있는 워커 수를 본다. 유예가 지나면 `g_force`(원자 변수)를 세우고 처리 중인 연결을 `shutdown`한다. 워커는 문장마다 실행 직전에 `g_force`를 보고 멈춘다. 워커는 연결을 `close`하기 전에 자기 칸을 비우고(같은 mutex), main은 그 mutex 안에서만 `shutdown`하므로 이미 닫혀 번호가 재사용된 fd를 건드리지 않는다.
+- 503 고정 응답은 accept 스레드에서 비차단으로 보낸다. 이미 도착한 바이트(최대 64 KiB)만 비차단으로 버리고 닫는다(연결 재설정으로 503이 사라지는 것을 줄이려고. spec 표에 반영).
+- 옵션 범위: `--threads` 1~256, `--queue` 1~4096(spec 반영). listen 대기열은 64에서 128로 늘렸다.
+- 테스트 전용 빌드에만 있는 조절 장치 2개를 더했다: `MINIDB_TEST_GRACE_MS`(유예 시간 단축), `MINIDB_TEST_STMT_DELAY_MS`(문장마다 잠금 밖에서 잠깐 쉼). 배포용 `minidb-server`에는 없다.
+
+**P3-03 검증 기록(2026-11-17)**
+
+| 명령 | 환경 | 결과 |
+|---|---|---|
+| `mingw32-make`, `mingw32-make test` | Windows, TDM-GCC 10.3 | 경고 0, 단위 26,071개 검사 실패 0(작업 큐 포함), CLI 46개 실패 0 |
+| `make`, `make test` | Docker `gcc:13` | 경고 0, 단위·CLI·서버 23개 실패 0. 서버 테스트 5회 연속 실행 모두 통과(시간에 기대는 테스트의 흔들림 확인) |
+| `make sanitize` | Docker `gcc:13`, ASan/UBSan/LSan | 단위·CLI·서버 실패 0, 보고 없음 |
+| `docker run --security-opt seccomp=unconfined ... make tsan` | Docker `gcc:13`, TSan | 단위(작업 큐 생산자 4·소비자 4 포함)·서버 실패 0, 보고 없음 |
+| 변이 9개 | Docker `gcc:13` | 8개 잡힘: 워커 1개로, 큐가 차면 503 없이 닫기, 대기 연결에 503 없이 닫기, 문장 경계 검사 제거, 유예 뒤 강제 종료 제거, 수신 전체 기한 60초로, 고리 버퍼 순환 제거(단위), 가득 참 검사 제거(단위). 못 잡은 1개("닫힌 큐에 남은 항목을 꺼냄")는 `wq_close`가 닫으면서 항목을 모두 가져가므로 동작이 같은 변이다 |
+| walkthrough 6장 실습 1~3 | Windows PowerShell → Docker 서버 | 느린 요청이 있어도 `/health` 239 ms(P3-02는 3,378 ms). `--threads 1 --queue 1`에서 503 `BUSY` 237 ms, 대기 요청은 408 뒤에 200. SIGINT 때 대기 요청 503 `SHUTTING_DOWN`, 처리 중 요청은 408까지 처리하고 종료 |
+
+spec 대응:
+
+| ID | 테스트 |
+|---|---|
+| S3 | 서버 테스트 7개 추가(총 23개): `slow_client_does_not_block_others`(느린 연결이 있어도 다른 요청 2초 안), `busy_is_immediate_when_queue_full`(`--threads 1 --queue 1`, 503 `BUSY` 2초 안·200바이트 미만, 큐에서 기다린 요청은 처리됨), `concurrent_inserts_over_http`(클라이언트 16개 × 15번 INSERT+조회: id 1..240 중복·빠짐 없음, 성공한 INSERT는 바로 조회됨, CLI로 같은 행 수), `receive_deadlines`(헤더 멈춤 → 5초 408, 1초에 1바이트 → 10초 408, 그 사이 다른 요청 2초 안), `shutdown_finishes_running_and_rejects_queued`(처리 중 요청은 200으로 끝까지, 대기 요청 503 `SHUTTING_DOWN`·저장 안 됨, 종료 코드 0), `shutdown_grace_stops_at_statement_boundary`(유예가 지나면 연결을 끊고 문장 1만 저장), `shutdown_grace_closes_slow_connection`(느린 연결의 기한까지 기다리지 않고 종료). `usage_and_start_errors`에 `--threads`·`--queue` 범위 추가. 단위: `test_workqueue_basic`, `test_workqueue_threads` |
 
 ### P3-04 — 읽기 병렬화
 
