@@ -4,9 +4,9 @@ C로 SQL 파일을 실행하고 데이터를 파일에 저장하는 CLI(Phase 1)
 
 ## Phase 3 — API 서버 (진행 중)
 
-현재 상태: **P3-03(스레드 풀과 작업 큐)까지 완료.** `POST /query`로 SQL을 보내면 JSON으로 답하는 서버(`build/minidb-server`, POSIX 전용)가 워커 여러 개로 연결을 동시에 처리한다. 큐가 가득 차면 503 `BUSY`로 바로 거절한다. 엔진은 아직 전역 잠금이라 문장 실행은 한 번에 하나다(읽기 병렬화는 P3-04).
+현재 상태: **P3-04(읽기 병렬화)까지 완료.** `POST /query`로 SQL을 보내면 JSON으로 답하는 서버(`build/minidb-server`, POSIX 전용)가 워커 여러 개로 연결을 동시에 처리한다. 큐가 가득 차면 503 `BUSY`로 바로 거절한다. 엔진은 읽기·쓰기 잠금이라 SELECT끼리는 동시에 실행되고 INSERT는 혼자 실행된다(쓰기 우선). 100만 행 선형 탐색 4개 동시: 전역 잠금 813 ms → 313 ms.
 
-1. [실습](docs/phase3/walkthrough.md): 서버 띄우기 → `curl`로 요청·응답 → 요청 하나가 엔진까지 가는 지도 → (6장) 스레드 풀. **여기서 시작**
+1. [실습](docs/phase3/walkthrough.md): 서버 띄우기 → `curl`로 요청·응답 → 요청 하나가 엔진까지 가는 지도 → (6장) 스레드 풀 → (7장) 읽기 병렬화. **여기서 시작**
 2. [개발 명세](docs/phase3/spec.md): API 계약, 오류 코드, 크기 제한, 저장 후 실패, 동시성 계약
 3. [설계와 결정](docs/phase3/design.md): 엔진 연결, 지금 코드의 동시성 문제, 잠금 단계, 서버 구조
 4. [작업 순서](docs/phase3/tasks.md): P3-01~P3-05, 단위별 흐름·확인 시나리오·검증 기록
@@ -19,6 +19,7 @@ curl.exe -s http://localhost:8080/query --data-binary "SELECT * FROM users WHERE
 make test                      # Windows: 단위(동시 정확성 포함)·CLI / Linux: 여기에 서버 테스트까지
 docker run --rm --security-opt seccomp=unconfined -v "$PWD:/src" -w /src gcc:13 make tsan       # 데이터 경쟁 검사
 docker run --rm --security-opt seccomp=unconfined -v "$PWD:/src" -w /src gcc:13 make race-demo  # 잠금 없는 엔진 관찰 실험
+docker run --rm -v "$PWD:/src" -w /src gcc:13 make read-bench   # 전역 잠금 vs 읽기·쓰기 잠금 측정 (약 1분)
 ```
 
 ## Phase 2 — B+ 트리 인덱스 (완료)

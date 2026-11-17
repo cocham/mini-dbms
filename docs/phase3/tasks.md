@@ -2,7 +2,7 @@
 
 ## 현재 상태
 
-**P3-03 완료(2026-11-17).** 워커 N개가 연결을 동시에 처리하고, 큐가 가득 차면 503 `BUSY`, 종료 때는 대기 요청에 503 `SHUTTING_DOWN`을 보낸다. 실습은 [walkthrough.md](walkthrough.md) 6장. P3-02는 사용자 검증 PASS(2026-11-17, `36ea7a8`). 다음 단위(P3-04)는 사용자 검증(PASS)을 받은 뒤 진행한다.
+**P3-04 완료(2026-11-17).** SELECT끼리는 공유 잠금으로 동시에 실행되고, INSERT는 배타 잠금이다(glibc에서 쓰기 우선). 조회는 공유 `FILE*` 대신 위치를 지정해 읽는다. 실습은 [walkthrough.md](walkthrough.md) 7장. P3-03은 사용자 검증 PASS(2026-11-17, `6063d77`). 다음 단위(P3-05)는 사용자 검증(PASS)을 받은 뒤 진행한다.
 
 진행 방식: 한 단위를 구현한다 → 테스트와 ASan·TSan 검사로 검증한다 → 통과하면 커밋한다 → **사용자가 검증 결과(PASS)를 전하면** 다음 단위로 간다(2026-11-16 사용자 지시, P3-01부터). 사용자 동작이나 공개 인터페이스를 바꾸는 결정은 구현 전에 짧게 제안한다.
 
@@ -12,7 +12,7 @@
 | P3-01 | 엔진 진입점과 전역 잠금 | S1, S1x | 완료 |
 | P3-02 | 단일 스레드 HTTP 서버 | S2, 실행 예시와 요청 경로 지도 | 완료 |
 | P3-03 | 스레드 풀과 작업 큐 | S3 | 완료 |
-| P3-04 | 읽기 병렬화 | S4 | 대기 |
+| P3-04 | 읽기 병렬화 | S4 | 완료 |
 | P3-05 | 부하 측정과 마무리 | S5 | 대기 |
 
 ## 학습과의 분리
@@ -66,6 +66,8 @@ spec 대응:
 | 동시 INSERT(4,000번) | 매번 처음 몇 건(2~17건) 안에 같은 id를 두 스레드가 받았다. 두 번째 줄은 파일에 기록됐지만 인덱스 등록이 중복으로 실패했고(`INDEX_FAILED`), 엔진은 중단 상태가 되어 나머지 INSERT를 모두 거절했다 |
 | 재시작 | 매번 거부. 같은 id의 줄이 두 번 기록되어 "id가 증가 순서가 아닙니다"(데이터 파일 손상) |
 | TSan(같은 빌드) | 경고 6개. 모두 `table_append`의 `last_id` 읽기·쓰기(storage.c)다. **읽기 단계의 오류는 TSan이 보고하지 않았다.** stdio 함수는 호출 하나마다 내부 잠금이 있어서 메모리 경쟁은 없지만, `fseek`와 `getc`의 묶음은 원자적이지 않다. TSan이 잡는 것은 메모리 접근 경쟁이고, 이런 논리적 경쟁은 잡지 못한다. 그래서 P3-04의 `pread` 전환은 TSan 결과와 별개로 필요하다 |
+
+**P3-04 뒤 다시 관찰(2026-11-17, 같은 조건, 일반 실행 5번 + TSan 1번):** 읽기 단계는 매번 16,000번 모두 정상, 오류 0. 조회가 공유 `FILE*` 대신 위치를 지정해 읽기(`pread`) 때문이다. 쓰기 단계는 그대로 망가진다(첫 16~17건 뒤 중복 id → 중단, 재시작 거부). 그래서 INSERT에는 여전히 배타 잠금이 필요하고, 읽기끼리만 잠금을 나눠 가질 수 있다.
 
 ### P3-02 — 단일 스레드 HTTP 서버
 
@@ -152,6 +154,43 @@ spec 대응:
 - 선형 탐색 요청 여러 개를 동시에 보낸다. 전역 잠금 빌드보다 전체 시간이 줄어드는지 본다(코어 수에 따라 다르다).
 - 선형 탐색이 도는 동안 INSERT를 보내 얼마나 기다리는지 본다(writer 기아 관찰).
 - 동시 정확성 테스트와 TSan이 그대로 통과한다.
+
+**구현 메모 (2026-11-17):**
+- `db.c`: `pthread_mutex` → `pthread_rwlock` 하나. INSERT만 배타 잠금, SELECT·EXPLAIN·`db_state`·`db_stats`는 공유 잠금. 중단 상태로 바꾸는 쓰기는 INSERT 실패 때만 있으므로 항상 배타 잠금 안이다.
+- `storage.c` 조회 3곳(`table_scan`, `table_find_by_id`, `table_find_id_range`)은 공유 `FILE*`를 쓰지 않는다. `read_at`(POSIX `pread`, Windows `ReadFile`+`OVERLAPPED`)으로 위치를 지정해 읽고, 읽기 버퍼는 호출마다 따로 둔다(id 조회는 스택 320바이트, 선형 탐색·범위는 64 KiB를 할당). `FILE*`는 INSERT만 쓴다. Windows CLI도 같은 코드라 동시 정확성 테스트가 Windows에서도 이 경로로 돈다.
+- `file_size`: 시작 시 검증하며 센 바이트 수로 정하고, INSERT가 줄을 끝까지 쓰고 `fflush`한 뒤에만 늘린다(배타 잠금 안). 조회는 시작 시점의 `file_size`까지만 읽는다.
+- **writer 기아 → 쓰기 우선으로 바꿈(설계에 적어 둔 대응).** 첫 측정에서 glibc 기본(읽기 우선) rwlock은 선형 탐색 4개가 계속 들어오는 동안 INSERT가 20초 넘게 응답을 받지 못했다. 공유 잠금이 한 번도 비지 않았기 때문이다. glibc에서는 `PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP`로 잠금을 만든다. 바꾼 뒤 같은 부하에서 INSERT 중앙값 104 ms, 최대 159 ms. 이 속성은 같은 스레드가 읽기 잠금을 겹쳐 잡으면 교착하므로, 엔진은 잠금을 한 번만 잡고 콜백 안에서 `db_*`를 부르지 않는다(지금 코드가 그렇다). glibc가 아닌 곳(Windows의 단위 테스트 등)은 기본 잠금이다.
+- 비교용 빌드 `-DMINIDB_GLOBAL_LOCK`: 읽기도 배타 잠금을 잡는다(P3-03까지와 같은 동작). 측정(`make read-bench`)에만 쓴다.
+
+**P3-04 측정 (`make read-bench`, 2026-11-17, Docker `gcc:13`, CPU 8개, 100만 행, 클라이언트·워커 4개, 3회 중앙값):**
+
+| 항목 | 전역 잠금 (P3-03까지) | 읽기·쓰기 잠금 (P3-04) |
+|---|---|---|
+| 선형 탐색 1개 응답 | 199 ms | 190 ms |
+| 선형 탐색 4개 동시, 전체 시간 | 813 ms (1개의 4.1배) | **313 ms** (1.6배) |
+| INSERT 응답 (부하 없음) | 1.30 ms | 1.06 ms |
+| INSERT 응답 (선형 탐색 4개가 계속 도는 중), 중앙값 / 최대 | 550 ms / 671 ms | **104 ms / 159 ms** |
+| (참고) 읽기 우선 기본값일 때 같은 INSERT | — | 20초 넘게 응답 없음 |
+
+- 전역 잠금에서는 4개가 한 줄로 서서 1개의 약 4배가 걸린다. 공유 잠금에서는 동시에 읽어 1.6배다. 1배가 아닌 것은 디스크·메모리 대역폭과 JSON 만들기를 나눠 쓰기 때문이다. 숫자는 CPU 수와 디스크(페이지 캐시) 상태에 따라 다르다.
+- 쓰기 우선이라 INSERT는 이미 돌고 있는 탐색들이 끝날 때까지만 기다린다(탐색 1개 시간 안쪽). 전역 잠금보다 짧은 것은 그 뒤에 온 탐색이 INSERT를 앞지르지 못하기 때문이다.
+
+**P3-04 검증 기록(2026-11-17)**
+
+| 명령 | 환경 | 결과 |
+|---|---|---|
+| `mingw32-make`, `mingw32-make test` | Windows, TDM-GCC 10.3 | 경고 0, 단위 29,119개 검사 실패 0(쓰기 우선 테스트는 glibc 전용이라 제외), CLI 46개 실패 0 |
+| `make`, `make test` | Docker `gcc:13` | 경고 0, 단위 29,127개·CLI 46개·서버 23개 실패 0. 단위 테스트 5회 연속 통과 |
+| `make sanitize` | Docker `gcc:13`, ASan/UBSan/LSan | 단위·CLI·서버 실패 0, 보고 없음 |
+| `docker run --security-opt seccomp=unconfined ... make tsan` | Docker `gcc:13`, TSan | 단위·서버 실패 0, 보고 없음(읽기가 실제로 동시에 도는 상태). 단위 TSan 2회 더 반복 통과 |
+| 변이 8개 | Docker `gcc:13` | 모두 잡힘: 읽기도 배타 잠금(`MINIDB_GLOBAL_LOCK`), INSERT도 공유 잠금, id 조회 버퍼를 `static`으로 공유(일반·TSan 빌드 둘 다), INSERT 뒤 `file_size` 안 늘림, 선형 탐색이 `file_size` 대신 파일 끝까지 읽음, 쓰기 우선 → 읽기 우선 |
+| `make race-demo` | Docker `gcc:13` | 위 "P3-04 뒤 다시 관찰" |
+
+spec 대응:
+
+| ID | 테스트 |
+|---|---|
+| S4 | 단위 5개 추가: `test_storage_parallel_reads_without_lock`(스레드 8개가 잠금 없이 같은 `Table`을 id·범위·전체 조회, 결과 전부 정확 → 조회 경로에 공유 상태 없음), `test_storage_scan_stops_at_file_size`(파일 끝에 덜 쓰인 줄이 붙어도 조회는 `file_size`까지만), `test_db_readers_run_together`(SELECT 둘이 동시에 잠금 안에 있음), `test_db_writer_waits_for_reader`(SELECT가 잠금 안에 있는 동안 INSERT는 끝나지 않음), `test_db_writer_not_starved`(glibc: 기다리는 INSERT 뒤에 온 SELECT는 INSERT보다 먼저 들어가지 못함). 기존 `test_db_concurrent_correctness`(C1~C4)는 이제 읽기가 실제로 동시에 도는 상태에서 통과. 처리량 비교: `make read-bench`(위 표) |
 
 **파일:** 바뀌는 곳: `src/storage.c`(읽기 경로 `pread`, `file_size`), `src/db.c`(rwlock), 측정 스크립트.
 

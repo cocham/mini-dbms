@@ -2,12 +2,19 @@
  * 단위 테스트: Parser, Storage, Executor를 함수 단위로 검증한다.
  * 사용법: test_unit <임시 디렉터리>
  */
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L /* clock_gettime (잠금 동작 테스트의 기한) */
+#endif
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <pthread.h>
+#ifdef _WIN32
+#include <pthread_time.h> /* winpthreads의 clock_gettime */
+#endif
 
 #include "bptree.h"
 #include "db.h"
@@ -2113,6 +2120,396 @@ static void test_json_budget(void) {
     jb_free(&b);
 }
 
+/* ---------- Phase 3 / P3-04: 읽기 병렬화 ---------- */
+
+#define PR_ROWS 3000
+#define PR_THREADS 8
+#define PR_OPS 300
+
+typedef struct {
+    Table *t;
+    uint32_t seed;
+    int bad;    /* 엉뚱한 행, 빠진 행 */
+    int errors; /* 엔진 오류 */
+    char first_error[256];
+} PrState;
+
+static void pr_name(int64_t id, char *buf, size_t cap) {
+    snprintf(buf, cap, "row%" PRId64, id);
+}
+
+typedef struct {
+    int64_t next;
+    int64_t count;
+    int broken;
+} PrSeq;
+
+static int pr_row(const Row *row, void *ctx) {
+    PrSeq *s = ctx;
+    char want[32];
+
+    pr_name(row->id, want, sizeof want);
+    if (row->id != s->next || strcmp(row->name, want) != 0 || row->age != (int)(row->id % 151)) {
+        s->broken = 1;
+    }
+    s->next = row->id + 1;
+    s->count++;
+    return 0;
+}
+
+static void *pr_worker(void *arg) {
+    PrState *ps = arg;
+    int op;
+
+    for (op = 0; op < PR_OPS; op++) {
+        uint32_t k = ct_rand(&ps->seed) % 100;
+        int64_t a = 1 + (int64_t)(ct_rand(&ps->seed) % PR_ROWS);
+        PrSeq s = {a, 0, 0};
+        DbError err = {{0}, DBE_NONE};
+        int rc, want;
+
+        if (k < 60) {
+            rc = table_find_by_id(ps->t, a, pr_row, &s, &err);
+            want = 1;
+        } else if (k < 95) {
+            int64_t b = a + 40 > PR_ROWS ? PR_ROWS : a + 40;
+            rc = table_find_id_range(ps->t, a, b, pr_row, &s, &err);
+            want = (int)(b - a + 1);
+        } else {
+            s.next = 1;
+            rc = table_scan(ps->t, pr_row, &s, &err);
+            want = PR_ROWS;
+        }
+        if (rc != 0) {
+            if (ps->errors++ == 0) {
+                snprintf(ps->first_error, sizeof ps->first_error, "%s", err.msg);
+            }
+        } else if (s.broken || s.count != want) {
+            ps->bad++;
+        }
+    }
+    return NULL;
+}
+
+/* 조회 경로는 공유 상태를 쓰지 않으므로 잠금 없이 여러 스레드가 같은 Table을 읽어도 결과가 맞다.
+   (P3-01까지는 공유 FILE*의 위치가 섞여 "인덱스와 데이터 파일이 일치하지 않습니다"가 났다: tasks.md S1x)
+   TSan 빌드에서는 조회 경로의 데이터 경쟁도 함께 검사한다. */
+static void test_storage_parallel_reads_without_lock(void) {
+    const char *dir = fresh_dir("p3_parallel_reads");
+    Table *t = NULL;
+    DbError err = {{0}, DBE_NONE};
+    PrState st[PR_THREADS];
+    pthread_t th[PR_THREADS];
+    int64_t i, id;
+    int j;
+
+    CHECK(table_open(dir, &t, &err) == 0);
+    if (t == NULL) {
+        return;
+    }
+    for (i = 1; i <= PR_ROWS; i++) {
+        char name[32];
+        pr_name(i, name, sizeof name);
+        CHECK(table_append(t, name, (int)(i % 151), &id, &err) == 0 && id == i);
+    }
+    for (j = 0; j < PR_THREADS; j++) {
+        memset(&st[j], 0, sizeof st[j]);
+        st[j].t = t;
+        st[j].seed = 0x51ED270Bu * (uint32_t)(j + 1);
+        CHECK(pthread_create(&th[j], NULL, pr_worker, &st[j]) == 0);
+    }
+    for (j = 0; j < PR_THREADS; j++) {
+        pthread_join(th[j], NULL);
+        if (st[j].errors != 0) {
+            fprintf(stderr, "    스레드 %d 첫 오류: %s\n", j, st[j].first_error);
+        }
+        CHECK(st[j].errors == 0);
+        CHECK(st[j].bad == 0);
+    }
+    CHECK(table_close(t, &err) == 0);
+}
+
+/* 조회는 시작 시점의 file_size까지만 읽는다. 그 뒤에 붙은(아직 끝나지 않은) 바이트는 보지 않는다.
+   서버에서는 INSERT가 배타 잠금 안에서 줄을 다 쓴 뒤에야 file_size를 늘리므로, 이 장치는 잠금과 별도로
+   "반쯤 쓰인 줄은 조회에 보이지 않는다"(C2)를 코드에 드러낸다. 여기서는 파일 끝에 직접 덧붙여 확인한다. */
+static void test_storage_scan_stops_at_file_size(void) {
+    const char *dir = fresh_dir("p3_file_size");
+    char file[600];
+    Table *t = NULL;
+    DbError err = {{0}, DBE_NONE};
+    Collected c;
+    int64_t id;
+    FILE *fp;
+
+    CHECK(table_open(dir, &t, &err) == 0);
+    if (t == NULL) {
+        return;
+    }
+    CHECK(table_append(t, "a", 1, &id, &err) == 0 && table_append(t, "b", 2, &id, &err) == 0);
+    snprintf(file, sizeof file, "%s/users.tsv", dir);
+    fp = fopen(file, "ab");
+    CHECK(fp != NULL);
+    if (fp != NULL) {
+        fputs("3\tpartial", fp); /* 개행이 없는 줄 앞부분: 끝까지 읽으면 "손상"이다 */
+        fclose(fp);
+    }
+    c.count = 0;
+    c.stop_after = 0;
+    CHECK(table_scan(t, collect_row, &c, &err) == 0);
+    CHECK(c.count == 2 && c.ids[1] == 2);
+    c.count = 0;
+    CHECK(table_find_id_range(t, 1, 9, collect_row, &c, &err) == 0 && c.count == 2);
+    CHECK(table_close(t, &err) == 0);
+    /* 다시 열면 실제 파일 끝까지 검증하므로 손상으로 거부된다(시작 시 검증은 그대로) */
+    CHECK(table_open(dir, &t, &err) == -1 && strstr(err.msg, "개행") != NULL);
+}
+
+/* 잠금 동작을 직접 확인하는 도우미: 콜백 안(=엔진 잠금 안)에서 서로를 기다린다. 기다림에는 기한이 있어서
+   잠금이 기대와 다르면 멈추지 않고 실패한다. */
+typedef struct {
+    Db *db;
+    pthread_mutex_t m;
+    pthread_cond_t c;
+    int inside;       /* 지금 콜백 안에 있는 읽기 수 */
+    int met;          /* 한 번이라도 둘이 동시에 콜백 안에 있었다 */
+    int saw_both;     /* 콜백 안에서 다른 읽기도 들어온 것을 본 읽기 수 */
+    int insert_done;  /* INSERT의 db_exec가 끝났다 */
+    int insert_early; /* 읽기가 잠금 안에 있는 동안 INSERT가 끝났다(배타 잠금 위반) */
+    int mode;         /* 0: 둘이 만나기, 1: 안에서 잠깐 버티기 */
+} LockProbe;
+
+static void deadline_ms(struct timespec *ts, long ms) {
+    clock_gettime(CLOCK_REALTIME, ts);
+    ts->tv_sec += ms / 1000;
+    ts->tv_nsec += (ms % 1000) * 1000000L;
+    if (ts->tv_nsec >= 1000000000L) {
+        ts->tv_sec++;
+        ts->tv_nsec -= 1000000000L;
+    }
+}
+
+static int probe_row(const Row *row, void *ctx) {
+    LockProbe *p = ctx;
+    struct timespec ts;
+
+    (void)row;
+    pthread_mutex_lock(&p->m);
+    p->inside++;
+    if (p->inside >= 2) {
+        p->met = 1; /* 먼저 나간 쪽이 inside를 줄여도 만났다는 사실은 남는다 */
+    }
+    pthread_cond_broadcast(&p->c);
+    if (p->mode == 0) {
+        deadline_ms(&ts, 3000);
+        while (!p->met && pthread_cond_timedwait(&p->c, &p->m, &ts) == 0) {
+        }
+        if (p->met) {
+            p->saw_both++;
+        }
+    } else {
+        deadline_ms(&ts, 300); /* 300 ms 버티는 동안 INSERT가 끝나면 안 된다 */
+        while (pthread_cond_timedwait(&p->c, &p->m, &ts) == 0) {
+        }
+        if (p->insert_done) {
+            p->insert_early = 1;
+        }
+    }
+    p->inside--;
+    pthread_mutex_unlock(&p->m);
+    return 0;
+}
+
+static void *probe_reader(void *arg) {
+    LockProbe *p = arg;
+    Statement st = {STMT_SELECT, NULL, 0, WHERE_ID, 1, 0, CMP_EQ, 0};
+    ResultSink rs = {NULL, probe_row, p, NULL};
+    DbError err = {{0}, DBE_NONE};
+    db_exec(p->db, &st, &rs, NULL, &err);
+    return NULL;
+}
+
+static void *probe_writer(void *arg) {
+    LockProbe *p = arg;
+    DbError err = {{0}, DBE_NONE};
+    int64_t id = 0;
+
+    db_insert(p->db, "w", 1, &id, NULL, &err);
+    pthread_mutex_lock(&p->m);
+    p->insert_done = 1;
+    pthread_cond_broadcast(&p->c);
+    pthread_mutex_unlock(&p->m);
+    return NULL;
+}
+
+/* SELECT 두 개는 동시에 잠금 안에 들어간다(공유 잠금). 전역 잠금이면 둘째가 들어오지 못해 3초 뒤 실패한다. */
+static void test_db_readers_run_together(void) {
+    const char *dir = fresh_dir("p3_readers_together");
+    LockProbe p;
+    pthread_t a, b;
+    DbError err = {{0}, DBE_NONE};
+    int64_t id;
+
+    memset(&p, 0, sizeof p);
+    CHECK(db_open(dir, &p.db, &err) == 0);
+    CHECK(db_insert(p.db, "r", 1, &id, NULL, &err) == 0);
+    pthread_mutex_init(&p.m, NULL);
+    pthread_cond_init(&p.c, NULL);
+    p.mode = 0;
+    CHECK(pthread_create(&a, NULL, probe_reader, &p) == 0);
+    CHECK(pthread_create(&b, NULL, probe_reader, &p) == 0);
+    pthread_join(a, NULL);
+    pthread_join(b, NULL);
+    CHECK(p.saw_both == 2);
+    pthread_cond_destroy(&p.c);
+    pthread_mutex_destroy(&p.m);
+    CHECK(db_close(p.db, &err) == 0);
+}
+
+/* SELECT가 잠금 안에 있는 동안 INSERT는 끝나지 않는다(배타 잠금). 읽기가 나간 뒤에는 끝난다. */
+static void test_db_writer_waits_for_reader(void) {
+    const char *dir = fresh_dir("p3_writer_waits");
+    LockProbe p;
+    pthread_t r, w;
+    DbError err = {{0}, DBE_NONE};
+    struct timespec ts;
+    int64_t id;
+
+    memset(&p, 0, sizeof p);
+    CHECK(db_open(dir, &p.db, &err) == 0);
+    CHECK(db_insert(p.db, "r", 1, &id, NULL, &err) == 0);
+    pthread_mutex_init(&p.m, NULL);
+    pthread_cond_init(&p.c, NULL);
+    p.mode = 1;
+    CHECK(pthread_create(&r, NULL, probe_reader, &p) == 0);
+    pthread_mutex_lock(&p.m); /* 읽기가 콜백 안(잠금 안)에 들어올 때까지 기다린 뒤 INSERT를 시작한다 */
+    deadline_ms(&ts, 3000);
+    while (p.inside == 0 && pthread_cond_timedwait(&p.c, &p.m, &ts) == 0) {
+    }
+    pthread_mutex_unlock(&p.m);
+    CHECK(pthread_create(&w, NULL, probe_writer, &p) == 0);
+    pthread_join(r, NULL);
+    pthread_join(w, NULL);
+    CHECK(p.insert_early == 0);
+    CHECK(p.insert_done == 1);
+    CHECK(db_count(p.db, WHERE_NONE, 0, &err) == 2);
+    pthread_cond_destroy(&p.c);
+    pthread_mutex_destroy(&p.m);
+    CHECK(db_close(p.db, &err) == 0);
+}
+
+#ifdef __GLIBC__
+/* 쓰기 우선(glibc): 읽기 R1이 잠금을 잡은 동안 INSERT W가 기다리기 시작하면, 그 뒤에 온 읽기 R2는 W보다
+   먼저 들어가지 못한다. 읽기 우선(기본값)이면 R2가 바로 들어가고, 선형 탐색이 겹쳐 계속 들어오면
+   INSERT가 끝없이 기다린다(P3-04 측정에서 20초 넘게 응답 없음). */
+typedef struct {
+    Db *db;
+    pthread_mutex_t m;
+    pthread_cond_t c;
+    int r1_inside, release, seq, w_seq, r2_seq;
+} WriterFirst;
+
+static void wait_ms(WriterFirst *p, long ms) { /* p->m을 잡은 채로 부른다 */
+    struct timespec ts;
+    deadline_ms(&ts, ms);
+    while (pthread_cond_timedwait(&p->c, &p->m, &ts) == 0) {
+    }
+}
+
+static int wf_r1_row(const Row *row, void *ctx) {
+    WriterFirst *p = ctx;
+    struct timespec ts;
+    (void)row;
+    pthread_mutex_lock(&p->m);
+    p->r1_inside = 1;
+    pthread_cond_broadcast(&p->c);
+    deadline_ms(&ts, 5000);
+    while (!p->release && pthread_cond_timedwait(&p->c, &p->m, &ts) == 0) {
+    }
+    pthread_mutex_unlock(&p->m);
+    return 0;
+}
+
+static int wf_r2_row(const Row *row, void *ctx) {
+    WriterFirst *p = ctx;
+    (void)row;
+    pthread_mutex_lock(&p->m);
+    p->r2_seq = ++p->seq;
+    pthread_mutex_unlock(&p->m);
+    return 0;
+}
+
+static void *wf_reader(void *arg, RowFn fn) {
+    WriterFirst *p = arg;
+    Statement st = {STMT_SELECT, NULL, 0, WHERE_ID, 1, 0, CMP_EQ, 0};
+    ResultSink rs = {NULL, fn, p, NULL};
+    DbError err = {{0}, DBE_NONE};
+    db_exec(p->db, &st, &rs, NULL, &err);
+    return NULL;
+}
+
+static void *wf_r1(void *arg) { return wf_reader(arg, wf_r1_row); }
+static void *wf_r2(void *arg) { return wf_reader(arg, wf_r2_row); }
+
+static int wf_on_insert(int64_t id, void *ctx) { /* 엔진 잠금 안에서 불린다: 순서를 잠금 안에서 기록 */
+    WriterFirst *p = ctx;
+    (void)id;
+    pthread_mutex_lock(&p->m);
+    p->w_seq = ++p->seq;
+    pthread_mutex_unlock(&p->m);
+    return 0;
+}
+
+static void *wf_w(void *arg) {
+    WriterFirst *p = arg;
+    Statement st = {STMT_INSERT, "w", 1, WHERE_NONE, 0, 0, CMP_EQ, 0};
+    ResultSink rs = {wf_on_insert, NULL, p, NULL};
+    DbError err = {{0}, DBE_NONE};
+    db_exec(p->db, &st, &rs, NULL, &err);
+    return NULL;
+}
+
+static void test_db_writer_not_starved(void) {
+    const char *dir = fresh_dir("p3_writer_first");
+    WriterFirst p;
+    pthread_t r1, r2, w;
+    DbError err = {{0}, DBE_NONE};
+    int64_t id;
+    int r2_early;
+    struct timespec ts;
+
+    memset(&p, 0, sizeof p);
+    CHECK(db_open(dir, &p.db, &err) == 0);
+    CHECK(db_insert(p.db, "r", 1, &id, NULL, &err) == 0);
+    pthread_mutex_init(&p.m, NULL);
+    pthread_cond_init(&p.c, NULL);
+    CHECK(pthread_create(&r1, NULL, wf_r1, &p) == 0);
+    pthread_mutex_lock(&p.m);
+    deadline_ms(&ts, 3000);
+    while (!p.r1_inside && pthread_cond_timedwait(&p.c, &p.m, &ts) == 0) {
+    }
+    pthread_mutex_unlock(&p.m);
+    CHECK(pthread_create(&w, NULL, wf_w, &p) == 0); /* 배타 잠금을 기다리기 시작한다 */
+    pthread_mutex_lock(&p.m);
+    wait_ms(&p, 200);
+    pthread_mutex_unlock(&p.m);
+    CHECK(pthread_create(&r2, NULL, wf_r2, &p) == 0);
+    pthread_mutex_lock(&p.m);
+    wait_ms(&p, 200);
+    r2_early = p.r2_seq != 0; /* R1이 아직 잠금 안인데 R2가 들어왔다 = 읽기 우선 */
+    p.release = 1;
+    pthread_cond_broadcast(&p.c);
+    pthread_mutex_unlock(&p.m);
+    pthread_join(r1, NULL);
+    pthread_join(w, NULL);
+    pthread_join(r2, NULL);
+    CHECK(!r2_early);
+    CHECK(p.w_seq > 0 && p.r2_seq > p.w_seq); /* INSERT가 먼저, 그 뒤에 R2 */
+    pthread_cond_destroy(&p.c);
+    pthread_mutex_destroy(&p.m);
+    CHECK(db_close(p.db, &err) == 0);
+}
+#endif
+
 /* ---------- 작업 큐 (P3-03) ---------- */
 
 static void test_workqueue_basic(void) {
@@ -2306,6 +2703,14 @@ int main(int argc, char **argv) {
 
     test_json_escape_and_utf8();
     test_json_budget();
+
+    test_storage_parallel_reads_without_lock();
+    test_storage_scan_stops_at_file_size();
+    test_db_readers_run_together();
+    test_db_writer_waits_for_reader();
+#ifdef __GLIBC__
+    test_db_writer_not_starved();
+#endif
 
     test_workqueue_basic();
     test_workqueue_threads();

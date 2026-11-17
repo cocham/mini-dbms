@@ -37,7 +37,7 @@ DEMO_BIN = build/bpt_demo$(EXE)
 SERVER_BIN = build/minidb-server
 SERVER_TEST_BIN = build/minidb-server-test
 
-.PHONY: all test unit cli server sanitize tsan race-demo bench clean
+.PHONY: all test unit cli server sanitize tsan race-demo read-bench bench clean
 
 ifeq ($(OS),Windows_NT)
 all: $(BIN) $(DEMO_BIN)
@@ -122,6 +122,16 @@ race-demo:
 	@printf 'TSan 경고 수: '; grep -c "WARNING: ThreadSanitizer" build/race/tsan.txt || true
 	@grep -E -m8 "WARNING: ThreadSanitizer|^    #0 " build/race/tsan.txt || true
 	@echo '(전체 보고: build/race/tsan.txt)'
+
+# Linux 전용 측정(판정 없음, test에 넣지 않음, P3-04): 같은 데이터로 전역 잠금 빌드와 읽기·쓰기 잠금 빌드를
+#   비교한다. 선형 탐색을 동시에 보냈을 때 전체 시간, 탐색이 도는 동안 INSERT 응답 시간(writer 기아).
+#   make read-bench READ_ROWS=200000 READ_CLIENTS=8 처럼 바꿔 볼 수 있다. 결과는 CPU 수에 따라 다르다.
+READ_ROWS ?= 1000000
+READ_CLIENTS ?= 4
+read-bench: $(SERVER_BIN)
+	$(CC) $(CFLAGS) $(THREAD_FLAGS) -DMINIDB_GLOBAL_LOCK -o build/minidb-server-global $(SRC) $(SERVER_SRC)
+	$(PYTHON) tools/read_parallel.py --rw $(SERVER_BIN) --global build/minidb-server-global \
+		--rows $(READ_ROWS) --clients $(READ_CLIENTS) --threads $(READ_CLIENTS)
 
 # 100만 건 생성·삽입 후 인덱스 조회 vs 선형 탐색 측정 (P2-04). 느리므로 test에 넣지 않는다.
 #   make bench BENCH_ROWS=100000 처럼 건수를 줄여 볼 수 있다. 결과는 docs/phase2/benchmark.md로 옮긴다.
