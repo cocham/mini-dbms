@@ -37,7 +37,7 @@ DEMO_BIN = build/bpt_demo$(EXE)
 SERVER_BIN = build/minidb-server
 SERVER_TEST_BIN = build/minidb-server-test
 
-.PHONY: all test unit cli server sanitize tsan race-demo read-bench bench clean
+.PHONY: all test unit cli server sanitize tsan race-demo read-bench load-bench bench clean
 
 ifeq ($(OS),Windows_NT)
 all: $(BIN) $(DEMO_BIN)
@@ -132,6 +132,18 @@ read-bench: $(SERVER_BIN)
 	$(CC) $(CFLAGS) $(THREAD_FLAGS) -DMINIDB_GLOBAL_LOCK -o build/minidb-server-global $(SRC) $(SERVER_SRC)
 	$(PYTHON) tools/read_parallel.py --rw $(SERVER_BIN) --global build/minidb-server-global \
 		--rows $(READ_ROWS) --clients $(READ_CLIENTS) --threads $(READ_CLIENTS)
+
+# Linux 전용 부하 측정(판정 없음, test에 넣지 않음, P3-05): 워커 수, 요청 종류 × 잠금 방식, 큐 크기별
+#   처리량과 응답 시간 분포. 결과는 build/load_result.md에도 쓴다. docs/phase3/benchmark.md로 옮긴다.
+#   측정 사이에 TIME_WAIT 연결이 빠질 때까지 기다리므로 몇 분 걸린다(tools/load.py 설명).
+#   make load-bench LOAD_ROWS=200000 처럼 줄여 볼 수 있다.
+LOAD_ROWS ?= 1000000
+LOAD_SECONDS ?= 2
+load-bench: $(SERVER_BIN) $(BIN)
+	$(CC) $(CFLAGS) $(THREAD_FLAGS) -DMINIDB_GLOBAL_LOCK -o build/minidb-server-global $(SRC) $(SERVER_SRC)
+	$(CC) $(CFLAGS) $(THREAD_FLAGS) -o build/loadgen tools/loadgen.c
+	$(PYTHON) tools/load.py --server $(SERVER_BIN) --global build/minidb-server-global --cli $(BIN) \
+		--loadgen build/loadgen --rows $(LOAD_ROWS) --seconds $(LOAD_SECONDS)
 
 # 100만 건 생성·삽입 후 인덱스 조회 vs 선형 탐색 측정 (P2-04). 느리므로 test에 넣지 않는다.
 #   make bench BENCH_ROWS=100000 처럼 건수를 줄여 볼 수 있다. 결과는 docs/phase2/benchmark.md로 옮긴다.

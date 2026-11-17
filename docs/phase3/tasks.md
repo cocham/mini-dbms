@@ -2,7 +2,7 @@
 
 ## 현재 상태
 
-**P3-04 완료(2026-11-17).** SELECT끼리는 공유 잠금으로 동시에 실행되고, INSERT는 배타 잠금이다(glibc에서 쓰기 우선). 조회는 공유 `FILE*` 대신 위치를 지정해 읽는다. 실습은 [walkthrough.md](walkthrough.md) 7장. P3-03은 사용자 검증 PASS(2026-11-17, `6063d77`). 다음 단위(P3-05)는 사용자 검증(PASS)을 받은 뒤 진행한다.
+**P3-05 완료(2026-11-17) — Phase 3의 모든 단위 구현 완료.** 부하 측정 결과는 [benchmark.md](benchmark.md), 실습은 [walkthrough.md](walkthrough.md) 8장. P3-04는 사용자 검증 PASS(2026-11-17, `c8ad6d3`). P3-05는 사용자 검증(PASS)을 기다린다.
 
 진행 방식: 한 단위를 구현한다 → 테스트와 ASan·TSan 검사로 검증한다 → 통과하면 커밋한다 → **사용자가 검증 결과(PASS)를 전하면** 다음 단위로 간다(2026-11-16 사용자 지시, P3-01부터). 사용자 동작이나 공개 인터페이스를 바꾸는 결정은 구현 전에 짧게 제안한다.
 
@@ -13,7 +13,7 @@
 | P3-02 | 단일 스레드 HTTP 서버 | S2, 실행 예시와 요청 경로 지도 | 완료 |
 | P3-03 | 스레드 풀과 작업 큐 | S3 | 완료 |
 | P3-04 | 읽기 병렬화 | S4 | 완료 |
-| P3-05 | 부하 측정과 마무리 | S5 | 대기 |
+| P3-05 | 부하 측정과 마무리 | S5 | 완료 |
 
 ## 학습과의 분리
 
@@ -201,6 +201,41 @@ spec 대응:
 **확인 시나리오:** `docs/phase3/benchmark.md` 표에서 워커 수, 잠금 방식, 요청 종류별 차이를 읽는다. Phase 2의 "실행 한 번 기준 2배 미만" 결과와 서버 구조의 차이를 비교한다.
 
 **파일:** 새 `tools/load.py`, `docs/phase3/benchmark.md`. 바뀌는 곳: README, docs/phase3/*.
+
+**구현 메모 (2026-11-17):**
+- 부하 생성기를 C로 따로 만들었다(`tools/loadgen.c`, 클라이언트마다 스레드 하나, 닫힌 고리). 처음에는 `load.py`가 파이썬 프로세스로 요청을 보냈는데, 클라이언트가 요청마다 쓰는 CPU가 커서 워커를 늘려도 처리량이 그대로였다(서버가 아니라 클라이언트를 잰 셈). `load.py`는 서버 띄우기·설정 바꾸기·표 만들기만 한다. `make load-bench`.
+- 측정 중 발견한 환경 병목 두 가지와 대응(benchmark.md 5):
+  - 데이터·서버 로그를 Windows 공유 폴더에 두면 요청마다 로그 쓰기(약 1 ms, 한 번에 하나)에서 모든 워커가 줄을 서서 처리량이 약 1,000건/초에서 멈췄다. 측정 도구(`load.py`, `read_parallel.py`)는 이제 컨테이너 안 임시 폴더를 쓴다. 그래서 P3-04 때 잰 `read-bench` 값도 다시 쟀다(813 → 313 ms였던 것이 임시 폴더에서 493 → 100 ms). walkthrough 7장 표를 새 값으로 바꿨다.
+  - 서버가 먼저 닫아 TIME_WAIT 연결이 서버 쪽에 60초씩 쌓이고, 상한(32,768)에 닿으면 처리량이 절반 가까이 떨어졌다. 부하 생성기는 응답을 끝까지 받은 뒤 RST(`SO_LINGER` 0)로 닫아 쌓이지 않게 한다. 실제 클라이언트와 다른 점은 benchmark.md에 적었다.
+- 설정마다 2초씩 3회 재고 처리량이 가운데인 회차를 쓴다(한 번만 재면 같은 설정이 2배 넘게 흔들렸다).
+- 서버 코드는 바꾸지 않았다. 밀린 문서 수정 2개: walkthrough 6장 실습 2에 UTF-8 출력 설정 줄과 "시작 줄에서 `워커 1개, 큐 1` 확인" 안내.
+
+**P3-05 결과 요약 (benchmark.md, Docker `gcc:13`, CPU 8개, 100만 행):**
+
+| 질문 | 값 |
+|---|---|
+| id 하나 조회: CLI 한 번 실행 vs 떠 있는 서버 | 189 ms vs 0.23 ms (Phase 2의 "실행 한 번 기준 2배 미만"은 시작 비용 때문이었고, 서버는 그 비용을 한 번만 낸다) |
+| id 조회 처리량: 워커 1 / 2 / 4 / 8개 (클라이언트 16개) | 5,966 / 11,956 / 20,311 / 22,733건/초 |
+| 선형 탐색(클라이언트 4개): 전역 잠금 vs 읽기·쓰기 잠금 | 15 vs 46건/초, p99 2,284 vs 106 ms |
+| id 조회(클라이언트 8개): 전역 잠금 vs 읽기·쓰기 잠금 | 17,070 vs 21,286건/초 (잠금 안 시간이 짧아 차이가 작다) |
+| 몰릴 때 503: 워커 1개·클라이언트 16개, 큐 1칸 vs 64칸 | 2초 동안 33,371번 vs 0번 (대신 p50 0.80 → 2.12 ms) |
+
+**P3-05 검증 기록(2026-11-17)**
+
+| 명령 | 환경 | 결과 |
+|---|---|---|
+| `mingw32-make`, `mingw32-make test` | Windows, TDM-GCC 10.3 | 경고 0, 단위 29,119개 검사 실패 0, CLI 46개 실패 0 |
+| `make clean && make test` | Docker `gcc:13` | 경고 0, 단위 29,127개·CLI 46개·서버 23개 실패 0 |
+| `make sanitize` | Docker `gcc:13`, ASan/UBSan/LSan | 단위·CLI·서버 실패 0, 보고 없음 |
+| `docker run --security-opt seccomp=unconfined ... make tsan` | Docker `gcc:13`, TSan | 단위·서버 실패 0, 보고 없음 |
+| `make bench BENCH_ROWS=100000` | Docker `gcc:13` | Phase 2 측정 도구 정상 동작(INDEX LOOKUP·RANGE SCAN·FULL SCAN 표 출력) |
+| `make load-bench`, `make read-bench` (`READ_CLIENTS=4`, `16`) | Docker `gcc:13` | benchmark.md와 walkthrough 7·8장의 표 |
+
+spec 대응:
+
+| ID | 확인 |
+|---|---|
+| S5 | 부하 측정: benchmark.md 1~6. Phase 1·2 회귀: CLI 테스트 46개가 A1~A8(`a1_`~`a7_` 테스트와 sanitize)과 B3~B7(`p2_` 테스트)을, 단위 테스트가 B1·B2(B+ 트리)를 덮고 Windows·Linux·sanitize에서 모두 통과(B8). ASan·TSan 통과. 문서: README, benchmark.md, walkthrough 8장 |
 
 ## 공통 규칙 (Phase 1·2에서 이어짐)
 

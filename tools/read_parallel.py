@@ -2,7 +2,7 @@
 """읽기 병렬화 측정 (Phase 3 / P3-04). Linux(Docker) 전용.
 
 사용법: python3 tools/read_parallel.py --rw build/minidb-server --global build/minidb-server-global
-                                       [--rows 1000000] [--clients 4] [--threads 4] [--workdir build/readpar]
+                                       [--rows 1000000] [--clients 4] [--threads 4] [--workdir /tmp/minidb_readpar]
 
 같은 데이터로 두 서버를 차례로 띄워 비교한다.
   rw      정상 빌드: SELECT끼리 공유 잠금(동시에 실행)
@@ -24,6 +24,7 @@ import shutil
 import socket
 import statistics
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -182,7 +183,7 @@ def main():
     ap.add_argument("--clients", type=int, default=4)
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--repeat", type=int, default=3)
-    ap.add_argument("--workdir", default="build/readpar")
+    ap.add_argument("--workdir", default=os.path.join(tempfile.gettempdir(), "minidb_readpar"))
     a = ap.parse_args()
 
     base = os.path.join(a.workdir, "base")
