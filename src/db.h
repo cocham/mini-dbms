@@ -22,7 +22,8 @@ typedef struct Db Db; /* 불투명 타입. Table + 잠금 + 상태 */
 typedef enum {
     DB_OK = 0,
     DB_HALTED_INDEX, /* 파일 기록 완료 뒤 인덱스 등록 실패. 파일은 온전, 재시작하면 인덱스를 다시 만든다 */
-    DB_HALTED_WRITE  /* 쓰기 도중 실패. 파일 끝이 깨졌을 수 있어 재시작이 거부될 수 있다 */
+    DB_HALTED_WRITE, /* 쓰기 도중 실패. 파일 끝이 깨졌을 수 있어 재시작이 거부될 수 있다 */
+    DB_HALTED_REOPEN /* Windows 전용: UPDATE·DELETE의 바꿔치기 뒤 다시 열기 실패. 파일은 온전, 재시작하면 복원 */
 } DbState;
 
 /* data_dir/users.tsv를 연다(table_open). 0 성공, -1 실패. */
@@ -34,6 +35,8 @@ int db_open(const char *data_dir, Db **out, DbError *err);
  * - 중단 상태면 실행하지 않고 -1, err->kind = DBE_HALTED.
  * - INSERT가 DBE_INDEX_FAILED로 실패하면 엔진을 DB_HALTED_INDEX로 바꾸고, stored_id에 기록된 id를 담는다.
  * - INSERT가 DBE_WRITE_FAILED로 실패하면 엔진을 DB_HALTED_WRITE로 바꾼다. 기록 여부를 모르므로 stored_id는 0.
+ * - UPDATE·DELETE가 DBE_REOPEN_FAILED(Windows 전용)로 실패하면 DB_HALTED_REOPEN으로 바꾼다.
+ *   그 밖의 UPDATE·DELETE 실패는 파일·인덱스가 그대로라 상태를 바꾸지 않는다.
  * stored_id는 NULL이어도 된다. 그 밖의 경우 0.
  */
 int db_exec(Db *db, const Statement *st, const ResultSink *sink, int64_t *stored_id, DbError *err);

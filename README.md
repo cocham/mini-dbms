@@ -1,6 +1,21 @@
 # 미니 DBMS
 
-C로 SQL 파일을 실행하고 데이터를 파일에 저장하는 CLI(Phase 1)에, id B+ 트리 인덱스(Phase 2)를 붙였다.
+C로 SQL 파일을 실행하고 데이터를 파일에 저장하는 CLI(Phase 1)에, id B+ 트리 인덱스(Phase 2), API 서버(Phase 3), UPDATE·DELETE(Phase 4)를 붙였다.
+
+## Phase 4 — UPDATE·DELETE (구현 완료, 검증 대기)
+
+현재 상태: **P4-01~P4-04 구현.** CLI와 서버 모두에서 `UPDATE users SET name/age = .. WHERE ..;`, `DELETE FROM users WHERE ..;`를 쓸 수 있다. 결과는 조건에 맞은 행 수(`UPDATE 2`, `{"type":"update","count":2}`)다. 바뀐 내용 전체를 임시 파일에 쓰고 바꿔치기(rename)하므로 문장 하나는 전부 반영되거나 하나도 반영되지 않는다. 가장 큰 id를 지워도 그 id는 다시 쓰지 않는다(`users.next`). WHERE 없는 UPDATE·DELETE는 거부한다. 100만 행 측정은 하지 않았다(사용자 결정).
+
+1. [실습](docs/phase4/walkthrough.md): CLI로 고치고 지우기 → 파일이 어떻게 바뀌나 → 다음 id → 실패 시 무변경 → 서버 JSON. **여기서 시작**
+2. [개발 명세](docs/phase4/spec.md): 문법, 결과, 다음 id, 실패와 재시도
+3. [설계와 결정](docs/phase4/design.md): D01~D08, 다시 쓰기 순서, Windows 예외
+4. [작업 순서](docs/phase4/tasks.md): P4-01~P4-04, 검증 기록
+
+```powershell
+mingw32-make
+build\minidb.exe --data-dir data\p4 examples\phase4_seed.sql
+build\minidb.exe --data-dir data\p4 examples\phase4_change.sql
+```
 
 ## Phase 3 — API 서버 (구현 완료)
 
@@ -20,7 +35,10 @@ docker run --rm -it -p 127.0.0.1:8080:8080 -v "$PWD:/src" -w /src gcc:13 bash -c
 curl.exe -s http://localhost:8080/query --data-binary "SELECT * FROM users WHERE id = 1;"
 
 make test                      # Windows: 단위(동시 정확성 포함)·CLI / Linux: 여기에 서버 테스트까지
-docker run --rm --security-opt seccomp=unconfined -v "$PWD:/src" -w /src gcc:13 make tsan       # 데이터 경쟁 검사
+# Docker 검사는 저장소를 컨테이너 안에 복사해서 돌린다. Windows 공유 폴더에서는 Phase 4의 바꿔치기(rename)
+# 뒤 파일이 다른 프로세스에 잠깐 보이지 않아 단위 테스트가 실패한다 (docs/phase4/tasks.md 환경 관찰)
+docker run --rm -v "$PWD:/src:ro" gcc:13 bash -c "cp -r /src /w && cd /w && make clean && make test"
+docker run --rm --security-opt seccomp=unconfined -v "$PWD:/src:ro" gcc:13 bash -c "cp -r /src /w && cd /w && make clean && make tsan"  # 데이터 경쟁 검사
 docker run --rm --security-opt seccomp=unconfined -v "$PWD:/src" -w /src gcc:13 make race-demo  # 잠금 없는 엔진 관찰 실험
 docker run --rm -v "$PWD:/src" -w /src gcc:13 make read-bench   # 전역 잠금 vs 읽기·쓰기 잠금 측정 (약 1분)
 docker run --rm -v "$PWD:/src" -w /src gcc:13 make load-bench   # 부하 측정 전체 (약 2분, build/load_result.md)
@@ -90,7 +108,7 @@ docker run --rm -v "%cd%:/src" -w /src gcc:13 make sanitize
 | src/main.c | CLI: 인자·SQL 파일 읽기, 문장 순차 실행, 결과·오류 출력, 종료 코드 |
 | src/parser.c | Lexer + 재귀 하강 파서: SQL 텍스트 → Statement |
 | src/executor.c | 값 검증 후 Storage에 저장·조회 요청. WHERE는 조회 콜백 앞의 필터로 검사, 결과는 콜백으로 전달 |
-| src/storage.c | users.tsv 열기·검증·순차 읽기·추가, 다음 ID 복원. Phase 2: id 인덱스 구축·등록·`table_find_by_id` |
+| src/storage.c | users.tsv 열기·검증·순차 읽기·추가, 다음 ID 복원. Phase 2: id 인덱스 구축·등록·`table_find_by_id`. Phase 4: `table_rewrite`(임시 파일 + 바꿔치기), `users.next` |
 | src/bptree.c | (Phase 2) 메모리 B+ 트리: id → 레코드 바이트 위치 |
 | tools/bpt_demo.c | (Phase 2) 트리 모양·탐색 경로를 보는 학습 도구 |
 | tests/test_unit.c | Parser·Storage·Executor 단위 테스트 |

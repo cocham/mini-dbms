@@ -8,6 +8,7 @@
 """
 import json
 import os
+import random
 import re
 import shlex
 import shutil
@@ -413,6 +414,83 @@ def usage_and_start_errors():
     eq(code, 1, "시작 실패: " + err)
 
 
+# ---------- UPDATE·DELETE (Phase 4) ----------
+
+@test
+def update_delete_syntax_errors_execute_nothing():
+    with Server(fresh("p4_syntax")) as s:
+        # WHERE 없는 DELETE는 구문 오류 → 같은 요청의 앞 INSERT도 실행되지 않는다(전체 선파싱)
+        st, r = query(s.port, ins("a", 1) + "DELETE FROM users;")
+        eq((st, r["error"]["statement"], r["error"]["code"], r["results"]), (400, 2, "SQL_SYNTAX", []))
+        ok("WHERE 조건이 필요" in r["error"]["message"], r["error"]["message"])
+        st, r = query(s.port, ins("a", 1) + "UPDATE users SET id = 3 WHERE id = 1;")
+        eq((st, r["error"]["statement"], r["error"]["code"]), (400, 2, "SQL_SYNTAX"))
+        st, r = query(s.port, "SELECT * FROM users;")
+        eq(r["results"][0]["rows"], [], "아무것도 저장되지 않음")
+
+
+@test
+def update_delete_json_results():
+    # D5: {"type":"update","count":n}을 받고 이어서 SELECT로 바뀐 결과를 본다
+    d = fresh("p4_json")
+    with Server(d) as s:
+        query(s.port, ins("a", 10) + ins("b", 20) + ins("c", 20) + ins("d", 30))
+        st, r = query(s.port, "UPDATE users SET age = 21 WHERE age = 20;"
+                              "UPDATE users SET name = 'O''Brien' WHERE id = 1;"
+                              "DELETE FROM users WHERE id = 4;"
+                              "DELETE FROM users WHERE id = 99;"
+                              "SELECT * FROM users;")
+        eq(st, 200)
+        eq(r["results"][:4], [{"type": "update", "count": 2}, {"type": "update", "count": 1},
+                              {"type": "delete", "count": 1}, {"type": "delete", "count": 0}])
+        eq(r["results"][4]["rows"], [[1, "O'Brien", 10], [2, "b", 21], [3, "c", 21]])
+        st, h, b = request(s.port, "GET", "/health")
+        eq(json.loads(b)["rows"], 3)
+        # 가장 큰 id(4)를 지웠으므로 다음 INSERT는 5
+        st, r = query(s.port, ins("e", 1))
+        eq(r["results"], [{"type": "insert", "id": 5}])
+        # 실행 오류: 앞 UPDATE는 반영되고 응답에 남는다. 값 오류인 UPDATE는 아무것도 바꾸지 않는다
+        st, r = query(s.port, "UPDATE users SET age = 1 WHERE id = 2; UPDATE users SET age = 151 WHERE id = 3;")
+        eq((st, r["error"]["statement"], r["error"]["code"]), (400, 2, "SQL_ERROR"))
+        eq(r["results"], [{"type": "update", "count": 1}])
+    eq(cli_rows(d), ["1\tO'Brien\t10", "2\tb\t1", "3\tc\t21", "5\te\t1"], "재시작(CLI)해도 같음")
+
+
+@test
+def retried_delete_can_hit_rows_added_in_between():
+    # spec "실패와 재시도": 같은 DELETE를 다시 보내는 것은 안전하지 않다. 사이에 들어온 행도 지우고 행 수도 달라진다
+    with Server(fresh("p4_retry")) as s:
+        query(s.port, ins("lee", 30) + ins("park", 30) + ins("kim", 25))
+        st, r = query(s.port, "DELETE FROM users WHERE age = 30;")
+        eq(r["results"], [{"type": "delete", "count": 2}])
+        st, r = query(s.port, ins("new", 30))  # 다른 클라이언트
+        eq(r["results"], [{"type": "insert", "id": 4}])
+        st, r = query(s.port, "DELETE FROM users WHERE age = 30; SELECT * FROM users;")
+        eq(r["results"][0], {"type": "delete", "count": 1}, "재시도가 새 행을 지움")
+        eq(r["results"][1]["rows"], [[3, "kim", 25]])
+        # 사이에 쓰기가 없으면 데이터는 같지만 행 수는 다르다(0)
+        st, r = query(s.port, "DELETE FROM users WHERE age = 30;")
+        eq(r["results"], [{"type": "delete", "count": 0}])
+
+
+@test
+def update_result_space_reserved_before_execution():
+    # INSERT처럼 결과 자리를 먼저 확보한다: 응답에 빠진 UPDATE는 실행되지 않았다
+    with Server(fresh("p4_reserve"), "--max-response", "4096") as s:
+        query(s.port, ins("a", 1))
+        n = 300
+        st, h, data = request(s.port, "POST", "/query",
+                              "".join("UPDATE users SET name = 'v%d' WHERE id = 1;" % i for i in range(n)))
+        ok(len(data) <= 4096, "응답 %d바이트" % len(data))
+        r = json.loads(data)
+        eq((st, r["error"]["code"]), (400, "RESULT_TOO_LARGE"))
+        executed = len(r["results"])
+        ok(0 < executed < n, "실행된 문장 %d개" % executed)
+        eq(r["error"]["statement"], executed + 1)
+        st, r = query(s.port, "SELECT * FROM users;")
+        eq(r["results"][0]["rows"], [[1, "v%d" % (executed - 1), 1]], "응답에 보인 마지막 UPDATE까지만 반영")
+
+
 # ---------- 스레드 풀 · 큐 · 기한 · 종료 (P3-03) ----------
 
 def cli_rows(d):
@@ -525,6 +603,60 @@ def concurrent_inserts_over_http():
         st, h, b = request(s.port, "GET", "/health")
         eq(json.loads(b)["rows"], clients * per)
     eq(len(cli_rows(d)), clients * per, "재시작(CLI)해도 같은 행 수 (C4)")
+
+
+@test
+def concurrent_mixed_writes_over_http():
+    # D5: 여러 클라이언트가 INSERT·UPDATE·DELETE·SELECT를 섞는다. 각자 자기 행만 고치고 지우므로
+    # 결과를 정확히 예상할 수 있다. 끝나면 각자의 기록과 실제 내용, 재시작 뒤 내용을 비교한다
+    clients, ops = 8, 25
+    d = fresh("p4_mixed")
+    with Server(d) as s:
+        def worker(c):
+            rng = random.Random(c)
+            mine = {}  # id → (name, age) 살아 있어야 할 행
+            issued = []
+            for i in range(ops):
+                k = rng.random()
+                if k < 0.4 or not mine:
+                    name, age = "c%d_%d" % (c, i), rng.randint(0, 150)
+                    st, r = query(s.port, ins(name, age))
+                    eq(st, 200, name)
+                    new_id = r["results"][0]["id"]
+                    mine[new_id] = (name, age)
+                    issued.append(new_id)
+                    continue
+                target = rng.choice(sorted(mine))
+                if k < 0.6:
+                    age = rng.randint(0, 150)
+                    st, r = query(s.port, "UPDATE users SET age = %d WHERE id = %d;" % (age, target))
+                    eq((st, r["results"]), (200, [{"type": "update", "count": 1}]), "UPDATE")
+                    mine[target] = (mine[target][0], age)
+                elif k < 0.75:
+                    st, r = query(s.port, "DELETE FROM users WHERE id = %d;" % target)
+                    eq((st, r["results"]), (200, [{"type": "delete", "count": 1}]), "DELETE")
+                    del mine[target]
+                    st, r = query(s.port, "DELETE FROM users WHERE id = %d;" % target)
+                    eq(r["results"], [{"type": "delete", "count": 0}], "이미 지운 행")
+                else:
+                    st, r = query(s.port, "SELECT * FROM users WHERE id = %d;" % target)
+                    name, age = mine[target]
+                    eq(r["results"][0]["rows"], [[target, name, age]], "내 행")
+            return mine, issued
+        threads = [in_thread(worker, c) for c in range(clients)]
+        alive, issued = {}, []
+        for th, box in threads:
+            th.join(180)
+            ok(not th.is_alive(), "클라이언트가 끝나지 않음")
+            if "error" in box:
+                raise box["error"]
+            alive.update(box["value"][0])
+            issued += box["value"][1]
+        eq(sorted(issued), list(range(1, len(issued) + 1)), "id 중복·빠짐 없음")
+        want = ["%d\t%s\t%d" % (i, alive[i][0], alive[i][1]) for i in sorted(alive)]
+        st, r = query(s.port, "SELECT * FROM users;")
+        eq(["%d\t%s\t%d" % tuple(row) for row in r["results"][0]["rows"]], want, "최종 내용")
+    eq(cli_rows(d), want, "재시작(CLI)해도 같음")
 
 
 @test

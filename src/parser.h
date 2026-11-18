@@ -8,23 +8,28 @@
 
 /* Parser: SQL 텍스트 → Statement. 파일 저장은 하지 않는다. */
 
-typedef enum { STMT_INSERT, STMT_SELECT } StmtKind;
+typedef enum { STMT_INSERT, STMT_SELECT, STMT_UPDATE, STMT_DELETE } StmtKind;
 
-/* SELECT의 WHERE 조건: 없음, id = 값, age = 값, id 범위(< <= > >= BETWEEN) */
+/* WHERE 조건(SELECT·UPDATE·DELETE): 없음, id = 값, age = 값, id 범위(< <= > >= BETWEEN).
+   UPDATE·DELETE는 WHERE_NONE이 될 수 없다(파서가 거부, DB-P4-D03). */
 typedef enum { WHERE_NONE, WHERE_ID, WHERE_AGE, WHERE_ID_RANGE } WhereKind;
 
 /* 사용자가 쓴 비교 형태. WHERE_ID·WHERE_AGE는 CMP_EQ, WHERE_ID_RANGE는 나머지 중 하나 */
 typedef enum { CMP_EQ, CMP_LT, CMP_LE, CMP_GT, CMP_GE, CMP_BETWEEN } CmpOp;
 
+/* UPDATE의 SET에 나온 컬럼 (Statement.set_cols의 비트) */
+enum { SET_COL_NAME = 1, SET_COL_AGE = 2 };
+
 typedef struct {
     StmtKind kind;
-    char *name;          /* INSERT: 따옴표를 풀어낸 문자열. Statement가 소유(malloc) */
-    int age;             /* INSERT */
-    WhereKind where;     /* SELECT */
-    int64_t where_value; /* SELECT: where가 WHERE_NONE이 아닐 때 비교할 값. BETWEEN이면 아래쪽 끝 */
+    char *name;          /* INSERT의 name, UPDATE의 SET name: 따옴표를 풀어낸 문자열. Statement가 소유(malloc) */
+    int age;             /* INSERT의 age, UPDATE의 SET age */
+    WhereKind where;     /* SELECT·UPDATE·DELETE */
+    int64_t where_value; /* where가 WHERE_NONE이 아닐 때 비교할 값. BETWEEN이면 아래쪽 끝 */
     int explain;         /* SELECT: EXPLAIN SELECT ...이면 1. 계획만 만들고 조회는 실행하지 않는다 */
-    CmpOp where_op;      /* SELECT: 비교 형태 (EXPLAIN 출력에 원래 형태를 보여 주려고 보존) */
-    int64_t where_value2; /* SELECT: CMP_BETWEEN일 때 위쪽 끝. 그 밖에는 0 */
+    CmpOp where_op;      /* 비교 형태 (EXPLAIN 출력에 원래 형태를 보여 주려고 보존) */
+    int64_t where_value2; /* CMP_BETWEEN일 때 위쪽 끝. 그 밖에는 0 */
+    int set_cols;        /* UPDATE: SET에 나온 컬럼(SET_COL_NAME | SET_COL_AGE). 그 밖에는 0 */
 } Statement;
 
 /*

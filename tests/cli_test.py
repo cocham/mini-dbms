@@ -264,7 +264,7 @@ A5_CASES = [
     ("SELECT * FROM users WHERE id = 1 AND age = 1;", "AND/OR"),
     ("SELECT * FROM users WHERE id = 9223372036854775808;", "64비트"),
     ("SELECT * FROM users WHERE id = 1", "세미콜론"),
-    ("DELETE FROM users;", "INSERT 또는 SELECT"),
+    ("DELETE FROM users;", "WHERE 조건이 필요"),
 ]
 
 
@@ -765,6 +765,189 @@ def p2_random_model(env):
             expected += HEADER + rows(pred)
         expect_ok(env.run("\n".join(stmts)), expected)
     eq(env.data(), rows(lambda r: True), "최종 파일")
+
+
+# ---------- Phase 4: UPDATE·DELETE ----------
+
+def next_file(env):
+    p = os.path.join(env.data_dir, "users.next")
+    if not os.path.exists(p):
+        return None
+    with open(p, "rb") as f:
+        return f.read()
+
+
+def leftover_tmp(env):
+    return [n for n in ("users.tsv.tmp", "users.next.tmp") if os.path.exists(os.path.join(env.data_dir, n))]
+
+
+FIVE = "".join("INSERT INTO users (name, age) VALUES ('%s', %d);" % p
+               for p in [("a", 10), ("b", 20), ("c", 20), ("d", 30), ("e", 40)])
+
+
+@test
+def p4_update_delete_basic(env):
+    # D2: 고치고 지운 뒤 SELECT가 id 순서로 바뀐 결과를 보여 준다. 다시 실행해도 같다
+    expect_ok(env.run(FIVE), b"INSERT 1\n" * 5)
+    expect_ok(env.run("UPDATE users SET age = 21 WHERE age = 20;"
+                      "UPDATE users SET name = 'O''Brien', age = 5 WHERE id = 1;"
+                      "UPDATE users SET name = '민수' WHERE id BETWEEN 4 AND 9;"
+                      "UPDATE users SET age = 21 WHERE id = 2;"  # 값이 같아도 센다
+                      "DELETE FROM users WHERE id = 3;"
+                      "DELETE FROM users WHERE id > 100;"
+                      "SELECT * FROM users;"),
+              b"UPDATE 2\nUPDATE 1\nUPDATE 2\nUPDATE 1\nDELETE 1\nDELETE 0\n" + HEADER +
+              u("1\tO'Brien\t5\n2\tb\t21\n4\t민수\t30\n5\t민수\t40\n"))
+    eq(env.data(), u("1\tO'Brien\t5\n2\tb\t21\n4\t민수\t30\n5\t민수\t40\n"), "저장 파일")
+    eq(leftover_tmp(env), [], "임시 파일 없음")
+    eq(next_file(env), None, "가장 큰 id를 지우지 않으면 users.next 없음")
+    # 재시작: 인덱스 조회·범위 조회·선형 탐색 모두 새 파일 기준
+    expect_ok(env.run("SELECT * FROM users WHERE id = 4;"
+                      "SELECT * FROM users WHERE id = 3;"
+                      "SELECT * FROM users WHERE id BETWEEN 2 AND 5;"
+                      "SELECT * FROM users WHERE age = 21;"),
+              HEADER + u("4\t민수\t30\n") + HEADER + HEADER + u("2\tb\t21\n4\t민수\t30\n5\t민수\t40\n") +
+              HEADER + b"2\tb\t21\n")
+
+
+@test
+def p4_delete_max_id_keeps_next_id(env):
+    # D3: 가장 큰 id를 지운 뒤 INSERT는 그보다 큰 id를 받는다. 다시 실행해도 같다
+    expect_ok(env.run(TWO_INSERTS + "INSERT INTO users (name, age) VALUES ('c', 3);"
+                      "DELETE FROM users WHERE id = 3;"
+                      "INSERT INTO users (name, age) VALUES ('d', 4);"
+                      "SELECT * FROM users WHERE id >= 3;"),
+              b"INSERT 1\n" * 3 + b"DELETE 1\nINSERT 1\n" + HEADER + b"4\td\t4\n")
+    eq(next_file(env), b"3\n", "users.next")
+    expect_ok(env.run("DELETE FROM users WHERE id >= 1;"), b"DELETE 3\n")
+    eq(env.data(), b"", "모두 지움")
+    eq(next_file(env), b"4\n", "users.next")
+    expect_ok(env.run("INSERT INTO users (name, age) VALUES ('e', 5); SELECT * FROM users;"),
+              b"INSERT 1\n" + HEADER + b"5\te\t5\n")
+
+
+@test
+def p4_zero_rows_leave_file_untouched(env):
+    # D06: 조건에 맞는 행이 없으면 0이고 파일을 다시 쓰지 않는다(같은 파일 그대로: inode·수정 시각)
+    expect_ok(env.run(TWO_INSERTS), b"INSERT 1\nINSERT 1\n")
+    before = os.stat(env.data_file)
+    expect_ok(env.run("UPDATE users SET age = 1 WHERE id = 99;"
+                      "DELETE FROM users WHERE age = 77;"
+                      "DELETE FROM users WHERE id BETWEEN 5 AND 3;"),
+              b"UPDATE 0\nDELETE 0\nDELETE 0\n")
+    after = os.stat(env.data_file)
+    eq((after.st_ino, after.st_mtime_ns, after.st_size), (before.st_ino, before.st_mtime_ns, before.st_size),
+       "파일 그대로")
+    eq(env.data(), TWO_ROWS, "저장 파일")
+
+
+@test
+def p4_value_errors_change_nothing(env):
+    expect_ok(env.run(TWO_INSERTS), b"INSERT 1\nINSERT 1\n")
+    cases = [
+        ("UPDATE users SET age = 151 WHERE id = 1;", "age"),
+        ("UPDATE users SET name = '' WHERE id = 1;", "빈 문자열"),
+        ("UPDATE users SET name = '%s' WHERE id = 1;" % ("x" * 256), "255"),
+        ("UPDATE users SET name = 'ok', age = 200 WHERE id = 1;", "age"),
+    ]
+    for sql, needle in cases:
+        expect_fail(env.run(sql), "문장 1", needle)
+        eq(env.data(), TWO_ROWS, "실패 후 저장 파일 (%s)" % sql[:40])
+        eq(leftover_tmp(env), [], "임시 파일 없음")
+
+
+@test
+def p4_fail_fast_keeps_earlier_change(env):
+    # 문장마다 바로 반영된다: 뒤 문장이 실패해도 앞 UPDATE·DELETE는 남는다(INSERT와 같은 fail-fast)
+    expect_ok(env.run(TWO_INSERTS), b"INSERT 1\nINSERT 1\n")
+    expect_fail(env.run("DELETE FROM users WHERE id = 1; UPDATE users SET age = 999 WHERE id = 2;"),
+                "문장 2", stdout=b"DELETE 1\n")
+    eq(env.data(), u("2\tO'Brien\t30\n"), "앞 DELETE는 반영")
+
+
+@test
+def p4_stale_tmp_removed_on_start(env):
+    # 이전 실행이 다시 쓰기 도중 끝나 남긴 임시 파일은 시작할 때 지운다. 원래 파일은 그대로
+    expect_ok(env.run(TWO_INSERTS), b"INSERT 1\nINSERT 1\n")
+    for name, data in (("users.tsv.tmp", b"1\tpartial"), ("users.next.tmp", b"9\n")):
+        with open(os.path.join(env.data_dir, name), "wb") as f:
+            f.write(data)
+    expect_ok(env.run("SELECT * FROM users;"), HEADER + TWO_ROWS)
+    eq(leftover_tmp(env), [], "임시 파일 정리")
+    expect_ok(env.run("INSERT INTO users (name, age) VALUES ('c', 3);"), b"INSERT 1\n")
+    eq(env.data(), TWO_ROWS + b"3\tc\t3\n", "남은 users.next.tmp는 반영하지 않음")
+
+
+@test
+def p4_corrupt_next_file_refuses_start(env):
+    expect_ok(env.run(TWO_INSERTS), b"INSERT 1\nINSERT 1\n")
+    # b"1\x0000\n"은 Codex 재현(31 00 30 30 0a): NUL 앞만 읽어 1로 보면 안 된다
+    for bad in (b"abc\n", b"1\x0000\n", b"1\x00\n", b"7 \n"):
+        with open(os.path.join(env.data_dir, "users.next"), "wb") as f:
+            f.write(bad)
+        expect_fail(env.run("INSERT INTO users (name, age) VALUES ('c', 3);"), "다음 id 파일 손상")
+        eq(env.data(), TWO_ROWS, "거부 뒤 저장 파일 (%r)" % bad)
+        eq(next_file(env), bad, "거부 뒤 users.next (%r)" % bad)
+
+
+@test
+def p4_timing_lines(env):
+    expect_ok(env.run(TWO_INSERTS), b"INSERT 1\nINSERT 1\n")
+    code, out, err = env.run_args(["--timing", "--data-dir", env.data_dir,
+                                   env.sql_file("UPDATE users SET age = 1 WHERE id >= 1;"
+                                                "DELETE FROM users WHERE id = 9;")])
+    eq((code, out), (0, b"UPDATE 2\nDELETE 0\n"), "--timing")
+    lines = timing_lines(err)
+    assert re.match(u(r"^\[측정\] 문장 1: [0-9.]+ ms, 수정 2행$"), lines[2]), lines[2]
+    assert re.match(u(r"^\[측정\] 문장 2: [0-9.]+ ms, 삭제 0행$"), lines[3]), lines[3]
+
+
+@test
+def p4_random_model(env):
+    # 무작위 UPDATE·DELETE를 파이썬 모델과 비교한다. 매번 다른 프로세스(재시작)로 확인한다
+    rng = random.Random(4)
+    people = {i: ("p%d" % i, rng.randint(0, 150)) for i in range(1, 41)}
+    expect_ok(env.run("".join("INSERT INTO users (name, age) VALUES ('%s', %d);" % people[i] for i in range(1, 41))),
+              b"INSERT 1\n" * 40)
+    ages = [a for _, a in people.values()]
+    for step in range(25):
+        k = rng.randrange(4)
+        a = rng.randint(1, 45)
+        b = a + rng.randint(0, 10)
+        v = rng.choice(ages)
+        if k == 0:
+            sql, hit = "DELETE FROM users WHERE age = %d;" % v, [i for i in people if people[i][1] == v]
+        elif k == 1:
+            sql, hit = "DELETE FROM users WHERE id BETWEEN %d AND %d;" % (a, b), [i for i in people if a <= i <= b]
+        elif k == 2:
+            sql, hit = "UPDATE users SET age = %d WHERE id <= %d;" % (v, a), [i for i in people if i <= a]
+        else:
+            sql, hit = "UPDATE users SET name = 's%d' WHERE id = %d;" % (step, a), [i for i in people if i == a]
+        for i in hit:
+            if k < 2:
+                del people[i]
+            elif k == 2:
+                people[i] = (people[i][0], v)
+            else:
+                people[i] = ("s%d" % step, people[i][1])
+        kind = b"DELETE" if k < 2 else b"UPDATE"
+        rows = b"".join(u("%d\t%s\t%d\n" % (i, people[i][0], people[i][1])) for i in sorted(people))
+        expect_ok(env.run(sql + "SELECT * FROM users;"), kind + b" %d\n" % len(hit) + HEADER + rows)
+        eq(env.data(), rows, "저장 파일 (%s)" % sql)
+
+
+@test
+def p4_update_delete_syntax_errors(env):
+    cases = [
+        ("UPDATE users SET name = 'x';", "UPDATE에는 WHERE 조건이 필요"),
+        ("DELETE FROM users;", "DELETE에는 WHERE 조건이 필요"),
+        ("UPDATE users SET id = 5 WHERE id = 1;", "id는 바꿀 수 없습니다"),
+        ("UPDATE users SET age = 1, age = 2 WHERE id = 1;", "중복"),
+        ("EXPLAIN DELETE FROM users WHERE id = 1;", "EXPLAIN은 SELECT 문에만"),
+    ]
+    for sql, needle in cases:
+        expect_fail(env.run(sql), "문장 1", needle)
+        eq(env.data(), b"", "실패 후 저장 파일 (%s)" % sql[:40])
 
 
 @test

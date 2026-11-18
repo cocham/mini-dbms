@@ -26,6 +26,8 @@
 #endif
 
 #define TABLE_FILE "users.tsv"
+#define NEXT_FILE "users.next" /* 마지막으로 부여한 id (Phase 4, DB-P4-D04) */
+#define TMP_SUFFIX ".tmp"
 #define ID_MAX_DIGITS 19  /* INT64_MAX = 9223372036854775807 */
 #define AGE_MAX_DIGITS 3
 /* 가장 긴 레코드: 19 + 1 + 255 + 1 + 3 = 279바이트. 넉넉히 잡고 넘으면 손상으로 본다. */
@@ -33,10 +35,15 @@
 #define SCAN_BUF (64 * 1024) /* 선형 탐색·범위 조회가 호출마다 따로 쓰는 읽기 버퍼 */
 
 struct Table {
-    FILE *fp;      /* "a+b". INSERT(쓰기)만 쓴다. 조회는 이 FILE*의 위치·버퍼를 건드리지 않는다 */
+    FILE *fp;      /* "a+b". INSERT(쓰기)만 쓴다. 조회는 이 FILE*의 위치·버퍼를 건드리지 않는다.
+                      Windows에서 다시 쓰기 뒤 다시 열기에 실패하면 NULL(엔진이 중단 상태가 된다) */
     int fd;        /* fp의 파일 서술자. 조회는 위치를 지정해 읽는다(read_at) */
-    char *path;
-    int64_t last_id;   /* 파일에 있는 최대 ID. 빈 테이블이면 0 */
+    char *path;          /* data_dir/users.tsv */
+    char *tmp_path;      /* data_dir/users.tsv.tmp: 다시 쓰기(UPDATE·DELETE)가 새 내용을 쓰는 곳 */
+    char *next_path;     /* data_dir/users.next */
+    char *next_tmp_path; /* data_dir/users.next.tmp */
+    int64_t next_saved;  /* users.next에 적힌 값. 없으면 0 */
+    int64_t last_id;   /* 마지막으로 부여한 ID = max(파일의 최대 ID, users.next). 빈 테이블이면 0 */
     int64_t file_size; /* 끝까지 기록된 줄의 바이트 합. INSERT가 배타 잠금 안에서 늘린다 */
     BpTree *index;     /* id → 그 레코드 줄이 시작하는 바이트 위치. 메모리에만 있다 */
 };
@@ -228,11 +235,77 @@ static int parse_record(char *line, size_t len, int64_t prev_id, Row *row, const
 static int scan_file(Table *t, BpTree *build, RowFn fn, void *ctx, int64_t end, int64_t *out_last_id,
                      int64_t *out_size, DbError *err);
 
+/* dir/name+suffix를 malloc해 돌려준다. 메모리가 부족하면 NULL */
+static char *join_path(const char *dir, const char *name, const char *suffix) {
+    size_t n = strlen(dir) + 1 + strlen(name) + strlen(suffix) + 1;
+    char *p = malloc(n);
+
+    if (p != NULL) {
+        snprintf(p, n, "%s/%s%s", dir, name, suffix);
+    }
+    return p;
+}
+
+/* FILE*는 닫은 뒤 부른다 */
+static void table_free(Table *t) {
+    bpt_destroy(t->index);
+    free(t->path);
+    free(t->tmp_path);
+    free(t->next_path);
+    free(t->next_tmp_path);
+    free(t);
+}
+
+/* users.next를 읽어 t->next_saved에 담는다. 없으면 0. 형식: 양의 정수 한 줄("5\n") */
+static int read_next_file(Table *t, DbError *err) {
+    char buf[ID_MAX_DIGITS + 3];
+    size_t n;
+    int bad;
+    int64_t v = 0;
+    char eb[128];
+    FILE *fp = fopen(t->next_path, "rb");
+
+    t->next_saved = 0;
+    if (fp == NULL) {
+        if (errno == ENOENT) {
+            return 0;
+        }
+        db_error_setk(err, DBE_STORAGE, "다음 id 파일을 열 수 없습니다: %s (%s)", t->next_path,
+                      db_errstr(errno, eb, sizeof eb));
+        return -1;
+    }
+    n = fread(buf, 1, sizeof buf - 1, fp);
+    bad = ferror(fp) || !feof(fp); /* 다 못 읽었으면 너무 길다 */
+    fclose(fp);
+    buf[n] = '\0';
+    if (bad || n < 2 || buf[n - 1] != '\n') {
+        bad = 1;
+    } else {
+        size_t i;
+        /* parse_digits는 NUL에서 멈추므로, 읽은 바이트 전체(LF 앞)가 숫자인지 먼저 본다.
+           "1\0" "00\n" 같은 파일을 1로 읽으면 지운 id를 다시 줄 수 있다 */
+        for (i = 0; i + 1 < n; i++) {
+            if (buf[i] < '0' || buf[i] > '9') {
+                bad = 1;
+            }
+        }
+    }
+    if (!bad) {
+        buf[n - 1] = '\0';
+        bad = parse_digits(buf, ID_MAX_DIGITS, &v) != 0 || v <= 0;
+    }
+    if (bad) {
+        db_error_setk(err, DBE_STORAGE, "다음 id 파일 손상: %s (양의 정수 한 줄이어야 합니다)", t->next_path);
+        return -1;
+    }
+    t->next_saved = v;
+    return 0;
+}
+
 /* ---------- 공개 함수 ---------- */
 
 int table_open(const char *data_dir, Table **out, DbError *err) {
     Table *t;
-    size_t path_len;
     int saved_errno;
     char eb[128];
 
@@ -242,13 +315,18 @@ int table_open(const char *data_dir, Table **out, DbError *err) {
         db_error_setk(err, DBE_STORAGE, "메모리가 부족합니다");
         return -1;
     }
-    path_len = strlen(data_dir) + 1 + strlen(TABLE_FILE) + 1;
-    t->path = malloc(path_len);
-    if (t->path == NULL) {
+    t->fd = -1;
+    t->path = join_path(data_dir, TABLE_FILE, "");
+    t->tmp_path = join_path(data_dir, TABLE_FILE, TMP_SUFFIX);
+    t->next_path = join_path(data_dir, NEXT_FILE, "");
+    t->next_tmp_path = join_path(data_dir, NEXT_FILE, TMP_SUFFIX);
+    if (t->path == NULL || t->tmp_path == NULL || t->next_path == NULL || t->next_tmp_path == NULL) {
         db_error_setk(err, DBE_STORAGE, "메모리가 부족합니다");
         goto fail;
     }
-    snprintf(t->path, path_len, "%s/%s", data_dir, TABLE_FILE);
+    /* 이전 실행이 다시 쓰기 도중 끝났으면 임시 파일이 남는다. 바꿔치기 전까지 원래 파일은 온전하므로 지운다. */
+    remove(t->tmp_path);
+    remove(t->next_tmp_path);
 
     t->fp = fopen(t->path, "a+b");
     if (t->fp == NULL) {
@@ -275,8 +353,12 @@ int table_open(const char *data_dir, Table **out, DbError *err) {
         db_error_setk(err, DBE_STORAGE, "메모리가 부족합니다");
         goto fail;
     }
-    if (scan_file(t, t->index, NULL, NULL, INT64_MAX, &t->last_id, &t->file_size, err) != 0) {
+    if (scan_file(t, t->index, NULL, NULL, INT64_MAX, &t->last_id, &t->file_size, err) != 0 ||
+        read_next_file(t, err) != 0) {
         goto fail;
+    }
+    if (t->next_saved > t->last_id) {
+        t->last_id = t->next_saved; /* 가장 큰 id의 행이 지워졌다: 그 id를 다시 쓰지 않는다 */
     }
     *out = t;
     return 0;
@@ -285,9 +367,7 @@ fail:
     if (t->fp != NULL) {
         fclose(t->fp);
     }
-    bpt_destroy(t->index);
-    free(t->path);
-    free(t);
+    table_free(t);
     return -1;
 }
 
@@ -539,6 +619,260 @@ int table_append(Table *t, const char *name, int age, int64_t *out_id, DbError *
     return 0;
 }
 
+/* ---------- 다시 쓰기 (Phase 4: UPDATE·DELETE, DB-P4-D01·D05) ----------
+ *
+ * 바뀐 내용 전체를 users.tsv.tmp에 쓰고 users.tsv와 바꿔치기(rename)한다. 원래 파일은 바꿔치기 전까지
+ * 건드리지 않으므로, 그 앞에서 실패하면 파일·인덱스·조회 결과가 모두 그대로다(임시 파일은 지운다).
+ * 호출자(db.c)가 배타 잠금을 잡고 부른다. 그래서 다시 쓰는 동안 조회·INSERT가 끼어들지 않는다.
+ */
+
+#ifdef MINIDB_TESTING
+static int g_fail_rewrite; /* REWRITE_FAIL_*: 다음 다시 쓰기 한 번이 그 단계에서 실패한다 */
+void table_test_fail_rewrite(int stage) { g_fail_rewrite = stage; }
+static int take_fail(int stage) {
+    if (g_fail_rewrite != stage) {
+        return 0;
+    }
+    g_fail_rewrite = REWRITE_FAIL_NONE;
+    errno = EIO;
+    return 1;
+}
+#define FAIL_AT(stage) take_fail(stage)
+#else
+#define FAIL_AT(stage) 0
+#endif
+
+/* from을 to로 바꾼다(to가 있으면 덮어씀). POSIX rename은 한 번에 일어난다.
+   Windows rename은 있는 파일을 덮어쓰지 않으므로 MoveFileExA를 쓴다. */
+static int replace_file(const char *from, const char *to) {
+#ifdef _WIN32
+    if (MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING)) {
+        return 0;
+    }
+    errno = EACCES;
+    return -1;
+#else
+    return rename(from, to);
+#endif
+}
+
+/* users.next에 v를 쓴다: users.next.tmp에 쓰고 바꿔치기. 실패하면 users.next는 이전 내용 그대로다. */
+static int write_next_file(Table *t, int64_t v, DbError *err) {
+    char eb[128];
+    int saved;
+    FILE *fp = fopen(t->next_tmp_path, "wb");
+    int ok = fp != NULL && fprintf(fp, "%" PRId64 "\n", v) > 0 && !FAIL_AT(REWRITE_FAIL_NEXT);
+
+    if (fp != NULL && fclose(fp) != 0) {
+        ok = 0;
+    }
+    if (ok && replace_file(t->next_tmp_path, t->next_path) != 0) {
+        ok = 0;
+    }
+    if (ok) {
+        return 0;
+    }
+    saved = errno;
+    remove(t->next_tmp_path);
+    db_error_setk(err, DBE_STORAGE, "다음 id 파일 쓰기 실패: %s (%s)", t->next_path, db_errstr(saved, eb, sizeof eb));
+    return -1;
+}
+
+typedef struct {
+    RowPred match;
+    void *match_ctx;
+    const RowUpdate *upd; /* NULL이면 DELETE */
+    FILE *out;            /* users.tsv.tmp */
+    BpTree *index;        /* 새 파일 기준 id → 바이트 위치 */
+    int64_t size;         /* 새 파일에 쓴 바이트 수 = 다음 줄이 시작할 위치 */
+    int64_t max_id;       /* 새 파일의 최대 id. 비면 0 */
+    int64_t count;        /* 조건에 맞은 행 수 */
+    const char *tmp_path;
+    DbError err;          /* 콜백에서 난 오류. failed가 1일 때만 의미가 있다 */
+    int failed;
+} RewriteCtx;
+
+/* 원래 파일의 행을 하나씩 받아 새 파일에 쓴다: 지울 행은 건너뛰고, 고칠 행은 새 값으로, 나머지는 그대로. */
+static int rewrite_row(const Row *row, void *vctx) {
+    RewriteCtx *rc = vctx;
+    const char *name = row->name;
+    int age = row->age;
+    char eb[128];
+    int n;
+
+    if (rc->match(row, rc->match_ctx)) {
+        rc->count++;
+        if (rc->upd == NULL) {
+            return 0; /* DELETE: 새 파일에 쓰지 않는다 */
+        }
+        if (rc->upd->set_name) {
+            name = rc->upd->name;
+        }
+        if (rc->upd->set_age) {
+            age = rc->upd->age;
+        }
+    }
+    n = fprintf(rc->out, "%" PRId64 "\t%s\t%d\n", row->id, name, age);
+    if (n >= 0 && FAIL_AT(REWRITE_FAIL_WRITE)) {
+        fflush(rc->out); /* 임시 파일에 내용이 남은 채로 실패해야 정리를 확인할 수 있다 */
+        n = -1;
+    }
+    if (n < 0) {
+        db_error_setk(&rc->err, DBE_STORAGE, "임시 파일 쓰기 실패: %s (%s)", rc->tmp_path,
+                      db_errstr(errno, eb, sizeof eb));
+        rc->failed = 1;
+        return 1;
+    }
+    /* id는 원래 파일에서 증가 순서였고 그 순서대로 쓰므로 중복은 없다. 실패 원인은 메모리 부족뿐이다. */
+    if (bpt_insert(rc->index, row->id, rc->size) != BPT_OK) {
+        db_error_setk(&rc->err, DBE_STORAGE, "메모리가 부족해 새 인덱스를 만들 수 없습니다");
+        rc->failed = 1;
+        return 1;
+    }
+    rc->size += n;
+    rc->max_id = row->id;
+    return 0;
+}
+
+#ifdef _WIN32
+static int reopen_table_file(Table *t) {
+    t->fp = fopen(t->path, "a+b");
+    if (t->fp == NULL) {
+        t->fd = -1;
+        return -1;
+    }
+    t->fd = _fileno(t->fp);
+    return 0;
+}
+#endif
+
+int table_rewrite(Table *t, RowPred match, void *match_ctx, const RowUpdate *upd, int64_t *out_count,
+                  DbError *err) {
+    RewriteCtx rc;
+    char eb[128];
+    int saved;
+#ifndef _WIN32
+    FILE *nfp;
+#endif
+
+    *out_count = 0;
+    /* 파일 형식을 깨는 값은 Executor 검증과 별개로 여기서도 막는다(table_append와 같은 규칙). */
+    if (upd != NULL &&
+        ((upd->set_name && (upd->name == NULL || upd->name[0] == '\0' || strlen(upd->name) > NAME_MAX_BYTES ||
+                            strpbrk(upd->name, "\t\r\n") != NULL)) ||
+         (upd->set_age && (upd->age < AGE_MIN || upd->age > AGE_MAX)))) {
+        db_error_setk(err, DBE_STORAGE, "저장할 수 없는 레코드입니다");
+        return -1;
+    }
+    memset(&rc, 0, sizeof rc);
+    rc.match = match;
+    rc.match_ctx = match_ctx;
+    rc.upd = upd;
+    rc.tmp_path = t->tmp_path;
+    rc.index = bpt_create(BPT_DEFAULT_ORDER);
+    if (rc.index == NULL) {
+        db_error_setk(err, DBE_STORAGE, "메모리가 부족합니다");
+        return -1;
+    }
+    rc.out = fopen(t->tmp_path, "wb");
+    if (rc.out == NULL) {
+        db_error_setk(err, DBE_STORAGE, "임시 파일을 만들 수 없습니다: %s (%s)", t->tmp_path,
+                      db_errstr(errno, eb, sizeof eb));
+        goto fail;
+    }
+
+    /* 1) 원래 파일을 처음부터 읽으며(위치 지정 읽기, 원래 FILE*는 건드리지 않음) 새 파일과 새 트리를 만든다 */
+    if (scan_file(t, NULL, rewrite_row, &rc, t->file_size, NULL, NULL, err) != 0) {
+        if (rc.failed) {
+            *err = rc.err;
+        }
+        goto fail;
+    }
+    /* 2) 새 파일 마무리 */
+    saved = fflush(rc.out) != 0 || ferror(rc.out);
+    if (fclose(rc.out) != 0) {
+        saved = 1;
+    }
+    rc.out = NULL;
+    if (saved) {
+        db_error_setk(err, DBE_STORAGE, "임시 파일 쓰기 실패: %s (%s)", t->tmp_path, db_errstr(errno, eb, sizeof eb));
+        goto fail;
+    }
+    /* 3) 다음 id: 가장 큰 id의 행이 새 파일에서 사라지면 그 id를 users.next에 남긴다(DB-P4-D04).
+          users.next는 "이보다 큰 id를 써라"라는 뜻뿐이라, 뒤 단계가 실패해도 남아 있어 해가 없다. */
+    if (rc.max_id < t->last_id && t->next_saved < t->last_id) {
+        if (write_next_file(t, t->last_id, err) != 0) {
+            goto fail;
+        }
+        t->next_saved = t->last_id;
+    }
+
+#ifndef _WIN32
+    /* 4) INSERT가 쓸 새 FILE*를 바꿔치기 전에 연다. 바꿔치기 뒤에 실패할 단계를 남기지 않기 위해서다 */
+    nfp = fopen(t->tmp_path, "a+b");
+    if (nfp == NULL) {
+        db_error_setk(err, DBE_STORAGE, "임시 파일을 열 수 없습니다: %s (%s)", t->tmp_path,
+                      db_errstr(errno, eb, sizeof eb));
+        goto fail;
+    }
+    /* 5) 바꿔치기. rename은 한 번에 일어난다: 다른 프로세스는 옛 파일이나 새 파일 하나만 본다 */
+    if (FAIL_AT(REWRITE_FAIL_RENAME) || rename(t->tmp_path, t->path) != 0) {
+        saved = errno;
+        fclose(nfp);
+        db_error_setk(err, DBE_STORAGE, "데이터 파일 바꿔치기 실패: %s (%s)", t->path, db_errstr(saved, eb, sizeof eb));
+        goto fail;
+    }
+    /* 6) 교체. 여기부터는 실패할 단계가 없다. 옛 FILE*는 모든 INSERT 뒤 fflush했으므로 닫기만 한다 */
+    fclose(t->fp);
+    t->fp = nfp;
+    t->fd = fileno(nfp);
+#else
+    /* Windows: 열린 파일은 바꿀 수 없어 옛 FILE*를 닫고 바꾼 뒤 다시 연다(design.md "Windows (CLI만)") */
+    fclose(t->fp);
+    t->fp = NULL;
+    t->fd = -1;
+    if (FAIL_AT(REWRITE_FAIL_RENAME) || replace_file(t->tmp_path, t->path) != 0) {
+        saved = errno;
+        if (reopen_table_file(t) != 0) {
+            remove(t->tmp_path);
+            bpt_destroy(rc.index);
+            db_error_setk(err, DBE_REOPEN_FAILED,
+                          "데이터 파일 바꿔치기 실패 뒤 원래 파일을 다시 열지 못했습니다: %s (변경 없음, 다시 실행하면 복원)",
+                          t->path);
+            return -1;
+        }
+        db_error_setk(err, DBE_STORAGE, "데이터 파일 바꿔치기 실패: %s (%s)", t->path, db_errstr(saved, eb, sizeof eb));
+        goto fail;
+    }
+#endif
+    bpt_destroy(t->index);
+    t->index = rc.index;
+    t->file_size = rc.size;
+    *out_count = rc.count;
+#ifdef _WIN32
+    /* 바꿔치기 뒤라 되돌릴 수 없다. 실패하면 엔진을 중단 상태로 둔다(파일은 온전, 다시 실행하면 복원) */
+    if (FAIL_AT(REWRITE_FAIL_REOPEN) || reopen_table_file(t) != 0) {
+        if (t->fp != NULL) {
+            fclose(t->fp);
+            t->fp = NULL;
+            t->fd = -1;
+        }
+        db_error_setk(err, DBE_REOPEN_FAILED,
+                      "데이터 파일을 바꾼 뒤 다시 열지 못했습니다: %s (변경은 파일에 반영됨, 다시 실행하면 복원)", t->path);
+        return -1;
+    }
+#endif
+    return 0;
+
+fail:
+    if (rc.out != NULL) {
+        fclose(rc.out);
+    }
+    remove(t->tmp_path);
+    bpt_destroy(rc.index);
+    return -1;
+}
+
 int64_t table_last_id(const Table *t) { return t->last_id; }
 
 #ifdef MINIDB_TESTING
@@ -568,12 +902,10 @@ int table_close(Table *t, DbError *err) {
     if (t == NULL) {
         return 0;
     }
-    rc = fclose(t->fp);
+    rc = t->fp != NULL ? fclose(t->fp) : 0;
     if (rc != 0) {
         db_error_setk(err, DBE_STORAGE, "데이터 파일 닫기 실패: %s (%s)", t->path, db_errstr(errno, eb, sizeof eb));
     }
-    bpt_destroy(t->index);
-    free(t->path);
-    free(t);
+    table_free(t);
     return rc == 0 ? 0 : -1;
 }

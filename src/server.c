@@ -56,6 +56,7 @@
 #define MIN_MAX_RESPONSE 4096
 #define RESPONSE_RESERVE 2048
 #define INSERT_RESULT_MAX 48 /* {"type":"insert","id":-9223372036854775808} + 쉼표 */
+#define CHANGE_RESULT_MAX 48 /* {"type":"update","count":-9223372036854775808} + 쉼표 = 47 */
 
 /* 스레드 풀 (P3-03, DB-P3-D06) */
 #define DEFAULT_THREADS 4
@@ -194,6 +195,14 @@ static int json_on_insert(int64_t id, void *vctx) {
                : 0;
 }
 
+/* {"type":"update","count":n} / {"type":"delete","count":n} (DB-P4-D06) */
+static int json_on_change(StmtKind kind, int64_t count, void *vctx) {
+    QueryCtx *q = vctx;
+    const char *head = kind == STMT_UPDATE ? "{\"type\":\"update\",\"count\":" : "{\"type\":\"delete\",\"count\":";
+    /* INSERT처럼 자리를 실행 전에 확보했으므로 여기서는 실패하지 않는다: 반영된 변경이 응답에서 빠지지 않게 */
+    return (jb_lit(q->res, head) != 0 || jb_i64(q->res, count) != 0 || jb_lit(q->res, "}") != 0) ? 1 : 0;
+}
+
 static int json_on_row(const Row *row, void *vctx) {
     QueryCtx *q = vctx;
 
@@ -234,7 +243,11 @@ typedef struct {
 } QueryError;
 
 static const char *halt_reason_code(DbState s) {
-    return s == DB_HALTED_INDEX ? "index_failed" : "write_failed";
+    switch (s) {
+    case DB_HALTED_INDEX: return "index_failed";
+    case DB_HALTED_REOPEN: return "reopen_failed"; /* Windows 전용이라 서버(POSIX)에서는 나오지 않는다 */
+    default: return "write_failed";
+    }
 }
 
 /* 실행 단계 실패를 오류 코드로 (spec 오류 코드 표) */
@@ -261,6 +274,7 @@ static void classify(QueryError *qe, const DbError *err, const JsonBuf *res, con
         }
         break;
     case DBE_STORAGE:
+    case DBE_REOPEN_FAILED: /* Windows 전용. 서버에서는 나오지 않는다 */
         qe->status = 500;
         qe->code = "STORAGE";
         break;
@@ -376,7 +390,7 @@ static int handle_query(Server *s, int fd, const HttpRequest *req, size_t *nstmt
 
     for (k = 0; k < n && !failed; k++) {
         const Statement *st = &sts[k];
-        ResultSink sink = {json_on_insert, json_on_row, &q, json_on_plan};
+        ResultSink sink = {json_on_insert, json_on_row, &q, json_on_plan, json_on_change};
         DbError err = {{0}, DBE_NONE};
         size_t mark = res.len;
         const char *sep = nresults > 0 ? "," : "";
@@ -402,6 +416,9 @@ static int handle_query(Server *s, int fd, const HttpRequest *req, size_t *nstmt
         if (st->kind == STMT_INSERT) {
             /* 결과를 쓸 자리가 없으면 실행하지 않는다: 저장된 INSERT가 응답에서 빠지지 않게 */
             prep = jb_reserve(&res, strlen(sep) + INSERT_RESULT_MAX) == 0 ? jb_lit(&res, sep) : -1;
+        } else if (st->kind == STMT_UPDATE || st->kind == STMT_DELETE) {
+            /* INSERT와 같은 이유로 결과 자리를 먼저 확보한다: 자리가 없으면 파일을 다시 쓰지 않는다 */
+            prep = jb_reserve(&res, strlen(sep) + CHANGE_RESULT_MAX) == 0 ? jb_lit(&res, sep) : -1;
         } else if (!st->explain) {
             prep = (jb_lit(&res, sep) == 0 &&
                     jb_lit(&res, "{\"type\":\"select\",\"columns\":[\"id\",\"name\",\"age\"],\"rows\":[") == 0)

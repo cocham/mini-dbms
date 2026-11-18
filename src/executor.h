@@ -68,12 +68,17 @@ typedef struct {
     RowFn on_row;
     void *ctx;
     int (*on_plan)(const QueryPlan *plan, void *ctx); /* EXPLAIN 결과. 0이 아니면 실패로 처리 */
+    /* UPDATE·DELETE 결과: kind는 STMT_UPDATE/STMT_DELETE, count는 조건에 맞은 행 수(값이 같아도 셈).
+       파일에 반영한 뒤 호출된다. 0이 아니면 실패로 처리하지만 변경은 이미 파일에 있다 */
+    int (*on_change)(StmtKind kind, int64_t count, void *ctx);
 } ResultSink;
 
 /*
  * 0 성공, -1 실패(err에 원인). sink나 그 안의 콜백은 NULL이어도 된다.
  * SELECT는 executor_plan이 고른 경로로 실행한다. st->explain이면 계획을 on_plan으로 넘기고
  * 조회는 실행하지 않는다(on_row 호출 없음).
+ * UPDATE·DELETE는 SET 값을 검증하고, 대상을 SELECT와 같은 경로로 센 뒤, 대상이 있으면 파일을 다시 쓴다
+ * (table_rewrite). 0행이면 파일을 건드리지 않고 on_change(kind, 0)을 부른다.
  */
 int executor_run(Table *t, const Statement *st, const ResultSink *sink, DbError *err);
 

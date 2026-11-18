@@ -90,6 +90,9 @@ static void print_timing_stmt(long stmt_no, const Statement *st, const ExecStats
     fflush(stdout);
     if (st->kind == STMT_INSERT) {
         fprintf(stderr, "[측정] 문장 %ld: %.4f ms, 추가 1행\n", stmt_no, es->elapsed_ms);
+    } else if (st->kind == STMT_UPDATE || st->kind == STMT_DELETE) {
+        fprintf(stderr, "[측정] 문장 %ld: %.4f ms, %s %" PRId64 "행\n", stmt_no, es->elapsed_ms,
+                st->kind == STMT_UPDATE ? "수정" : "삭제", es->rows_returned);
     } else if (st->explain) {
         fprintf(stderr, "[측정] 문장 %ld: %.4f ms, 계획만\n", stmt_no, es->elapsed_ms);
     } else {
@@ -161,6 +164,13 @@ static int print_insert(int64_t id, void *ctx) {
     return printf("INSERT 1\n") < 0 ? -1 : 0;
 }
 
+/* UPDATE n / DELETE n: 조건에 맞은 행 수 (DB-P4-D06) */
+static int print_change(StmtKind kind, int64_t count, void *ctx) {
+    ExecStats *es = ctx;
+    es->rows_returned = count;
+    return printf("%s %" PRId64 "\n", kind == STMT_UPDATE ? "UPDATE" : "DELETE", count) < 0 ? -1 : 0;
+}
+
 static int print_row(const Row *row, void *ctx) {
     ExecStats *es = ctx;
     es->rows_returned++;
@@ -207,7 +217,7 @@ int main(int argc, char **argv) {
     size_t pos = 0;
     Db *db = NULL;
     ExecStats es = {0.0, 0};
-    ResultSink sink = {print_insert, print_row, NULL, print_plan};
+    ResultSink sink = {print_insert, print_row, NULL, print_plan, print_change};
     long stmt_no = 0;
     int status = 0;
     int timing = 0;
@@ -270,7 +280,7 @@ int main(int argc, char **argv) {
     sink.ctx = &es;
 
     /* 문장을 순서대로 실행하고, 하나라도 실패하면 즉시 멈춘다(fail-fast).
-     * 앞서 성공한 INSERT는 이미 파일에 있으므로 유지된다. */
+     * 앞서 성공한 INSERT·UPDATE·DELETE는 이미 파일에 있으므로 유지된다. */
     for (;;) {
         Statement st;
         int r;

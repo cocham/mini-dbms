@@ -10,7 +10,7 @@
 /*
  * 엔진 잠금 (Phase 3, DB-P3-D05). P3-04부터 읽기·쓰기 잠금(rwlock) 하나다.
  *   SELECT·EXPLAIN, db_state, db_stats → 공유(읽기) 잠금: 여러 개가 동시에 들어간다
- *   INSERT                              → 배타(쓰기) 잠금: 혼자 들어가고, 그동안 읽기도 기다린다
+ *   INSERT·UPDATE·DELETE                → 배타(쓰기) 잠금: 혼자 들어가고, 그동안 읽기도 기다린다
  * 읽기끼리 동시에 돌 수 있는 것은 조회 경로가 공유 상태를 쓰지 않기 때문이다(storage.c의 pread 읽기,
  * file_size 스냅숏). 잠금은 이것 하나이고, 그 안에서 다른 잠금을 잡지 않는다(spec C7).
  *
@@ -88,15 +88,17 @@ int db_open(const char *data_dir, Db **out, DbError *err) {
 }
 
 static const char *halt_reason(DbState s) {
-    return s == DB_HALTED_INDEX
-               ? "인덱스 등록 실패 이후. 재시작하면 파일에서 인덱스를 다시 만듭니다"
-               : "데이터 파일 쓰기 실패 이후. 파일 끝이 손상됐을 수 있어 재시작 전에 확인이 필요합니다";
+    switch (s) {
+    case DB_HALTED_INDEX: return "인덱스 등록 실패 이후. 재시작하면 파일에서 인덱스를 다시 만듭니다";
+    case DB_HALTED_REOPEN: return "데이터 파일을 바꾼 뒤 다시 열지 못함. 파일은 온전하며 재시작하면 복원됩니다";
+    default: return "데이터 파일 쓰기 실패 이후. 파일 끝이 손상됐을 수 있어 재시작 전에 확인이 필요합니다";
+    }
 }
 
 int db_exec(Db *db, const Statement *st, const ResultSink *sink, int64_t *stored_id, DbError *err) {
     DbError local = {{0}, DBE_NONE};
     DbError *e = err != NULL ? err : &local; /* 종류를 보고 상태를 바꿔야 하므로 err가 NULL이어도 받는다 */
-    int writer = st->kind == STMT_INSERT && !st->explain;
+    int writer = st->kind != STMT_SELECT; /* INSERT·UPDATE·DELETE는 배타 잠금 (DB-P4-D08) */
     int rc;
 
     if (stored_id != NULL) {
@@ -115,8 +117,12 @@ int db_exec(Db *db, const Statement *st, const ResultSink *sink, int64_t *stored
         return -1;
     }
     rc = executor_run(db->table, st, sink, e);
-    /* 상태를 바꾸는 실패(INDEX_FAILED·WRITE_FAILED)는 INSERT에서만 나오므로 항상 배타 잠금 안이다 */
+    /* 상태를 바꾸는 실패(INSERT의 INDEX_FAILED·WRITE_FAILED, Windows UPDATE·DELETE의 REOPEN_FAILED)는
+       쓰기 문장에서만 나오므로 항상 배타 잠금 안이다. UPDATE·DELETE의 다른 실패는 원래 상태가 남아 그대로 둔다 */
     if (rc != 0 && writer) {
+        if (e->kind == DBE_REOPEN_FAILED) {
+            db->state = DB_HALTED_REOPEN;
+        }
         if (e->kind == DBE_INDEX_FAILED) {
             db->state = DB_HALTED_INDEX;
             if (stored_id != NULL) {

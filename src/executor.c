@@ -30,14 +30,14 @@ void executor_plan_condition(const QueryPlan *plan, char *buf, size_t cap) {
     }
 }
 
-static int validate_insert(const Statement *st, DbError *err) {
+static int validate_name(const char *name, DbError *err) {
     size_t n;
 
-    if (st->name == NULL) {
+    if (name == NULL) {
         db_error_setk(err, DBE_SQL, "name 값이 없습니다");
         return -1;
     }
-    n = strlen(st->name);
+    n = strlen(name);
     if (n == 0) {
         db_error_setk(err, DBE_SQL, "name은 빈 문자열일 수 없습니다");
         return -1;
@@ -46,13 +46,31 @@ static int validate_insert(const Statement *st, DbError *err) {
         db_error_setk(err, DBE_SQL, "name이 %d바이트를 넘습니다 (%u바이트)", NAME_MAX_BYTES, (unsigned)n);
         return -1;
     }
-    if (strpbrk(st->name, "\t\r\n") != NULL) {
+    if (strpbrk(name, "\t\r\n") != NULL) {
         db_error_setk(err, DBE_SQL, "name에 탭이나 줄바꿈을 넣을 수 없습니다");
         return -1;
     }
-    if (st->age < AGE_MIN || st->age > AGE_MAX) {
-        db_error_setk(err, DBE_SQL, "age 값 %d이(가) 허용 범위(%d~%d)를 벗어났습니다",
-                     st->age, AGE_MIN, AGE_MAX);
+    return 0;
+}
+
+static int validate_age(int age, DbError *err) {
+    if (age < AGE_MIN || age > AGE_MAX) {
+        db_error_setk(err, DBE_SQL, "age 값 %d이(가) 허용 범위(%d~%d)를 벗어났습니다", age, AGE_MIN, AGE_MAX);
+        return -1;
+    }
+    return 0;
+}
+
+static int validate_insert(const Statement *st, DbError *err) {
+    return validate_name(st->name, err) != 0 || validate_age(st->age, err) != 0 ? -1 : 0;
+}
+
+/* UPDATE의 SET 값: INSERT와 같은 규칙. SET에 없는 컬럼은 검사하지 않는다 */
+static int validate_update(const Statement *st, DbError *err) {
+    if ((st->set_cols & SET_COL_NAME) && validate_name(st->name, err) != 0) {
+        return -1;
+    }
+    if ((st->set_cols & SET_COL_AGE) && validate_age(st->age, err) != 0) {
         return -1;
     }
     return 0;
@@ -129,11 +147,8 @@ static int filter_row(const Row *row, void *ctx) {
     return f->next(row, f->next_ctx);
 }
 
-int executor_plan(const Table *t, const Statement *st, QueryPlan *out, DbError *err) {
-    if (st->kind != STMT_SELECT) {
-        db_error_setk(err, DBE_SQL, "실행 계획은 SELECT 문에만 만들 수 있습니다");
-        return -1;
-    }
+/* WHERE에 맞는 행을 찾는 경로. SELECT와 UPDATE·DELETE의 대상 찾기가 함께 쓴다 */
+static void build_plan(const Table *t, const Statement *st, QueryPlan *out) {
     /* 경로 선택 기준은 조건의 종류뿐이다. 값(where_value)이나 키 존재 여부는 보지 않는다. */
     switch (st->where) {
     case WHERE_ID: out->kind = PLAN_INDEX_LOOKUP; break;
@@ -147,6 +162,80 @@ int executor_plan(const Table *t, const Statement *st, QueryPlan *out, DbError *
     out->range = id_range_of(st);
     out->stats.tree_height = table_index_height(t);
     out->stats.total_rows = table_row_count(t);
+}
+
+int executor_plan(const Table *t, const Statement *st, QueryPlan *out, DbError *err) {
+    if (st->kind != STMT_SELECT) {
+        db_error_setk(err, DBE_SQL, "실행 계획은 SELECT 문에만 만들 수 있습니다");
+        return -1;
+    }
+    build_plan(t, st, out);
+    return 0;
+}
+
+/* plan이 고른 경로로 WHERE에 맞는 행을 하나씩 fn에 넘긴다 */
+static int run_where(Table *t, const Statement *st, const QueryPlan *plan, RowFn fn, void *ctx, DbError *err) {
+    FilterCtx f;
+
+    switch (plan->kind) {
+    case PLAN_INDEX_LOOKUP:
+        return table_find_by_id(t, st->where_value, fn, ctx, err);
+    case PLAN_INDEX_RANGE_SCAN:
+        if (plan->range.empty) {
+            return 0; /* 빈 범위: 트리도 파일도 보지 않는다 */
+        }
+        return table_find_id_range(t, plan->range.lo, plan->range.hi, fn, ctx, err);
+    case PLAN_FULL_SCAN:
+        f.st = st;
+        f.next = fn;
+        f.next_ctx = ctx;
+        return table_scan(t, filter_row, &f, err);
+    }
+    db_error_setk(err, DBE_SQL, "알 수 없는 실행 계획입니다");
+    return -1;
+}
+
+static int count_match(const Row *row, void *ctx) {
+    (void)row;
+    (*(int64_t *)ctx)++;
+    return 0;
+}
+
+static int pred_matches(const Row *row, void *ctx) { return row_matches(ctx, row); }
+
+/*
+ * UPDATE·DELETE (Phase 4, DB-P4-D01·D06)
+ *  1) SET 값 검증(INSERT와 같은 규칙). 실패하면 아무것도 바꾸지 않는다
+ *  2) 대상 세기: SELECT와 같은 경로(인덱스 조회·범위 조회·선형 탐색). 0행이면 파일을 다시 쓰지 않는다
+ *  3) 파일 다시 쓰기(table_rewrite): 원래 파일 전체를 훑으며 row_matches로 같은 행을 고르고 고치거나 지운다
+ * 2와 3이 같은 행을 고르는 것은 row_matches가 인덱스 경로와 같은 결과를 내기 때문이다(테스트에서 비교).
+ */
+static int run_change(Table *t, const Statement *st, const ResultSink *sink, DbError *err) {
+    QueryPlan plan;
+    int64_t n = 0;
+
+    if (st->kind == STMT_UPDATE && validate_update(st, err) != 0) {
+        return -1;
+    }
+    build_plan(t, st, &plan);
+    if (run_where(t, st, &plan, count_match, &n, err) != 0) {
+        return -1;
+    }
+    if (n > 0) {
+        RowUpdate upd;
+
+        upd.set_name = (st->set_cols & SET_COL_NAME) != 0;
+        upd.name = st->name;
+        upd.set_age = (st->set_cols & SET_COL_AGE) != 0;
+        upd.age = st->age;
+        if (table_rewrite(t, pred_matches, (void *)st, st->kind == STMT_UPDATE ? &upd : NULL, &n, err) != 0) {
+            return -1;
+        }
+    }
+    if (sink != NULL && sink->on_change != NULL && sink->on_change(st->kind, n, sink->ctx) != 0) {
+        db_error_setk(err, DBE_SINK, "결과 출력에 실패했습니다");
+        return -1;
+    }
     return 0;
 }
 
@@ -167,7 +256,6 @@ int executor_run(Table *t, const Statement *st, const ResultSink *sink, DbError 
     }
     case STMT_SELECT: {
         QueryPlan plan;
-        FilterCtx f;
 
         if (executor_plan(t, st, &plan, err) != 0) {
             return -1;
@@ -179,26 +267,11 @@ int executor_run(Table *t, const Statement *st, const ResultSink *sink, DbError 
             }
             return 0;
         }
-        switch (plan.kind) {
-        case PLAN_INDEX_LOOKUP:
-            return table_find_by_id(t, st->where_value, sink != NULL ? sink->on_row : NULL,
-                                    sink != NULL ? sink->ctx : NULL, err);
-        case PLAN_INDEX_RANGE_SCAN:
-            if (plan.range.empty) {
-                return 0; /* 빈 범위: 트리도 파일도 보지 않는다 */
-            }
-            return table_find_id_range(t, plan.range.lo, plan.range.hi,
-                                       sink != NULL ? sink->on_row : NULL,
-                                       sink != NULL ? sink->ctx : NULL, err);
-        case PLAN_FULL_SCAN:
-            f.st = st;
-            f.next = sink != NULL ? sink->on_row : NULL;
-            f.next_ctx = sink != NULL ? sink->ctx : NULL;
-            return table_scan(t, filter_row, &f, err);
-        }
-        db_error_setk(err, DBE_SQL, "알 수 없는 실행 계획입니다");
-        return -1;
+        return run_where(t, st, &plan, sink != NULL ? sink->on_row : NULL, sink != NULL ? sink->ctx : NULL, err);
     }
+    case STMT_UPDATE:
+    case STMT_DELETE:
+        return run_change(t, st, sink, err);
     }
     db_error_setk(err, DBE_SQL, "알 수 없는 문장 종류입니다");
     return -1;
