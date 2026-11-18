@@ -10,7 +10,7 @@
 /*
  * 엔진 잠금 (Phase 3, DB-P3-D05). P3-04부터 읽기·쓰기 잠금(rwlock) 하나다.
  *   SELECT·EXPLAIN, db_state, db_stats → 공유(읽기) 잠금: 여러 개가 동시에 들어간다
- *   INSERT                              → 배타(쓰기) 잠금: 혼자 들어가고, 그동안 읽기도 기다린다
+ *   INSERT·UPDATE·DELETE                → 배타(쓰기) 잠금: 혼자 들어가고, 그동안 읽기도 기다린다
  * 읽기끼리 동시에 돌 수 있는 것은 조회 경로가 공유 상태를 쓰지 않기 때문이다(storage.c의 pread 읽기,
  * file_size 스냅숏). 잠금은 이것 하나이고, 그 안에서 다른 잠금을 잡지 않는다(spec C7).
  *
@@ -96,7 +96,7 @@ static const char *halt_reason(DbState s) {
 int db_exec(Db *db, const Statement *st, const ResultSink *sink, int64_t *stored_id, DbError *err) {
     DbError local = {{0}, DBE_NONE};
     DbError *e = err != NULL ? err : &local; /* 종류를 보고 상태를 바꿔야 하므로 err가 NULL이어도 받는다 */
-    int writer = st->kind == STMT_INSERT && !st->explain;
+    int writer = st->kind != STMT_SELECT; /* INSERT·UPDATE·DELETE는 배타 잠금 (DB-P4-D08) */
     int rc;
 
     if (stored_id != NULL) {

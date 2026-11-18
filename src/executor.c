@@ -199,6 +199,12 @@ int executor_run(Table *t, const Statement *st, const ResultSink *sink, DbError 
         db_error_setk(err, DBE_SQL, "알 수 없는 실행 계획입니다");
         return -1;
     }
+    case STMT_UPDATE:
+    case STMT_DELETE:
+        /* P4-01은 문법까지만. 실행(파일 다시 쓰기)은 P4-02에서 붙인다. 아무것도 바꾸지 않는다. */
+        db_error_setk(err, DBE_SQL, "%s 문은 아직 실행을 지원하지 않습니다",
+                      st->kind == STMT_UPDATE ? "UPDATE" : "DELETE");
+        return -1;
     }
     db_error_setk(err, DBE_SQL, "알 수 없는 문장 종류입니다");
     return -1;

@@ -402,6 +402,8 @@ static int handle_query(Server *s, int fd, const HttpRequest *req, size_t *nstmt
         if (st->kind == STMT_INSERT) {
             /* 결과를 쓸 자리가 없으면 실행하지 않는다: 저장된 INSERT가 응답에서 빠지지 않게 */
             prep = jb_reserve(&res, strlen(sep) + INSERT_RESULT_MAX) == 0 ? jb_lit(&res, sep) : -1;
+        } else if (st->kind == STMT_UPDATE || st->kind == STMT_DELETE) {
+            prep = jb_lit(&res, sep); /* P4-01: 실행 오류로 끝나므로 결과를 쓰지 않는다(JSON 결과는 P4-03) */
         } else if (!st->explain) {
             prep = (jb_lit(&res, sep) == 0 &&
                     jb_lit(&res, "{\"type\":\"select\",\"columns\":[\"id\",\"name\",\"age\"],\"rows\":[") == 0)

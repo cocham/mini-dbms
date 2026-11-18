@@ -262,7 +262,7 @@ static void test_parse_comment_errors(void) {
     EXPECT_PARSE_ERROR("/* 닫히지 않음", "블록 주석");
     EXPECT_PARSE_ERROR("SELECT * FROM users /* 세미콜론이 주석 안; ", "블록 주석");
     /* 중첩 미지원: 안쪽 닫는 기호에서 주석이 끝나 남은 닫는 기호가 SQL로 읽힌다. */
-    EXPECT_PARSE_ERROR("/* a /* b */ */ SELECT * FROM users;", "INSERT 또는 SELECT");
+    EXPECT_PARSE_ERROR("/* a /* b */ */ SELECT * FROM users;", "INSERT, SELECT, UPDATE 또는 DELETE");
     EXPECT_PARSE_ERROR("SELECT * FROM users -- 세미콜론이 주석 안;", "세미콜론");
     EXPECT_PARSE_ERROR("SELECT * FROM users / 1;", "알 수 없는 문자 '/'");
 }
@@ -340,8 +340,8 @@ static void test_parse_errors(void) {
     EXPECT_PARSE_ERROR("SELECT * FROM users", "세미콜론");
     EXPECT_PARSE_ERROR("INSERT INTO users (name, age) VALUES ('a', 1)", "세미콜론");
     EXPECT_PARSE_ERROR("SELECT * FROM users SELECT * FROM users;", "세미콜론");
-    EXPECT_PARSE_ERROR(";", "INSERT 또는 SELECT");
-    EXPECT_PARSE_ERROR("UPDATE users SET age = 1;", "INSERT 또는 SELECT");
+    EXPECT_PARSE_ERROR(";", "INSERT, SELECT, UPDATE 또는 DELETE");
+    EXPECT_PARSE_ERROR("UPDATE users SET age = 1;", "WHERE 조건이 필요");
     EXPECT_PARSE_ERROR("SELECT * FROM orders;", "테이블 'orders'");
     EXPECT_PARSE_ERROR("SELECT name FROM users;", "SELECT *");
     EXPECT_PARSE_ERROR("SELECT * users;", "FROM");
@@ -365,6 +365,110 @@ static void test_parse_errors(void) {
                        "범위");
     EXPECT_PARSE_ERROR("INSERT INTO users (name, age) VALUES ('a', 2147483648);", "범위");
     EXPECT_PARSE_ERROR("INSERT INTO users (name, age) VALUES ('a', 1.5);", "알 수 없는 문자");
+}
+
+/* ---------- Phase 4 / P4-01: UPDATE·DELETE 문법 ---------- */
+
+static void test_parse_update_delete(void) {
+    Statement st;
+    DbError err = {{0}, DBE_NONE};
+    const char *multi = "update USERS set AGE = 3 where ID = 1; Delete From users Where id > 5;";
+    size_t pos = 0;
+
+    /* SET 하나 */
+    CHECK(parse_one("UPDATE users SET age = 31 WHERE id = 3;", &st, &err) == 1);
+    CHECK(st.kind == STMT_UPDATE && st.set_cols == SET_COL_AGE && st.age == 31 && st.name == NULL);
+    CHECK(st.where == WHERE_ID && st.where_value == 3 && st.explain == 0);
+    statement_free(&st);
+
+    /* SET 둘(순서 무관), 문자열 이스케이프, age 조건 */
+    CHECK(parse_one("UPDATE users SET age = 40, name = 'O''Brien' WHERE age = 30;", &st, &err) == 1);
+    CHECK(st.kind == STMT_UPDATE && st.set_cols == (SET_COL_NAME | SET_COL_AGE));
+    CHECK(st.name != NULL && strcmp(st.name, "O'Brien") == 0 && st.age == 40);
+    CHECK(st.where == WHERE_AGE && st.where_value == 30);
+    statement_free(&st);
+
+    /* id 범위 조건, 주석·여러 줄 */
+    CHECK(parse_one("UPDATE users -- 주석\n SET name = 'Kim'\n WHERE id BETWEEN 10 AND 20;", &st, &err) == 1);
+    CHECK(st.set_cols == SET_COL_NAME && strcmp(st.name, "Kim") == 0);
+    CHECK(st.where == WHERE_ID_RANGE && st.where_op == CMP_BETWEEN && st.where_value == 10 &&
+          st.where_value2 == 20);
+    statement_free(&st);
+
+    /* DELETE: id =, 비교 연산자, age = */
+    CHECK(parse_one("DELETE FROM users WHERE id = 7;", &st, &err) == 1);
+    CHECK(st.kind == STMT_DELETE && st.where == WHERE_ID && st.where_value == 7 && st.set_cols == 0 &&
+          st.name == NULL);
+    statement_free(&st);
+    CHECK(parse_one("DELETE FROM users WHERE id >= 1000;", &st, &err) == 1);
+    CHECK(st.kind == STMT_DELETE && st.where == WHERE_ID_RANGE && st.where_op == CMP_GE && st.where_value == 1000);
+    statement_free(&st);
+    CHECK(parse_one("DELETE FROM users WHERE age = 0;", &st, &err) == 1);
+    CHECK(st.kind == STMT_DELETE && st.where == WHERE_AGE && st.where_value == 0);
+    statement_free(&st);
+
+    /* 대소문자 무시, 한 입력에 여러 문장 */
+    CHECK(parser_next(multi, &pos, &st, &err) == 1 && st.kind == STMT_UPDATE && st.age == 3 && st.where_value == 1);
+    statement_free(&st);
+    CHECK(parser_next(multi, &pos, &st, &err) == 1 && st.kind == STMT_DELETE && st.where_op == CMP_GT);
+    statement_free(&st);
+    CHECK(parser_next(multi, &pos, &st, &err) == 0);
+
+    /* WHERE 필수 (DB-P4-D03) */
+    EXPECT_PARSE_ERROR("DELETE FROM users;", "DELETE에는 WHERE 조건이 필요");
+    EXPECT_PARSE_ERROR("UPDATE users SET name = 'x';", "UPDATE에는 WHERE 조건이 필요");
+    EXPECT_PARSE_ERROR("UPDATE users SET name = 'x'", "UPDATE에는 WHERE 조건이 필요");
+    EXPECT_PARSE_ERROR("DELETE FROM users LIMIT 1;", "WHERE");
+    /* SET 오류: 문자열이 할당된 뒤 실패해도 name이 남지 않는다(EXPECT_PARSE_ERROR가 확인) */
+    EXPECT_PARSE_ERROR("UPDATE users SET id = 5 WHERE id = 1;", "id는 바꿀 수 없습니다");
+    EXPECT_PARSE_ERROR("UPDATE users SET age = 1, age = 2 WHERE id = 1;", "중복");
+    EXPECT_PARSE_ERROR("UPDATE users SET name = 'a', NAME = 'b' WHERE id = 1;", "중복");
+    EXPECT_PARSE_ERROR("UPDATE users SET email = 'a' WHERE id = 1;", "컬럼 'email'");
+    EXPECT_PARSE_ERROR("UPDATE users WHERE id = 1;", "SET");
+    EXPECT_PARSE_ERROR("UPDATE users SET WHERE id = 1;", "컬럼 'WHERE'");
+    EXPECT_PARSE_ERROR("UPDATE users SET age 3 WHERE id = 1;", "'='");
+    EXPECT_PARSE_ERROR("UPDATE users SET age = 'x' WHERE id = 1;", "정수");
+    EXPECT_PARSE_ERROR("UPDATE users SET name = 3 WHERE id = 1;", "문자열");
+    EXPECT_PARSE_ERROR("UPDATE users SET age = 99999999999 WHERE id = 1;", "범위");
+    EXPECT_PARSE_ERROR("UPDATE users SET name = 'a', WHERE id = 1;", "컬럼 'WHERE'");
+    EXPECT_PARSE_ERROR("UPDATE users SET name = 'a', ;", "컬럼 이름");
+    EXPECT_PARSE_ERROR("UPDATE users SET name = 'a' WHERE name = 'b';", "id 또는 age");
+    EXPECT_PARSE_ERROR("UPDATE users SET name = 'a' WHERE id = 1 AND age = 2;", "하나만");
+    EXPECT_PARSE_ERROR("UPDATE orders SET age = 1 WHERE id = 1;", "테이블 'orders'");
+    EXPECT_PARSE_ERROR("UPDATE users SET age = 1 WHERE id = 1", "세미콜론");
+    EXPECT_PARSE_ERROR("DELETE users WHERE id = 1;", "FROM");
+    EXPECT_PARSE_ERROR("DELETE FROM users WHERE age > 3;", "'=' 비교만");
+    /* EXPLAIN은 SELECT에만 */
+    EXPECT_PARSE_ERROR("EXPLAIN UPDATE users SET age = 1 WHERE id = 1;", "EXPLAIN은 SELECT 문에만");
+    EXPECT_PARSE_ERROR("EXPLAIN DELETE FROM users WHERE id = 1;", "EXPLAIN은 SELECT 문에만");
+}
+
+static int count_row(const Row *row, void *ctx);
+
+/* P4-01: UPDATE·DELETE는 파싱되지만 실행은 아직 지원하지 않는다. 아무것도 바뀌지 않는다. */
+static void test_executor_update_delete_not_yet(void) {
+    const char *dir = fresh_dir("p4_not_yet");
+    Table *t = NULL;
+    DbError err = {{0}, DBE_NONE};
+    Statement st;
+    int n = 0;
+    int64_t id;
+    ResultSink sink = {NULL, NULL, NULL, NULL};
+
+    CHECK(table_open(dir, &t, &err) == 0);
+    if (t == NULL) {
+        return;
+    }
+    CHECK(table_append(t, "a", 1, &id, &err) == 0);
+    CHECK(parse_one("UPDATE users SET age = 2 WHERE id = 1;", &st, &err) == 1);
+    err.kind = DBE_NONE;
+    CHECK(executor_run(t, &st, &sink, &err) == -1 && err.kind == DBE_SQL && strstr(err.msg, "UPDATE") != NULL);
+    statement_free(&st);
+    CHECK(parse_one("DELETE FROM users WHERE id = 1;", &st, &err) == 1);
+    CHECK(executor_run(t, &st, &sink, &err) == -1 && strstr(err.msg, "DELETE") != NULL);
+    statement_free(&st);
+    CHECK(table_scan(t, count_row, &n, &err) == 0 && n == 1);
+    CHECK(table_close(t, &err) == 0);
 }
 
 static void test_parse_explain(void) {
@@ -402,7 +506,7 @@ static void test_parse_explain_errors(void) {
     EXPECT_PARSE_ERROR("EXPLAIN;", "EXPLAIN 뒤에 SELECT");
     EXPECT_PARSE_ERROR("EXPLAIN", "EXPLAIN 뒤에 SELECT");
     EXPECT_PARSE_ERROR("EXPLAIN EXPLAIN SELECT * FROM users;", "EXPLAIN 뒤에 SELECT");
-    EXPECT_PARSE_ERROR("EXPLAIN UPDATE users SET age = 1;", "EXPLAIN 뒤에 SELECT");
+    EXPECT_PARSE_ERROR("EXPLAIN UPDATE users SET age = 1;", "SELECT 문에만"); /* Phase 4: UPDATE도 EXPLAIN 불가 */
     EXPECT_PARSE_ERROR("SELECT EXPLAIN * FROM users;", "SELECT *");
     /* EXPLAIN 뒤 SELECT의 오류 규칙은 일반 SELECT와 같다 */
     EXPECT_PARSE_ERROR("EXPLAIN SELECT * FROM users", "세미콜론");
@@ -645,7 +749,7 @@ static int count_insert(int64_t id, void *ctx) {
 
 static void expect_exec_error(Table *t, const char *name, int age, const char *needle) {
     char buf[300];
-    Statement st = {STMT_INSERT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0};
+    Statement st = {STMT_INSERT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0, 0};
     DbError err = {{0}, DBE_NONE};
 
     snprintf(buf, sizeof buf, "%s", name);
@@ -686,7 +790,7 @@ static void test_executor_validation(void) {
 
     /* 경계값은 성공한다. */
     {
-        Statement st = {STMT_INSERT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0};
+        Statement st = {STMT_INSERT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0, 0};
         int64_t last = 0;
         ResultSink sink = {count_insert, NULL, &last, NULL};
 
@@ -709,8 +813,8 @@ static void test_executor_insert_select(void) {
     int64_t last = 0;
     char kim[] = "kim";
     char lee[] = "lee";
-    Statement ins = {STMT_INSERT, kim, 20, WHERE_NONE, 0, 0, CMP_EQ, 0};
-    Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0};
+    Statement ins = {STMT_INSERT, kim, 20, WHERE_NONE, 0, 0, CMP_EQ, 0, 0};
+    Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0, 0};
     ResultSink sink;
 
     memset(&c, 0, sizeof c);
@@ -736,7 +840,7 @@ static void test_executor_insert_select(void) {
 
 /* WHERE 조건으로 조회한 id 목록을 ids에 담고 개수를 돌려준다. */
 static int select_where(Table *t, WhereKind kind, int64_t value, int64_t *ids) {
-    Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0};
+    Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0, 0};
     ResultSink sink = {NULL, collect_row, NULL, NULL};
     DbError err = {{0}, DBE_NONE};
     Collected c;
@@ -809,9 +913,9 @@ static void test_executor_id_uses_index_age_scans(void) {
     const char good[] = "1\ta\t25\n2\tb\t30\n";
     Table *t = NULL;
     DbError err = {{0}, DBE_NONE};
-    Statement by_id = {STMT_SELECT, NULL, 0, WHERE_ID, 1, 0, CMP_EQ, 0};
-    Statement by_id2 = {STMT_SELECT, NULL, 0, WHERE_ID, 2, 0, CMP_EQ, 0};
-    Statement by_age = {STMT_SELECT, NULL, 0, WHERE_AGE, 25, 0, CMP_EQ, 0};
+    Statement by_id = {STMT_SELECT, NULL, 0, WHERE_ID, 1, 0, CMP_EQ, 0, 0};
+    Statement by_id2 = {STMT_SELECT, NULL, 0, WHERE_ID, 2, 0, CMP_EQ, 0, 0};
+    Statement by_age = {STMT_SELECT, NULL, 0, WHERE_AGE, 25, 0, CMP_EQ, 0, 0};
     Collected c;
     ResultSink sink = {NULL, collect_row, NULL, NULL};
 
@@ -863,8 +967,8 @@ static void test_executor_plan_paths_and_stats(void) {
     const char *dir = fresh_dir("exec_plan");
     Table *t = NULL;
     DbError err = {{0}, DBE_NONE};
-    Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0};
-    Statement ins = {STMT_INSERT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0};
+    Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0, 0};
+    Statement ins = {STMT_INSERT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0, 0};
     QueryPlan plan;
     char name[] = "a";
     int i;
@@ -923,9 +1027,9 @@ static void test_executor_explain_does_not_execute(void) {
     const char good[] = "1\ta\t25\n2\tb\t30\n";
     Table *t = NULL;
     DbError err = {{0}, DBE_NONE};
-    Statement ex_age = {STMT_SELECT, NULL, 0, WHERE_AGE, 25, 1, CMP_EQ, 0};
-    Statement ex_id = {STMT_SELECT, NULL, 0, WHERE_ID, 2, 1, CMP_EQ, 0};
-    Statement sel_age = {STMT_SELECT, NULL, 0, WHERE_AGE, 25, 0, CMP_EQ, 0};
+    Statement ex_age = {STMT_SELECT, NULL, 0, WHERE_AGE, 25, 1, CMP_EQ, 0, 0};
+    Statement ex_id = {STMT_SELECT, NULL, 0, WHERE_ID, 2, 1, CMP_EQ, 0, 0};
+    Statement sel_age = {STMT_SELECT, NULL, 0, WHERE_AGE, 25, 0, CMP_EQ, 0, 0};
     Collected c;
     PlanCapture pc;
     ResultSink sink = {NULL, row_must_not_be_called, NULL, capture_plan};
@@ -966,7 +1070,7 @@ static void test_executor_explain_does_not_execute(void) {
 
 /* 범위 조회 결과(id 목록)를 out에 담고 개수를 돌려준다. 실패하면 -1. */
 static int select_range(Table *t, CmpOp op, int64_t v1, int64_t v2, int64_t *out, int cap) {
-    Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 0, 0, CMP_EQ, 0};
+    Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 0, 0, CMP_EQ, 0, 0};
     ResultSink sink = {NULL, collect_row, NULL, NULL};
     DbError err = {{0}, DBE_NONE};
     Collected c;
@@ -993,7 +1097,7 @@ static void test_executor_id_range(void) {
     DbError err = {{0}, DBE_NONE};
     int64_t ids[8];
     QueryPlan plan;
-    Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 2, 0, CMP_BETWEEN, 5};
+    Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 2, 0, CMP_BETWEEN, 5, 0};
 
     write_file(dir, data, sizeof data - 1); /* 4, 7, 8이 빠진 파일 */
     CHECK(table_open(dir, &t, &err) == 0);
@@ -1101,9 +1205,9 @@ static void test_executor_range_reads_only_inside(void) {
     const char good[] = "1\ta\t25\n2\tb\t30\n";
     Table *t = NULL;
     DbError err = {{0}, DBE_NONE};
-    Statement r11 = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 1, 0, CMP_BETWEEN, 1};
-    Statement r12 = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 1, 0, CMP_BETWEEN, 2};
-    Statement empty = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 2, 0, CMP_BETWEEN, 1};
+    Statement r11 = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 1, 0, CMP_BETWEEN, 1, 0};
+    Statement r12 = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 1, 0, CMP_BETWEEN, 2, 0};
+    Statement empty = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 2, 0, CMP_BETWEEN, 1, 0};
     Collected c;
     ResultSink sink = {NULL, collect_row, NULL, NULL};
 
@@ -1662,13 +1766,13 @@ static int remember_id(int64_t id, void *ctx) {
 }
 
 static int db_insert(Db *db, const char *name, int age, int64_t *out_id, int64_t *stored, DbError *err) {
-    Statement st = {STMT_INSERT, (char *)name, age, WHERE_NONE, 0, 0, CMP_EQ, 0};
+    Statement st = {STMT_INSERT, (char *)name, age, WHERE_NONE, 0, 0, CMP_EQ, 0, 0};
     ResultSink sink = {remember_id, NULL, out_id, NULL};
     return db_exec(db, &st, &sink, stored, err);
 }
 
 static int db_count(Db *db, WhereKind where, int64_t v, DbError *err) {
-    Statement st = {STMT_SELECT, NULL, 0, where, v, 0, CMP_EQ, 0};
+    Statement st = {STMT_SELECT, NULL, 0, where, v, 0, CMP_EQ, 0, 0};
     int n = 0;
     ResultSink sink = {NULL, count_row, &n, NULL};
     return db_exec(db, &st, &sink, NULL, err) == 0 ? n : -1;
@@ -1694,13 +1798,13 @@ static void test_db_exec_basic_and_kinds(void) {
     CHECK(db_state(db) == DB_OK);
     /* INSERT에 EXPLAIN 계획 요청 같은 엔진 쪽 문장 오류도 DBE_SQL */
     {
-        Statement st = {STMT_INSERT, (char *)"x", 1, WHERE_NONE, 0, 1, CMP_EQ, 0};
+        Statement st = {STMT_INSERT, (char *)"x", 1, WHERE_NONE, 0, 1, CMP_EQ, 0, 0};
         QueryPlan plan;
         CHECK(executor_plan(NULL, &st, &plan, &err) == -1 && err.kind == DBE_SQL);
     }
     /* 결과 콜백 실패: DBE_SINK */
     {
-        Statement st = {STMT_SELECT, NULL, 0, WHERE_ID, 1, 0, CMP_EQ, 0};
+        Statement st = {STMT_SELECT, NULL, 0, WHERE_ID, 1, 0, CMP_EQ, 0, 0};
         Collected c;
         ResultSink sink = {NULL, collect_row, &c, NULL};
         c.count = 0;
@@ -1741,7 +1845,7 @@ static void test_db_halt_after_index_failure(void) {
 
     /* 중단 상태: 조회도 INSERT도 실행하지 않는다 */
     {
-        Statement st = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0};
+        Statement st = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0, 0};
         ResultSink sink = {NULL, count_row, &n, NULL};
         CHECK(db_exec(db, &st, &sink, &stored, &err) == -1);
         CHECK(err.kind == DBE_HALTED && stored == 0 && n == 0);
@@ -1753,7 +1857,7 @@ static void test_db_halt_after_index_failure(void) {
     /* 파일은 온전하므로 재시작하면 64번이 인덱스로 보인다. "after"는 없다 */
     CHECK(db_open(dir, &db, &err) == 0);
     {
-        Statement st = {STMT_SELECT, NULL, 0, WHERE_ID, 64, 0, CMP_EQ, 0};
+        Statement st = {STMT_SELECT, NULL, 0, WHERE_ID, 64, 0, CMP_EQ, 0, 0};
         ResultSink sink = {NULL, collect_row, &c, NULL};
         c.count = 0;
         c.stop_after = 0;
@@ -1869,7 +1973,7 @@ static void *ct_worker(void *arg) {
             char name[32];
             int64_t id = 0;
             SeqCheck sc = {0, 0, 0, NULL};
-            Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID, 0, 0, CMP_EQ, 0};
+            Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID, 0, 0, CMP_EQ, 0, 0};
             ResultSink rs = {NULL, seq_row, &sc, NULL};
 
             snprintf(name, sizeof name, "t%d_%d", cs->tid, op);
@@ -1895,7 +1999,7 @@ static void *ct_worker(void *arg) {
         } else if (k < 60) {
             int64_t x;
             SeqCheck sc = {0, 0, 0, NULL};
-            Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID, 0, 0, CMP_EQ, 0};
+            Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID, 0, 0, CMP_EQ, 0, 0};
             ResultSink rs = {NULL, seq_row, &sc, NULL};
 
             if (known_max == 0) {
@@ -1912,7 +2016,7 @@ static void *ct_worker(void *arg) {
         } else if (k < 80) {
             int64_t a, b, want;
             SeqCheck sc = {0, 0, 0, NULL};
-            Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 0, 0, CMP_BETWEEN, 0};
+            Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 0, 0, CMP_BETWEEN, 0, 0};
             ResultSink rs = {NULL, seq_row, &sc, NULL};
 
             if (known_max == 0) {
@@ -1931,7 +2035,7 @@ static void *ct_worker(void *arg) {
             }
         } else if (k < 90) {
             SeqCheck sc = {1, 0, 0, NULL};
-            Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0};
+            Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0, 0};
             ResultSink rs = {NULL, seq_row, &sc, NULL};
 
             if (db_exec(cs->db, &sel, &rs, NULL, &err) != 0) {
@@ -1943,7 +2047,7 @@ static void *ct_worker(void *arg) {
             }
         } else {
             PlanSeen ps = {-1};
-            Statement sel = {STMT_SELECT, NULL, 0, WHERE_AGE, 30, 1, CMP_EQ, 0};
+            Statement sel = {STMT_SELECT, NULL, 0, WHERE_AGE, 30, 1, CMP_EQ, 0, 0};
             ResultSink rs = {NULL, NULL, &ps, plan_seen};
 
             if (db_exec(cs->db, &sel, &rs, NULL, &err) != 0) {
@@ -2036,7 +2140,7 @@ static void test_db_concurrent_correctness(void) {
     /* 각 id가 그 id를 받은 스레드가 넣은 이름을 가리킨다 (인덱스 → 위치 → 줄) */
     for (i = 0; i < CT_THREADS; i++) {
         for (j = 0; j < st[i].n_ins; j++) {
-            Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID, st[i].ids[j], 0, CMP_EQ, 0};
+            Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID, st[i].ids[j], 0, CMP_EQ, 0, 0};
             Collected c;
             ResultSink rs = {NULL, collect_row, &c, NULL};
 
@@ -2058,7 +2162,7 @@ static void test_db_concurrent_correctness(void) {
     CHECK(db_open(dir, &db, &err) == 0);
     {
         FinalCheck f = {0, 1, 0, total, names};
-        Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0};
+        Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0, 0};
         ResultSink rs = {NULL, final_row, &f, NULL};
         CHECK(db_exec(db, &sel, &rs, NULL, &err) == 0);
         CHECK(f.count == total && !f.broken);
@@ -2321,7 +2425,7 @@ static int probe_row(const Row *row, void *ctx) {
 
 static void *probe_reader(void *arg) {
     LockProbe *p = arg;
-    Statement st = {STMT_SELECT, NULL, 0, WHERE_ID, 1, 0, CMP_EQ, 0};
+    Statement st = {STMT_SELECT, NULL, 0, WHERE_ID, 1, 0, CMP_EQ, 0, 0};
     ResultSink rs = {NULL, probe_row, p, NULL};
     DbError err = {{0}, DBE_NONE};
     db_exec(p->db, &st, &rs, NULL, &err);
@@ -2440,7 +2544,7 @@ static int wf_r2_row(const Row *row, void *ctx) {
 
 static void *wf_reader(void *arg, RowFn fn) {
     WriterFirst *p = arg;
-    Statement st = {STMT_SELECT, NULL, 0, WHERE_ID, 1, 0, CMP_EQ, 0};
+    Statement st = {STMT_SELECT, NULL, 0, WHERE_ID, 1, 0, CMP_EQ, 0, 0};
     ResultSink rs = {NULL, fn, p, NULL};
     DbError err = {{0}, DBE_NONE};
     db_exec(p->db, &st, &rs, NULL, &err);
@@ -2461,7 +2565,7 @@ static int wf_on_insert(int64_t id, void *ctx) { /* 엔진 잠금 안에서 불�
 
 static void *wf_w(void *arg) {
     WriterFirst *p = arg;
-    Statement st = {STMT_INSERT, "w", 1, WHERE_NONE, 0, 0, CMP_EQ, 0};
+    Statement st = {STMT_INSERT, "w", 1, WHERE_NONE, 0, 0, CMP_EQ, 0, 0};
     ResultSink rs = {wf_on_insert, NULL, p, NULL};
     DbError err = {{0}, DBE_NONE};
     db_exec(p->db, &st, &rs, NULL, &err);
@@ -2658,6 +2762,8 @@ int main(int argc, char **argv) {
     test_parse_where_errors();
     test_parse_next_statement_error_isolated();
     test_parse_errors();
+    test_parse_update_delete();
+    test_executor_update_delete_not_yet();
     test_parse_explain();
     test_parse_explain_errors();
     test_parse_id_range();

@@ -413,6 +413,26 @@ def usage_and_start_errors():
     eq(code, 1, "시작 실패: " + err)
 
 
+# ---------- UPDATE·DELETE 문법 (P4-01) ----------
+
+@test
+def update_delete_syntax_and_not_yet():
+    with Server(fresh("p4_syntax")) as s:
+        # WHERE 없는 DELETE는 구문 오류 → 같은 요청의 앞 INSERT도 실행되지 않는다(전체 선파싱)
+        st, r = query(s.port, ins("a", 1) + "DELETE FROM users;")
+        eq((st, r["error"]["statement"], r["error"]["code"], r["results"]), (400, 2, "SQL_SYNTAX", []))
+        ok("WHERE 조건이 필요" in r["error"]["message"], r["error"]["message"])
+        st, r = query(s.port, "SELECT * FROM users;")
+        eq(r["results"][0]["rows"], [], "아무것도 저장되지 않음")
+        # 문법은 통과하지만 실행은 아직: 앞 INSERT는 실행되고 UPDATE에서 실행 오류
+        st, r = query(s.port, ins("a", 1) + "UPDATE users SET age = 2 WHERE id = 1;" + ins("b", 2))
+        eq((st, r["error"]["statement"], r["error"]["code"]), (400, 2, "SQL_ERROR"))
+        ok("아직 실행을 지원하지 않습니다" in r["error"]["message"], r["error"]["message"])
+        eq(r["results"], [{"type": "insert", "id": 1}])
+        st, r = query(s.port, "SELECT * FROM users;")
+        eq(r["results"][0]["rows"], [[1, "a", 1]], "UPDATE 무변경, 뒤 INSERT 미실행")
+
+
 # ---------- 스레드 풀 · 큐 · 기한 · 종료 (P3-03) ----------
 
 def cli_rows(d):

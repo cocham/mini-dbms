@@ -264,7 +264,7 @@ A5_CASES = [
     ("SELECT * FROM users WHERE id = 1 AND age = 1;", "AND/OR"),
     ("SELECT * FROM users WHERE id = 9223372036854775808;", "64비트"),
     ("SELECT * FROM users WHERE id = 1", "세미콜론"),
-    ("DELETE FROM users;", "INSERT 또는 SELECT"),
+    ("DELETE FROM users;", "WHERE 조건이 필요"),
 ]
 
 
@@ -765,6 +765,31 @@ def p2_random_model(env):
             expected += HEADER + rows(pred)
         expect_ok(env.run("\n".join(stmts)), expected)
     eq(env.data(), rows(lambda r: True), "최종 파일")
+
+
+# ---------- Phase 4 / P4-01: UPDATE·DELETE 문법 ----------
+
+@test
+def p4_update_delete_parse_but_not_executed_yet(env):
+    expect_ok(env.run("INSERT INTO users (name, age) VALUES ('a', 1);"), b"INSERT 1\n")
+    # 문법은 통과하지만 실행은 아직 지원하지 않는다: 실행 오류, 파일은 그대로
+    expect_fail(env.run("UPDATE users SET age = 2 WHERE id = 1;"), "문장 1", "UPDATE 문은 아직 실행을 지원하지 않습니다")
+    expect_fail(env.run("DELETE FROM users WHERE id = 1;"), "문장 1", "DELETE 문은 아직 실행을 지원하지 않습니다")
+    eq(env.data(), b"1\ta\t1\n", "파일 그대로")
+
+
+@test
+def p4_update_delete_syntax_errors(env):
+    cases = [
+        ("UPDATE users SET name = 'x';", "UPDATE에는 WHERE 조건이 필요"),
+        ("DELETE FROM users;", "DELETE에는 WHERE 조건이 필요"),
+        ("UPDATE users SET id = 5 WHERE id = 1;", "id는 바꿀 수 없습니다"),
+        ("UPDATE users SET age = 1, age = 2 WHERE id = 1;", "중복"),
+        ("EXPLAIN DELETE FROM users WHERE id = 1;", "EXPLAIN은 SELECT 문에만"),
+    ]
+    for sql, needle in cases:
+        expect_fail(env.run(sql), "문장 1", needle)
+        eq(env.data(), b"", "실패 후 저장 파일 (%s)" % sql[:40])
 
 
 @test
