@@ -457,6 +457,23 @@ def update_delete_json_results():
 
 
 @test
+def retried_delete_can_hit_rows_added_in_between():
+    # spec "실패와 재시도": 같은 DELETE를 다시 보내는 것은 안전하지 않다. 사이에 들어온 행도 지우고 행 수도 달라진다
+    with Server(fresh("p4_retry")) as s:
+        query(s.port, ins("lee", 30) + ins("park", 30) + ins("kim", 25))
+        st, r = query(s.port, "DELETE FROM users WHERE age = 30;")
+        eq(r["results"], [{"type": "delete", "count": 2}])
+        st, r = query(s.port, ins("new", 30))  # 다른 클라이언트
+        eq(r["results"], [{"type": "insert", "id": 4}])
+        st, r = query(s.port, "DELETE FROM users WHERE age = 30; SELECT * FROM users;")
+        eq(r["results"][0], {"type": "delete", "count": 1}, "재시도가 새 행을 지움")
+        eq(r["results"][1]["rows"], [[3, "kim", 25]])
+        # 사이에 쓰기가 없으면 데이터는 같지만 행 수는 다르다(0)
+        st, r = query(s.port, "DELETE FROM users WHERE age = 30;")
+        eq(r["results"], [{"type": "delete", "count": 0}])
+
+
+@test
 def update_result_space_reserved_before_execution():
     # INSERT처럼 결과 자리를 먼저 확보한다: 응답에 빠진 UPDATE는 실행되지 않았다
     with Server(fresh("p4_reserve"), "--max-response", "4096") as s:

@@ -2771,7 +2771,7 @@ static int file_exists(const char *dir, const char *name) {
     return 1;
 }
 
-static void write_named(const char *dir, const char *name, const char *data) {
+static void write_named_n(const char *dir, const char *name, const char *data, size_t len) {
     char path[600];
     FILE *fp;
 
@@ -2781,8 +2781,27 @@ static void write_named(const char *dir, const char *name, const char *data) {
         fprintf(stderr, "테스트 파일 생성 실패: %s\n", path);
         exit(2);
     }
-    fwrite(data, 1, strlen(data), fp);
+    fwrite(data, 1, len, fp);
     fclose(fp);
+}
+
+static void write_named(const char *dir, const char *name, const char *data) {
+    write_named_n(dir, name, data, strlen(data));
+}
+
+/* 파일 바이트 전체를 buf에 읽는다(NUL 포함). 읽은 길이, 없으면 0 */
+static size_t read_named_n(const char *dir, const char *name, char *buf, size_t cap) {
+    char path[600];
+    FILE *fp;
+    size_t n = 0;
+
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    fp = fopen(path, "rb");
+    if (fp != NULL) {
+        n = fread(buf, 1, cap, fp);
+        fclose(fp);
+    }
+    return n;
 }
 
 static void read_named(const char *dir, const char *name, char *buf, size_t cap) {
@@ -2961,8 +2980,15 @@ static void test_p4_update_validation(void) {
 
 /* D3: 가장 큰 id를 지워도 다음 id는 줄지 않는다. 재시작해도 같다(users.next, DB-P4-D04) */
 static void test_p4_next_id(void) {
-    static const char *const bad_next[] = {"abc\n", "3", "0\n", "", "03\n", "-1\n", "3\n4\n",
-                                           "99999999999999999999\n"};
+    /* 길이를 함께 적는다: 내장 NUL("1\0" + "00\n")은 C 문자열로 표현할 수 없다 (Codex 재현 31 00 30 30 0a) */
+    static const struct {
+        const char *bytes;
+        size_t len;
+    } bad_next[] = {
+        {"abc\n", 4}, {"3", 1}, {"0\n", 2}, {"", 0}, {"03\n", 3}, {"-1\n", 3}, {"3\n4\n", 4},
+        {"99999999999999999999\n", 21}, {"1\0" "00\n", 5}, {"1\0\n", 3}, {"\0" "1\n", 3},
+        {"1 \n", 3}, {"+1\n", 3}, {"1\r\n", 3},
+    };
     const char *dir = fresh_dir("p4_next");
     Table *t = NULL;
     DbError err = {{0}, DBE_NONE};
@@ -3018,12 +3044,25 @@ static void test_p4_next_id(void) {
 
     /* 손상된 users.next는 시작을 거부한다(조용히 0으로 보면 지운 id를 다시 줄 수 있다) */
     for (i = 0; i < sizeof bad_next / sizeof bad_next[0]; i++) {
+        char after[64];
+        size_t n;
+
         dir = fresh_dir("p4_next_bad");
-        write_named(dir, "users.next", bad_next[i]);
+        write_file(dir, "1\ta\t1\n", 6);
+        write_named_n(dir, "users.next", bad_next[i].bytes, bad_next[i].len);
         t = NULL;
         err.kind = DBE_NONE;
         CHECK(table_open(dir, &t, &err) == -1 && t == NULL && err.kind == DBE_STORAGE &&
               strstr(err.msg, "다음 id 파일 손상") != NULL);
+        if (t != NULL) {
+            fprintf(stderr, "    손상 %u번이 받아들여짐 (다음 id %" PRId64 ")\n", (unsigned)i, table_last_id(t));
+            table_close(t, &err);
+        }
+        /* 거부할 때 두 파일 모두 바꾸지 않는다 */
+        n = read_named_n(dir, "users.next", after, sizeof after);
+        CHECK(n == bad_next[i].len && memcmp(after, bad_next[i].bytes, n) == 0);
+        read_file(dir, buf, sizeof buf);
+        CHECK(strcmp(buf, "1\ta\t1\n") == 0);
     }
 }
 

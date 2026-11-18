@@ -106,6 +106,15 @@ spec 대응:
 
 **환경 관찰 — Docker Desktop(Windows) 공유 폴더:** 저장소를 `-v`로 마운트한 채 `make test`를 돌리면 단위 테스트 2개가 매번 실패했다. 다시 쓰기 뒤 Table이 파일을 연 채로 있는 동안 테스트가 같은 경로를 `fopen`하면 "No such file or directory"가 났다. 짧은 재현(파이썬: 열린 파일을 rename한 뒤 새 이름으로 열기)에서 공유 폴더만 실패하고 컨테이너 자체 `/tmp`는 성공했다. Windows 쪽에서는 보였다. 엔진 동작이 아니라 공유 폴더의 동작으로 판단해, Docker 검증은 저장소를 컨테이너 안에 복사해서 했다(`cp -r /src /w && cd /w && make test`). Phase 3까지의 테스트는 rename을 쓰지 않아 이 현상이 없었다.
 
+### Codex 검증 지적 수정 (2026-11-18)
+
+| 지적 | 수정 | 회귀 테스트 |
+|---|---|---|
+| [P2] `users.next`가 `31 00 30 30 0a`(1, NUL, 00, LF)이면 시작에 성공하고 값 1로 읽어 다음 INSERT에 id 2를 줌. `parse_digits`가 NUL에서 멈추기 때문 | `read_next_file`이 LF 앞의 읽은 바이트 전체가 숫자인지 먼저 확인 | 단위 `test_p4_next_id` 손상 사례를 길이 포함 14가지로(내장 NUL 3가지, 공백·`+`·CR 포함), 거부 시 `users.tsv`·`users.next` 바이트 무변경 확인. CLI `p4_corrupt_next_file_refuses_start`에 같은 바이트, 거부 뒤 INSERT 미실행 확인. 고치기 전 코드로 되돌리면 단위·CLI 모두 실패(변이로 확인) |
+| [P2] "UPDATE·DELETE는 다시 보내도 안전하다"는 설명이 틀림: DELETE 성공 → 다른 요청이 조건에 맞는 행 추가 → 재시도가 새 행도 지움. 재실행 행 수도 달라짐 | spec "실패와 재시도"를 경우별로 다시 씀(사이에 쓰기 없음: 데이터는 같고 행 수는 달라질 수 있음 / 끼어든 쓰기: 새 데이터를 바꿀 수 있음 → 먼저 SELECT로 확인). walkthrough 7장의 설명을 고치고 재현 실습(선택) 추가, design D06의 "같은 수" 주장 정정 | 서버 `retried_delete_can_hit_rows_added_in_between` |
+
+검증(수정 후): Windows 단위 31,261개·CLI 56개 / Docker(컨테이너 안 복사) 단위 31,258개·CLI 56개·서버 28개·부하 생성기 9개 실패 0, sanitize·TSan 보고 없음. walkthrough의 새 실습 출력은 Docker 서버에서 실제로 받은 값.
+
 spec 대응:
 
 | ID | 테스트 |

@@ -881,9 +881,13 @@ def p4_stale_tmp_removed_on_start(env):
 @test
 def p4_corrupt_next_file_refuses_start(env):
     expect_ok(env.run(TWO_INSERTS), b"INSERT 1\nINSERT 1\n")
-    with open(os.path.join(env.data_dir, "users.next"), "wb") as f:
-        f.write(b"abc\n")
-    expect_fail(env.run("SELECT * FROM users;"), "다음 id 파일 손상")
+    # b"1\x0000\n"은 Codex 재현(31 00 30 30 0a): NUL 앞만 읽어 1로 보면 안 된다
+    for bad in (b"abc\n", b"1\x0000\n", b"1\x00\n", b"7 \n"):
+        with open(os.path.join(env.data_dir, "users.next"), "wb") as f:
+            f.write(bad)
+        expect_fail(env.run("INSERT INTO users (name, age) VALUES ('c', 3);"), "다음 id 파일 손상")
+        eq(env.data(), TWO_ROWS, "거부 뒤 저장 파일 (%r)" % bad)
+        eq(next_file(env), bad, "거부 뒤 users.next (%r)" % bad)
 
 
 @test

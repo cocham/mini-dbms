@@ -200,7 +200,23 @@ curl.exe -s http://localhost:8080/query --data-binary "DELETE FROM users;"
 - 셋째 요청: INSERT는 실행됐고(id 6, 가장 큰 id 5를 지웠으므로 6), UPDATE는 값 오류라 아무것도 바꾸지 않았다. `statement: 2`부터 고쳐 다시 보내면 된다.
 - 넷째 요청: WHERE 없는 DELETE는 구문 오류다. 구문 오류는 요청 전체를 실행하지 않는다(Phase 3 규칙 그대로).
 
-**알 수 있는 것:** UPDATE·DELETE는 같은 문장을 두 번 보내도 결과가 같다(SET 값이 상수이고, 지운 행은 다시 지울 게 없다). INSERT와 달리 "결과를 못 받았을 때 다시 보내도 되나"를 고민하지 않아도 된다.
+**알 수 있는 것:** 서버에서는 같은 UPDATE·DELETE를 다시 보내는 것도 안전하지 않다. 그 사이에 다른 클라이언트가 쓸 수 있기 때문이다. 아래 (선택) 실습으로 직접 본다. 응답을 못 받아 반영 여부를 모르면 INSERT처럼 먼저 SELECT로 확인한다(spec "실패와 재시도").
+
+**(선택) 재시도가 새 행을 지우는 경우.** 두 클라이언트를 흉내 낸다. 첫째 줄이 "응답을 못 받은 DELETE"이고, 둘째 줄은 그 사이 다른 클라이언트의 INSERT, 셋째 줄은 같은 DELETE를 다시 보낸 것이다.
+
+```powershell
+curl.exe -s http://localhost:8080/query --data-binary "DELETE FROM users WHERE age = 31;"
+curl.exe -s http://localhost:8080/query --data-binary "INSERT INTO users (name, age) VALUES ('new', 31);"
+curl.exe -s http://localhost:8080/query --data-binary "DELETE FROM users WHERE age = 31; SELECT * FROM users;"
+```
+
+```text
+{"ok":true,"results":[{"type":"delete","count":2}]}
+{"ok":true,"results":[{"type":"insert","id":7}]}
+{"ok":true,"results":[{"type":"delete","count":1},{"type":"select","columns":["id","name","age"],"rows":[[1,"kim",25],[4,"choi",41],[6,"han",22]]}]}
+```
+
+위 상태에서 이어서 실행하면 첫 DELETE는 `count` 2(lee, park)이고, 다시 보낸 DELETE는 `count` 1이다. 방금 들어온 `new`가 지워져 SELECT에 없다. 첫 DELETE만 의도했다면 재시도가 남의 데이터를 지운 것이다. 행 수가 2 → 1로 달라진다는 것도 볼 수 있다.
 
 > **Docker Desktop(Windows) 공유 폴더에서 본 현상:** 서버가 `/src` 아래(공유 폴더)를 데이터 디렉터리로 쓰는 동안 UPDATE·DELETE를 한 뒤에는, **같은 컨테이너 안의 다른 프로세스**가 `users.tsv`를 열면 "No such file or directory"가 났다(`docker exec ... cat`). 서버를 끄면 보였다. Windows 쪽 `Get-Content`로는 서버가 떠 있는 동안에도 보였다. 컨테이너 자체 디렉터리(`/tmp`)에서는 생기지 않았다. "열린 채로 이름이 바뀐 파일"을 공유 폴더가 다루는 방식 때문이다(짧은 재현 스크립트로 확인). 엔진의 정확성과는 별개이고, 서버가 쓰는 동안 같은 디렉터리를 CLI로 동시에 여는 것은 원래 지원하지 않는다(Phase 3와 같음). 같은 이유로 Docker에서 `make test`를 돌릴 때는 저장소를 컨테이너 안에 복사해서 돌렸다(tasks.md 검증 기록).
 

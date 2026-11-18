@@ -281,6 +281,16 @@ static int read_next_file(Table *t, DbError *err) {
     if (bad || n < 2 || buf[n - 1] != '\n') {
         bad = 1;
     } else {
+        size_t i;
+        /* parse_digits는 NUL에서 멈추므로, 읽은 바이트 전체(LF 앞)가 숫자인지 먼저 본다.
+           "1\0" "00\n" 같은 파일을 1로 읽으면 지운 id를 다시 줄 수 있다 */
+        for (i = 0; i + 1 < n; i++) {
+            if (buf[i] < '0' || buf[i] > '9') {
+                bad = 1;
+            }
+        }
+    }
+    if (!bad) {
         buf[n - 1] = '\0';
         bad = parse_digits(buf, ID_MAX_DIGITS, &v) != 0 || v <= 0;
     }
