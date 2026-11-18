@@ -38,7 +38,7 @@ SERVER_BIN = build/minidb-server
 SERVER_TEST_BIN = build/minidb-server-test
 LOADGEN_BIN = build/loadgen
 
-.PHONY: all test unit cli server sanitize tsan race-demo read-bench load-bench bench clean
+.PHONY: all test unit cli server sanitize tsan race-demo read-bench load-bench page-bench bench clean
 
 ifeq ($(OS),Windows_NT)
 all: $(BIN) $(DEMO_BIN)
@@ -151,6 +151,14 @@ load-bench: $(SERVER_BIN) $(BIN) $(LOADGEN_BIN)
 	$(CC) $(CFLAGS) $(THREAD_FLAGS) -DMINIDB_GLOBAL_LOCK -o build/minidb-server-global $(SRC) $(SERVER_SRC)
 	$(PYTHON) tools/load.py --server $(SERVER_BIN) --global build/minidb-server-global --cli $(BIN) \
 		--loadgen $(LOADGEN_BIN) --rows $(LOAD_ROWS) --seconds $(LOAD_SECONDS)
+
+# Linux 전용 확인·측정(P5-03, DB-P5-D10): 변경 없는 100만 행에서 전체 조회 실패, GET /users 전체 순회가
+#   파일과 같은지, 첫·중간·마지막 페이지 응답 시간과 바이트. 순회가 파일과 다르면 종료 코드 1.
+#   결과는 build/page_result.md에도 쓴다. docs/phase5/benchmark.md로 옮긴다.
+PAGE_ROWS ?= 1000000
+PAGE_REPEAT ?= 30
+page-bench: $(SERVER_BIN)
+	$(PYTHON) tools/page_bench.py --server $(SERVER_BIN) --rows $(PAGE_ROWS) --repeat $(PAGE_REPEAT)
 
 # 100만 건 생성·삽입 후 인덱스 조회 vs 선형 탐색 측정 (P2-04). 느리므로 test에 넣지 않는다.
 #   make bench BENCH_ROWS=100000 처럼 건수를 줄여 볼 수 있다. 결과는 docs/phase2/benchmark.md로 옮긴다.

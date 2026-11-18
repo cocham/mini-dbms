@@ -2,14 +2,14 @@
 
 ## 현재 상태
 
-**P5-00 확정(2026-11-18, 사용자).** 브랜치 `phase5-pagination`(main `4d75692`에서 시작). D01~D11 확정. D04(순방향 조회로 보장 한정), D08(최악 크기 반영, 기본 limit도 상한 이하, 실패 방지는 결과 크기 상한에 한정), D10(변경 없는 100만 행에서 세 가지 확인)은 사용자가 범위를 고쳤다.
+**P5-01~P5-03 구현 완료(2026-11-18), 사용자 검증 대기.** P5-00 확정(2026-11-18, 사용자). 브랜치 `phase5-pagination`(main `4d75692`에서 시작). D01~D11 확정. D04(순방향 조회로 보장 한정), D08(최악 크기 반영, 기본 limit도 상한 이하, 실패 방지는 결과 크기 상한에 한정), D10(변경 없는 100만 행에서 세 가지 확인)은 사용자가 범위를 고쳤다.
 
 | ID | 기능 | 완료 기준 | 상태 |
 |---|---|---|---|
 | P5-00 | 구현 전 결정 | design.md DB-P5-D01~D11 확정 | 완료(2026-11-18) |
 | P5-01 | 엔진 제한 읽기 | E1, E5(단위) | 완료(검증 대기) |
 | P5-02 | `GET /users` | E2, E3, E4, E5(서버) | 완료(검증 대기) |
-| P5-03 | 100만 행 확인, 문서·실습 | E6, E8 | 대기 |
+| P5-03 | 100만 행 확인, 문서·실습 | E6, E8 | 완료(검증 대기) |
 
 진행 방식(D11): P5-01~P5-03을 이어서 구현·자체 검증·커밋하고 한 번에 검증받는다. 단위마다 그 단위의 테스트(단위·서버, 해당하면 sanitize·TSan)를 실행해 통과시킨 뒤 다음 단위로 간다. PASS 뒤 push와 main 대상 PR.
 
@@ -83,6 +83,55 @@
 - (선택) 커서가 바이트 위치가 아니라 id인 이유: 페이지 사이에 UPDATE로 파일 전체가 다시 쓰여도 다음 페이지가 그대로 이어지는 것.
 
 README에 Phase 5 절을 더한다.
+
+## P5-03 기록 (2026-11-18)
+
+- `tools/page_bench.py`, `make page-bench`. 결과는 [benchmark.md](benchmark.md): 전체 조회 400 `RESULT_TOO_LARGE`(146바이트), 1000행씩 1000페이지에 100만 행·파일과 다른 행 0, 페이지 하나 0.3~0.6 ms(첫·중간·마지막 같은 수준). 두 번 실행.
+- `--rows`가 100,000 이하이면 전체 조회가 기본 상한에 걸리지 않는다. 그래서 `--max-rows`를 rows/2로 낮춰 띄운다(작은 데이터로 도구를 확인할 때 쓰는 용도). 2만 행으로 도구 동작을 확인했다.
+- `docs/phase5/walkthrough.md`: 필수 4개·선택 4개. 출력은 Docker 서버에서 실제로 받은 값이다. 실습 5(순회 중 변경)는 처음에 커서를 건너뛴 순서(`after_id=7`)로 실행했다. 순방향 조회가 아니어서 받은 커서를 그대로 넘기는 순서로 다시 실행해 그 출력을 넣었다.
+- README에 Phase 5 절을 더했다. Phase 4 상태를 "완료"로 고쳤다.
+- 변이 테스트 중 "멈추지 않고 키를 끝까지 훑는" 변이(`RANGE_STOP` 대신 0)가 결과·읽은 줄 수로는 드러나지 않았다. 그래서 테스트 빌드에 "리프에서 받은 키 수"(`table_test_page_keys_seen`, `min(limit+1, 남은 행)`)를 더해 잡히게 했다.
+
+## 검증 기록 (2026-11-18, P5-01~P5-03 합본)
+
+| 명령 | 환경 | 결과 |
+|---|---|---|
+| `mingw32-make`, `mingw32-make test` | Windows, TDM-GCC 10.3 | 경고 0, 단위 41,735개·CLI 56개 실패 0 |
+| `make clean && make test` | Docker `gcc:13`, 컨테이너 안 복사본 | 경고 0, 단위 41,732개·CLI 56개·서버 34개·부하 생성기 9개 실패 0 |
+| `make sanitize` | Docker `gcc:13`, ASan/UBSan/LSan | 실패 0, 보고 없음 |
+| `make tsan` | Docker `gcc:13`, TSan | 단위·서버 실패 0, 보고 없음 |
+| `make page-bench` | Docker `gcc:13`, 100만 행 | 확인 3가지 통과(두 번), benchmark.md |
+| 변이 18개 | Docker `gcc:13` | 모두 잡힘(아래) |
+
+변이 18개(각각 단위 테스트, `users_` 서버 테스트 6개, 또는 TSan 단위 테스트로 확인):
+
+| 변이 | 잡은 곳 |
+|---|---|
+| `has_more`를 `읽은 줄 == limit`으로 | 단위(정확히 limit행 남음, 전체 순회 페이지 수) |
+| `limit+1`번째 행을 응답에 넣음 | 단위 |
+| 끝까지 읽고 `limit`개만 넘김 | 단위(읽은 줄 수) |
+| 멈추지 않고 키를 끝까지 훑음 | 단위(받은 키 수) |
+| 정상 멈춤을 오류로 | 단위 |
+| 커서 포함(`>=`) | 단위 |
+| `INT64_MAX` 넘침 처리 제거 | 단위·서버 |
+| 모르는 파라미터 무시 / 중복 허용 / `limit=0` 허용 / 앞자리 0 허용 / 끝의 `&` 허용 | 서버 |
+| 페이지 상한이 바이트를 무시(1000 고정) / 기본 limit이 상한을 넘음 | 서버 |
+| 빈 페이지 `next_cursor`를 0으로 / `next_cursor`가 첫 행 id | 서버 |
+| 긴 쿼리 문자열 허용 | 서버 |
+| `db_page`가 잠금 없이 읽음 | TSan(단위 동시 순회, `fclose`와의 경쟁) |
+
+spec 대응:
+
+| ID | 테스트 |
+|---|---|
+| E1 | 단위 `test_p5_page_basic`, `test_p5_page_gaps_and_rewrite`, `test_p5_page_early_stop_and_full_walk`, `test_p5_db_page_halted` |
+| E2 | 서버 `users_pages_basic`, `users_invalid_params`(거부 34가지·허용 경계·405·404 안내), `users_halted_and_validation_order` |
+| E3 | 서버 `users_walks_data_that_select_star_cannot_return`(5000행, `--max-rows 1000`) |
+| E4 | 서버 `users_page_limit_fits_response_budget`(1000·50·2, 최악의 행 3,219바이트) |
+| E5 | 단위 `test_p5_concurrent_forward_walk`(TSan 포함), 서버 `users_forward_walk_during_writes` |
+| E6 | `make page-bench`, benchmark.md |
+| E7 | 기존 테스트 전부(위 표) |
+| E8 | walkthrough.md, README |
 
 ## 검증 계획
 

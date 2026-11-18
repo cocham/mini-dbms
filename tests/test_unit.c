@@ -3552,7 +3552,7 @@ static void test_p5_page_basic(void) {
     }
     /* 빈 테이블 */
     CHECK(run_page(t, NULL, 0, 3, &g, &more, &err) == 0 && page_is(&g, more, NULL, 0, 0));
-    CHECK(table_test_page_lines_read() == 0);
+    CHECK(table_test_page_lines_read() == 0 && table_test_page_keys_seen() == 0);
 
     append_rows(t, 10);
     {
@@ -3561,11 +3561,12 @@ static void test_p5_page_basic(void) {
 
         CHECK(run_page(t, NULL, 0, 3, &g, &more, &err) == 0 && page_is(&g, more, first, 3, 1));
         CHECK(table_test_page_lines_read() == 3); /* 4번째 키는 확인만 하고 읽지 않는다 */
+        CHECK(table_test_page_keys_seen() == 4);
         CHECK(strcmp(g.names[0], "u1") == 0 && strcmp(g.names[2], "u3") == 0);
         CHECK(run_page(t, NULL, 3, 3, &g, &more, &err) == 0 && page_is(&g, more, mid, 3, 1));
         /* 정확히 limit행이 남으면 N+1번째가 없으므로 has_more 0: 빈 페이지를 한 번 더 받을 필요가 없다 */
         CHECK(run_page(t, NULL, 7, 3, &g, &more, &err) == 0 && page_is(&g, more, exact, 3, 0));
-        CHECK(table_test_page_lines_read() == 3);
+        CHECK(table_test_page_lines_read() == 3 && table_test_page_keys_seen() == 3);
         CHECK(run_page(t, NULL, 9, 3, &g, &more, &err) == 0 && page_is(&g, more, last, 1, 0));
         CHECK(table_test_page_lines_read() == 1);
         CHECK(run_page(t, NULL, 0, 1000, &g, &more, &err) == 0 && page_is(&g, more, all, 10, 0));
@@ -3651,11 +3652,11 @@ static void test_p5_page_early_stop_and_full_walk(void) {
     }
     append_rows(t, 10000);
     CHECK(run_page(t, NULL, 0, 3, &g, &more, &err) == 0 && g.n == 3 && more == 1);
-    CHECK(table_test_page_lines_read() == 3);
+    CHECK(table_test_page_lines_read() == 3 && table_test_page_keys_seen() == 4);
     CHECK(run_page(t, NULL, 5000, 100, &g, &more, &err) == 0 && g.n == 100 && g.ids[0] == 5001 && more == 1);
-    CHECK(table_test_page_lines_read() == 100);
+    CHECK(table_test_page_lines_read() == 100 && table_test_page_keys_seen() == 101);
     CHECK(run_page(t, NULL, 9990, 100, &g, &more, &err) == 0 && g.n == 10 && more == 0);
-    CHECK(table_test_page_lines_read() == 10);
+    CHECK(table_test_page_lines_read() == 10 && table_test_page_keys_seen() == 10);
 
     /* 커서 0부터 next_cursor(마지막 id)를 따라가면 1..10000이 순서대로 한 번씩, 정확히 10페이지 */
     more = 1;

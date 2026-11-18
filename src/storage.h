@@ -126,6 +126,8 @@ enum {
 void table_test_fail_rewrite(int stage);
 /* 이 스레드에서 마지막으로 부른 table_page가 파일에서 읽은 줄 수 (조기 종료 확인용) */
 int64_t table_test_page_lines_read(void);
+/* 같은 호출에서 인덱스 리프에서 받은 키 수 = min(limit + 1, 남은 행). 키를 끝까지 훑지 않는지 확인용 */
+int64_t table_test_page_keys_seen(void);
 /* 테스트 전용: 메모리 인덱스의 불변식 검사(bpt_validate). 0이면 정상 */
 int table_test_validate_index(const Table *t, char *why, size_t cap);
 #endif

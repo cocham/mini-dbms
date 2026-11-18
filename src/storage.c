@@ -488,14 +488,18 @@ typedef struct {
     int64_t next_pos; /* rd가 다음에 넘겨줄 바이트의 위치. -1이면 아직 이동 전 */
     int64_t limit;    /* table_page: 넘길 최대 행 수. 제한 없으면 -1 */
     int64_t lines;    /* 파일에서 읽은 줄 수 */
+    int64_t keys;     /* 리프에서 받은 키 수 (줄을 읽지 않은 limit+1번째 포함) */
     int has_more;     /* table_page: limit+1번째 키를 만났으면 1 */
 } RangeRead;
 
 #define RANGE_STOP 2 /* range_visit의 정상 멈춤. bpt_range가 그대로 돌려준다 */
 
 #ifdef MINIDB_TESTING
-static _Thread_local int64_t g_page_lines; /* 스레드마다 따로: 동시 테스트에서도 경쟁 없음 */
+/* 스레드마다 따로: 동시 테스트에서도 경쟁 없음 */
+static _Thread_local int64_t g_page_lines;
+static _Thread_local int64_t g_page_keys;
 int64_t table_test_page_lines_read(void) { return g_page_lines; }
+int64_t table_test_page_keys_seen(void) { return g_page_keys; }
 #endif
 
 /*
@@ -513,6 +517,7 @@ static int range_visit(int64_t id, int64_t offset, void *vctx) {
     Row row;
     int r;
 
+    rr->keys++;
     if (rr->limit >= 0 && rr->lines >= rr->limit) {
         rr->has_more = 1;
         return RANGE_STOP;
@@ -542,7 +547,7 @@ static int range_visit(int64_t id, int64_t offset, void *vctx) {
 
 /* [lo, hi]를 id 순서로 읽는다. limit ≥ 0이면 limit개를 넘긴 뒤 다음 키에서 정상으로 멈춘다. */
 static int range_read(Table *t, int64_t lo, int64_t hi, int64_t limit, RowFn fn, void *ctx, int *has_more,
-                      int64_t *lines, DbError *err) {
+                      int64_t *lines, int64_t *keys, DbError *err) {
     RangeRead rr;
     char *buf = malloc(SCAN_BUF);
     int r;
@@ -559,6 +564,7 @@ static int range_read(Table *t, int64_t lo, int64_t hi, int64_t limit, RowFn fn,
     rr.next_pos = -1;
     rr.limit = limit;
     rr.lines = 0;
+    rr.keys = 0;
     rr.has_more = 0;
     r = bpt_range(t->index, lo, hi, range_visit, &rr);
     free(buf);
@@ -568,15 +574,18 @@ static int range_read(Table *t, int64_t lo, int64_t hi, int64_t limit, RowFn fn,
     if (lines != NULL) {
         *lines = rr.lines;
     }
+    if (keys != NULL) {
+        *keys = rr.keys;
+    }
     return (r == 0 || r == RANGE_STOP) ? 0 : -1;
 }
 
 int table_find_id_range(Table *t, int64_t lo, int64_t hi, RowFn fn, void *ctx, DbError *err) {
-    return range_read(t, lo, hi, -1, fn, ctx, NULL, NULL, err);
+    return range_read(t, lo, hi, -1, fn, ctx, NULL, NULL, NULL, err);
 }
 
 int table_page(Table *t, int64_t after_id, int64_t limit, RowFn fn, void *ctx, int *has_more, DbError *err) {
-    int64_t lines = 0;
+    int64_t lines = 0, keys = 0;
     int more = 0;
     int rc;
 
@@ -585,6 +594,7 @@ int table_page(Table *t, int64_t after_id, int64_t limit, RowFn fn, void *ctx, i
     }
 #ifdef MINIDB_TESTING
     g_page_lines = 0;
+    g_page_keys = 0;
 #endif
     if (limit < 1 || after_id < 0) {
         db_error_setk(err, DBE_SQL, "페이지 조회 값이 올바르지 않습니다 (after_id %" PRId64 ", limit %" PRId64 ")",
@@ -594,9 +604,12 @@ int table_page(Table *t, int64_t after_id, int64_t limit, RowFn fn, void *ctx, i
     if (after_id == INT64_MAX) {
         return 0; /* 그보다 큰 id는 없다. after_id + 1은 넘치므로 트리를 보지 않는다 */
     }
-    rc = range_read(t, after_id + 1, INT64_MAX, limit, fn, ctx, &more, &lines, err);
+    rc = range_read(t, after_id + 1, INT64_MAX, limit, fn, ctx, &more, &lines, &keys, err);
 #ifdef MINIDB_TESTING
     g_page_lines = lines;
+    g_page_keys = keys;
+#else
+    (void)keys;
 #endif
     if (rc == 0 && has_more != NULL) {
         *has_more = more;
