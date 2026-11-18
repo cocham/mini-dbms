@@ -808,6 +808,246 @@ def write_failure_halts_and_restart_is_refused():
     ok("데이터 파일 손상" in err, err)
 
 
+# ---------- Phase 5: GET /users 커서 페이지 조회 ----------
+
+def users(port, qs=""):
+    st, h, data = request(port, "GET", "/users" + qs)
+    eq(h.get("content-type"), "application/json; charset=utf-8", "Content-Type")
+    return st, json.loads(data.decode("utf-8")), data
+
+
+def page_ids(r):
+    return [row[0] for row in r["rows"]]
+
+
+def write_rows(d, rows):
+    """users.tsv를 직접 쓴다(큰 데이터를 빨리 만들기). rows: (id, name, age)"""
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "users.tsv"), "wb") as f:
+        f.write(b"".join(b"%d\t%s\t%d\n" % (i, n if isinstance(n, bytes) else n.encode("utf-8"), a)
+                         for i, n, a in rows))
+
+
+def walk(port, limit, guard=100000):
+    """커서 0부터 next_cursor를 따라 has_more가 false가 될 때까지. (모든 행, 페이지 수)"""
+    rows, after, pages = [], 0, 0
+    while pages < guard:
+        st, r, _ = users(port, "?after_id=%d&limit=%d" % (after, limit))
+        eq(st, 200, "페이지 %d" % pages)
+        pages += 1
+        rows += r["rows"]
+        if r["rows"]:
+            eq(r["next_cursor"], r["rows"][-1][0], "next_cursor = 마지막 행 id")
+            after = r["next_cursor"]
+        else:
+            eq(r["next_cursor"], None, "빈 페이지의 next_cursor")
+        if not r["has_more"]:
+            return rows, pages
+    raise Fail("순회가 끝나지 않음")
+
+
+@test
+def users_pages_basic():
+    # E2·E1: 첫·중간·마지막 페이지, 정확히 limit행 남음, 빈 페이지, id 공백, 지워진 커서
+    with Server(fresh("p5_basic")) as s:
+        st, r, _ = users(s.port)
+        eq((st, r), (200, {"ok": True, "columns": ["id", "name", "age"], "rows": [], "has_more": False,
+                           "next_cursor": None}), "빈 테이블")
+        query(s.port, "".join(ins("u%d" % i, i) for i in range(1, 11)))
+        st, r, _ = users(s.port)
+        eq((st, page_ids(r), r["has_more"], r["next_cursor"]), (200, list(range(1, 11)), False, 10), "기본 limit 100")
+        eq(r["rows"][0], [1, "u1", 1])
+        eq(users(s.port, "?")[1], r, "'?'만 있으면 기본값")
+        st, r, _ = users(s.port, "?limit=3")
+        eq((page_ids(r), r["has_more"], r["next_cursor"]), ([1, 2, 3], True, 3), "첫 페이지")
+        st, r, _ = users(s.port, "?after_id=3&limit=3")
+        eq((page_ids(r), r["has_more"], r["next_cursor"]), ([4, 5, 6], True, 6), "중간 페이지")
+        st, r, _ = users(s.port, "?limit=3&after_id=7")
+        eq((page_ids(r), r["has_more"], r["next_cursor"]), ([8, 9, 10], False, 10), "정확히 limit행 남음 → false")
+        st, r, _ = users(s.port, "?after_id=9&limit=3")
+        eq((page_ids(r), r["has_more"], r["next_cursor"]), ([10], False, 10), "마지막 페이지")
+        for after in ("10", "11", "9223372036854775806", "9223372036854775807"):
+            st, r, _ = users(s.port, "?after_id=" + after)
+            eq((st, r["rows"], r["has_more"], r["next_cursor"]), (200, [], False, None), "빈 페이지 after_id=" + after)
+        st, r, _ = users(s.port, "?after_id=0&limit=10")
+        eq((page_ids(r), r["has_more"]), (list(range(1, 11)), False))
+        # id 공백: limit은 행 수
+        eq(query(s.port, "DELETE FROM users WHERE id BETWEEN 3 AND 5;")[1]["results"], [{"type": "delete", "count": 3}])
+        eq([page_ids(users(s.port, q)[1]) for q in ("?limit=3", "?after_id=6&limit=3", "?after_id=9&limit=3")],
+           [[1, 2, 6], [7, 8, 9], [10]], "공백 때문에 페이지가 덜 차지 않음")
+        st, r, _ = users(s.port, "?after_id=4&limit=3")
+        eq((page_ids(r), r["has_more"], r["next_cursor"]), ([6, 7, 8], True, 8), "지워진 id를 커서로 줘도 됨")
+        rows, pages = walk(s.port, 3)
+        eq(([x[0] for x in rows], pages), ([1, 2, 6, 7, 8, 9, 10], 3), "순방향 순회")
+        # 본문은 무시한다
+        st, h, data = request(s.port, "GET", "/users?limit=1", "SELECT 1;")
+        eq((st, page_ids(json.loads(data))), (200, [1]), "GET 본문 무시")
+        ok(any("GET /users → 200" in ln for ln in s.log), "요청 로그: " + "".join(s.log[-3:]))
+
+
+@test
+def users_invalid_params():
+    # E2: 입력 검증 표의 모든 경우 → 400 INVALID_PARAM, results 없음
+    bad = ["limit=abc", "limit=", "after_id=", "after_id=1.5", "after_id=-1", "limit=+10", "limit=-3",
+           "limit=0", "limit=1001", "after_id=9223372036854775808", "after_id=99999999999999999999",
+           "limit=00000000000000000001", "limt=10", "offset=5", "cursor=3", "LIMIT=3",
+           "limit=10&limit=20", "after_id=1&after_id=2", "limit", "after_id", "=3", "limit=%31%30",
+           "limit=010", "after_id=007", "after_id=00", "&limit=1", "limit=1&", "limit=1&&after_id=2", "&",
+           "limit=1&after_id=2&", "limit=1;after_id=2", "limit=1&x", "limit=1=2", "limit=1&z=" + "9" * 300]
+    with Server(fresh("p5_invalid")) as s:
+        query(s.port, ins("a", 1))
+        for qs in bad:
+            st, h, data = request(s.port, "GET", "/users?" + qs)
+            r = json.loads(data)
+            eq((st, r["ok"], r["error"]["code"], sorted(r)), (400, False, "INVALID_PARAM", ["error", "ok"]),
+               "거부: " + qs[:60])
+            ok(r["error"]["message"], "메시지: " + qs[:60])
+        st, r, _ = users(s.port, "?limit=1001")
+        ok("1000" in r["error"]["message"], "상한값 안내: " + r["error"]["message"])
+        st, r, _ = users(s.port, "?limt=10")
+        ok("limt" in r["error"]["message"], r["error"]["message"])
+        st, r, _ = users(s.port, "?limit=1&z=" + "9" * 300)
+        ok("256" in r["error"]["message"], "쿼리 문자열 길이: " + r["error"]["message"])
+        # 허용되는 경계
+        for qs, want in (("limit=1000", [1]), ("after_id=0", [1]), ("limit=1&after_id=0", [1]),
+                         ("after_id=9223372036854775807&limit=1", [])):
+            st, r, _ = users(s.port, "?" + qs)
+            eq((st, page_ids(r)), (200, want), "허용: " + qs)
+        st, h, body = request(s.port, "POST", "/users")
+        eq((st, h.get("allow"), json.loads(body)["error"]["code"]), (405, "GET", "METHOD"))
+        st, h, body = request(s.port, "DELETE", "/users?limit=1")
+        eq((st, h.get("allow")), (405, "GET"))
+        st, h, body = request(s.port, "GET", "/nope")
+        ok("GET /users" in json.loads(body)["error"]["message"], "404 안내에 /users")
+        eq(users(s.port)[1]["rows"], [[1, "a", 1]], "거부된 요청이 아무것도 바꾸지 않음")
+
+
+@test
+def users_walks_data_that_select_star_cannot_return():
+    # E3: 전체 SELECT는 결과 상한에 걸리지만 페이지로는 끝까지 받는다
+    d = fresh("p5_walk")
+    want = [[i, "n%d" % i, i % 151] for i in range(1, 5001)]
+    write_rows(d, want)
+    with Server(d, "--max-rows", "1000") as s:
+        ok(any("페이지 상한 1000행(기본 100)" in ln for ln in s.log), "시작 줄: " + "".join(s.log))
+        st, r = query(s.port, "SELECT * FROM users;")
+        eq((st, r["error"]["code"]), (400, "RESULT_TOO_LARGE"), "전체 조회는 실패")
+        rows, pages = walk(s.port, 1000)
+        eq((rows == want, pages), (True, 5), "1000행씩 5페이지, 중복·누락 없이 id 순서")
+        rows, pages = walk(s.port, 100)
+        eq((rows == want, pages), (True, 50), "기본 크기 100행씩 50페이지")
+        rows, pages = walk(s.port, 999)
+        eq((rows == want, pages), (True, 6), "나누어떨어지지 않는 크기")
+
+
+@test
+def users_page_limit_fits_response_budget():
+    # E4: 페이지 상한 = min(1000, --max-rows, 최악의 행이 --max-response에 들어가는 수), 기본 limit = min(100, 상한)
+    with Server(fresh("p5_cap_default")) as s:
+        ok(any("페이지 상한 1000행(기본 100)" in ln for ln in s.log), "시작 줄: " + "".join(s.log))
+        eq(users(s.port, "?limit=1000")[0], 200)
+        st, r, _ = users(s.port, "?limit=1001")
+        eq(st, 400)
+    with Server(fresh("p5_cap_rows"), "--max-rows", "50") as s:
+        ok(any("페이지 상한 50행(기본 50)" in ln for ln in s.log), "시작 줄: " + "".join(s.log))
+        query(s.port, "".join(ins("r%d" % i, 1) for i in range(60)))
+        st, r, _ = users(s.port)
+        eq((len(r["rows"]), r["has_more"], r["next_cursor"]), (50, True, 50), "기본 limit도 상한 이하")
+        st, r, _ = users(s.port, "?limit=51")
+        eq(st, 400)
+        ok("50" in r["error"]["message"], r["error"]["message"])
+    # 최악의 행: 19자리 id, 이름 255바이트가 모두 \u00XX로 이스케이프, age 3자리
+    d = fresh("p5_cap_bytes")
+    worst = b"\x01" * 255
+    big = 9223372036854775807
+    write_rows(d, [(1, "a", 1), (big - 2, worst, 150), (big - 1, worst, 150), (big, worst, 150)])
+    with Server(d, "--max-response", "4096") as s:
+        ok(any("페이지 상한 2행(기본 2)" in ln for ln in s.log), "시작 줄: " + "".join(s.log))
+        for after, more, cursor in ((big - 3, True, big - 1), (big - 2, False, big)):
+            st, r, data = users(s.port, "?after_id=%d&limit=2" % after)
+            eq((st, len(r["rows"]), r["has_more"], r["next_cursor"]), (200, 2, more, cursor))
+            eq(r["rows"][0][1], "\x01" * 255)
+            ok(len(data) <= 102 + 2 * 1559, "최악의 페이지 %d바이트 ≤ 고정 102 + 행 1559×2" % len(data))
+            ok(len(data) <= 4096, "응답 상한 안: %d" % len(data))
+        st, r, _ = users(s.port, "?after_id=%d" % (big - 3))
+        eq(len(r["rows"]), 2, "기본 limit = 2")
+        st, r, _ = users(s.port, "?limit=3")
+        eq(st, 400)
+        ok("2" in r["error"]["message"], r["error"]["message"])
+        st, r = query(s.port, "SELECT * FROM users;")
+        eq((st, r["error"]["code"]), (400, "RESULT_TOO_LARGE"), "같은 데이터의 전체 조회는 상한 초과")
+
+
+@test
+def users_halted_and_validation_order():
+    d = fresh("p5_halt")
+    s = Server(d, binary=SERVER_TEST, env={"MINIDB_TEST_FAULT": "index"})
+    try:
+        query(s.port, "".join(ins("u%d" % i, 1) for i in range(1, 64)))
+        eq(users(s.port, "?after_id=60")[1]["rows"], [[61, "u61", 1], [62, "u62", 1], [63, "u63", 1]])
+        st, r = query(s.port, ins("lost-index", 2))
+        eq(r["error"]["code"], "INDEX_FAILED")
+        st, r, _ = users(s.port)
+        eq((st, r["error"]["code"], sorted(r)), (503, "HALTED", ["error", "ok"]))
+        ok("index_failed" in r["error"]["message"], r["error"]["message"])
+        st, r, _ = users(s.port, "?limit=abc")
+        eq((st, r["error"]["code"]), (400, "INVALID_PARAM"), "입력 검증은 엔진보다 먼저")
+    finally:
+        eq(s.stop(), 0)
+
+
+@test
+def users_forward_walk_during_writes():
+    # E5: 순방향 조회 도중 INSERT·UPDATE·DELETE.
+    # (가) 받은 id가 엄격하게 증가 (나) 시작과 끝 모두에 있던 행은 모두 나옴 (다) 나온 id는 부여된 적 있는 id
+    d = fresh("p5_concurrent")
+    start = 300
+    write_rows(d, [(i, "s%d" % i, i % 151) for i in range(1, start + 1)])
+    with Server(d, "--threads", "4") as s:
+        done = threading.Event()
+
+        def writer(c):
+            rng = random.Random(100 + c)
+            for i in range(40):
+                k = rng.random()
+                target = rng.randint(1, start + 120)
+                if k < 0.4:
+                    st, r = query(s.port, ins("w%d_%d" % (c, i), rng.randint(0, 150)))
+                elif k < 0.7:
+                    st, r = query(s.port, "UPDATE users SET name = 'up%d' WHERE id = %d;" % (i, target))
+                else:
+                    st, r = query(s.port, "DELETE FROM users WHERE id = %d;" % target)
+                eq(st, 200, "쓰기")
+
+        def reader():
+            walks = []
+            while not done.is_set() or len(walks) < 2:
+                rows, _ = walk(s.port, 7)
+                walks.append([x[0] for x in rows])
+            return walks
+
+        rt, rbox = in_thread(reader)
+        ws = [in_thread(writer, c) for c in range(3)]
+        for th, box in ws:
+            th.join(180)
+            ok(not th.is_alive(), "쓰기가 끝나지 않음")
+            if "error" in box:
+                raise box["error"]
+        done.set()
+        rt.join(180)
+        ok(not rt.is_alive(), "순회가 끝나지 않음")
+        if "error" in rbox:
+            raise rbox["error"]
+        end_ids = set(x[0] for x in walk(s.port, 1000)[0])
+        st, r = query(s.port, ins("probe", 1))
+        max_id = r["results"][0]["id"]
+        both = set(range(1, start + 1)) & end_ids
+        for w in rbox["value"]:
+            ok(all(a < b for a, b in zip(w, w[1:])), "엄격하게 증가")
+            eq(sorted(both - set(w)), [], "계속 있던 행 누락")
+            ok(all(1 <= x < max_id for x in w), "부여된 적 없는 id")
+
+
 def main():
     failed = 0
     for fn in TESTS:
