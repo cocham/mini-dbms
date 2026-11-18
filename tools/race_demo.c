@@ -73,7 +73,7 @@ static void *read_work(void *arg) {
         DbError err = {{0}, DBE_NONE};
         Probe p;
         Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID, 0, 0, CMP_EQ, 0};
-        ResultSink ss = {NULL, probe_row, &p, NULL};
+        ResultSink ss = {NULL, probe_row, &p, NULL, NULL};
 
         w->seed = w->seed * 1664525u + 1013904223u;
         p.want = 1 + (int64_t)((w->seed >> 8) % PRELOAD);
@@ -99,7 +99,7 @@ static void *write_work(void *arg) {
         int64_t id = 0;
         DbError err = {{0}, DBE_NONE};
         Statement ins = {STMT_INSERT, name, 20, WHERE_NONE, 0, 0, CMP_EQ, 0};
-        ResultSink is = {remember_id, NULL, &id, NULL};
+        ResultSink is = {remember_id, NULL, &id, NULL, NULL};
 
         snprintf(name, sizeof name, "t%d_%d", w->tid, i);
         if (db_exec(w->db, &ins, &is, NULL, &err) != 0) {

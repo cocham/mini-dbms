@@ -16,7 +16,8 @@ typedef enum {
     DBE_STORAGE,      /* 읽기 오류·인덱스 불일치·파일을 건드리기 전의 실패. 이 문장은 기록되지 않음 */
     DBE_INDEX_FAILED, /* 파일 기록 완료(fprintf·fflush 성공) 뒤 인덱스 등록 실패. 그 줄은 파일에 남음 */
     DBE_WRITE_FAILED, /* 파일 쓰기 도중 실패. 그 줄이 기록됐는지 알 수 없음(일부만 남았을 수 있음) */
-    DBE_HALTED        /* 엔진이 중단 상태라 실행하지 않음 (db.h) */
+    DBE_HALTED,       /* 엔진이 중단 상태라 실행하지 않음 (db.h) */
+    DBE_REOPEN_FAILED /* Windows 전용: UPDATE·DELETE의 바꿔치기 뒤 데이터 파일을 다시 열지 못함. 파일은 온전 */
 } DbErrorKind;
 
 typedef struct {

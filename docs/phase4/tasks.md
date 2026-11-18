@@ -2,17 +2,17 @@
 
 ## 현재 상태
 
-**P4-01 완료(2026-11-18).** UPDATE·DELETE를 파싱한다(실행은 "아직 지원하지 않음"). 브랜치 `phase4-update-delete`(`phase3-server`의 `f8f88b4`에서 시작). D01~D08 확정, 100만 행 측정은 하지 않기로 했다(사용자). 다음 단위(P4-02)는 사용자 검증(PASS)을 받은 뒤 진행한다.
+**P4-01~P4-04 구현 완료(2026-11-18), 사용자 검증 대기.** 브랜치 `phase4-update-delete`(`phase3-server`의 `f8f88b4`에서 시작). D01~D08 확정, 100만 행 측정은 하지 않기로 했다(사용자).
 
-진행 방식: 한 단위를 구현한다 → 테스트와 ASan·TSan 검사로 검증한다 → 통과하면 커밋한다 → 사용자가 검증 결과(PASS)를 전하면 push·main 대상 PR을 만들고 다음 단위로 간다. 사용자 동작이나 공개 인터페이스를 바꾸는 결정은 구현 전에 짧게 제안한다.
+진행 방식: P4-01까지는 단위마다 사용자 검증(PASS)을 받았다. P4-02부터는 사용자가 "단계를 합쳐서 다 만들어 놓고 검증해도 된다"고 해서 P4-02~P4-04를 이어서 구현·자체 검증·커밋하고 한 번에 검증받는다. PASS 뒤 push·main 대상 PR.
 
 | ID | 기능 | 완료 기준 | 상태 |
 |---|---|---|---|
 | P4-00 | 구현 전 결정 | design.md DB-P4-D01~D08 확정 | 완료(2026-11-18) |
 | P4-01 | 문법 | D1 | 완료 |
-| P4-02 | 파일 다시 쓰기와 CLI | D2, D3, D4 | 대기 |
-| P4-03 | 서버와 동시성 | D5 | 대기 |
-| P4-04 | 문서와 실습 | D6 | 대기 |
+| P4-02 | 파일 다시 쓰기와 CLI | D2, D3, D4 | 완료(검증 대기) |
+| P4-03 | 서버와 동시성 | D5 | 완료(검증 대기) |
+| P4-04 | 문서와 실습 | D6 | 완료(검증 대기) |
 
 ## 단위별 흐름과 확인 시나리오
 
@@ -60,6 +60,15 @@ spec 대응:
 
 **파일:** `src/storage.{h,c}`, `src/executor.{h,c}`, `src/db.c`, `src/main.c`, `tests/test_unit.c`, `tests/cli_test.py`.
 
+**구현 메모 (2026-11-18):**
+- `table_rewrite(t, match, ctx, upd, &count, err)`: design.md "다시 쓰기 순서" 그대로. 원래 파일은 `scan_file`(위치 지정 읽기)로 처음부터 읽고, 행마다 `match`로 대상을 골라 `users.tsv.tmp`에 쓰면서 새 B+ 트리를 만든다. POSIX는 바꿔치기 전에 tmp를 `"a+b"`로 열어 두고 `rename` 뒤에는 실패할 단계가 없다. Windows는 옛 FILE*를 닫고 `MoveFileExA(..., MOVEFILE_REPLACE_EXISTING)` 뒤 다시 연다. 바꿔치기 실패면 원래 파일을 다시 열고 STORAGE, 바꿔치기 뒤 다시 열기 실패면 `DBE_REOPEN_FAILED`.
+- Executor: SET 값 검증(INSERT와 같은 `validate_name`·`validate_age`) → SELECT와 같은 경로(`run_where`)로 대상 세기 → 1행 이상이면 `table_rewrite`(대상 판정은 선형 탐색과 같은 `row_matches`). 결과는 새 `ResultSink.on_change(kind, count, ctx)`.
+- 다음 id: `Table.last_id`의 뜻이 "파일의 최대 id"에서 "마지막으로 부여한 id"로 넓어졌다. 시작 시 `max(파일의 최대 id, users.next)`. `users.next`는 새 파일의 최대 id가 `last_id`보다 작고 아직 그 값을 적지 않았을 때만 `users.next.tmp` + 바꿔치기로 쓴다. 형식이 틀린 `users.next`는 시작 거부("다음 id 파일 손상").
+- 시작 시 남은 `users.tsv.tmp`·`users.next.tmp`를 지운다.
+- 새 오류 종류 `DBE_REOPEN_FAILED`와 엔진 상태 `DB_HALTED_REOPEN`(Windows 전용, 서버 사유 코드 `reopen_failed`). 그 밖의 UPDATE·DELETE 실패는 원래 상태가 남으므로 엔진 상태를 바꾸지 않는다.
+- design.md 표의 `set_name`·`has_set_age` 대신 P4-01에서 정한 `name`·`age` + `set_cols`를 그대로 쓴다.
+- 테스트 빌드 전용 실패 주입: `table_test_fail_rewrite(REWRITE_FAIL_WRITE / NEXT / RENAME / REOPEN)`.
+
 ### P4-03 — 서버와 동시성
 
 **흐름:** 서버가 UPDATE·DELETE 결과를 JSON으로 돌려준다. 결과 자리를 실행 전에 확보한다. 동시 정확성 테스트에 UPDATE·DELETE를 섞는다.
@@ -71,13 +80,42 @@ spec 대응:
 
 **파일:** `src/server.c`, `tests/server_test.py`, `tests/test_unit.c`(동시 정확성).
 
+**구현 메모 (2026-11-18):** `json_on_change`가 `{"type":"update"|"delete","count":n}`을 쓴다. INSERT처럼 실행 전에 `jb_reserve(CHANGE_RESULT_MAX = 48)`로 결과 자리를 확보한다: 자리가 없으면 그 문장은 실행하지 않고 `RESULT_TOO_LARGE`(응답에 빠진 UPDATE가 파일에만 반영되는 일이 없다). `DBE_REOPEN_FAILED`는 500 `STORAGE`로 분류한다(POSIX 서버에서는 나오지 않음).
+
 ### P4-04 — 문서와 실습
 
 **흐름:** walkthrough에 Phase 4 실습(CLI·`curl`로 UPDATE·DELETE, 다음 id, 실패 시 무변경)과 요청이 엔진까지 가는 지도의 바뀐 부분을 더한다. 100만 행 측정은 하지 않는다(사용자 결정).
 
 **확인 시나리오:** walkthrough의 명령을 그대로 실행해 문서의 응답과 같은지 본다. 파일 다시 쓰기 방식과 덧붙이기 방식(채택하지 않음)의 차이를 설명으로 읽는다.
 
-**파일:** `docs/phase4/walkthrough.md`, README.
+**파일:** `docs/phase4/walkthrough.md`, README, `examples/phase4_*.sql`.
+
+**구현 메모 (2026-11-18):** walkthrough의 CLI 출력은 Windows 빌드로, 서버 출력은 Docker `gcc:13`에서 실제로 실행해 받은 값이다. 실습마다 "왜"와 "알 수 있는 것"을 적고 필수·선택을 표시했다.
+
+## P4-02~P4-04 검증 기록 (2026-11-18)
+
+| 명령 | 환경 | 결과 |
+|---|---|---|
+| `mingw32-make`, `mingw32-make test` | Windows, TDM-GCC 10.3 | 경고 0, 단위 31,227개·CLI 56개 실패 0 (Windows 전용 다시 열기 실패 테스트 포함) |
+| `make clean && make test` | Docker `gcc:13`, 저장소를 컨테이너 안에 복사 | 경고 0, 단위 31,224개·CLI 56개·서버 27개·부하 생성기 9개 실패 0 |
+| `make sanitize` | 같은 환경, ASan/UBSan/LSan | 실패 0, 보고 없음 |
+| `make tsan` | 같은 환경, TSan | 단위·서버 실패 0, 보고 없음 |
+| 변이 15개 | 같은 환경 | 모두 잡힘(아래) |
+
+변이: 0행이어도 다시 쓰기, DELETE가 행을 남김, UPDATE가 조건 무시, 인덱스 교체 안 함, `file_size` 갱신 안 함, `users.next` 안 씀, 시작 시 `users.next` 무시, 손상된 `users.next` 허용, 실패 시 tmp 남김, 시작 시 tmp 정리 안 함, STORAGE 실패에 중단 상태, SET age 검증 안 함, 서버 결과 자리 확보 안 함(서버 테스트), CLI 행 수 틀림(CLI 테스트), UPDATE·DELETE가 공유 잠금(TSan).
+
+**환경 관찰 — Docker Desktop(Windows) 공유 폴더:** 저장소를 `-v`로 마운트한 채 `make test`를 돌리면 단위 테스트 2개가 매번 실패했다. 다시 쓰기 뒤 Table이 파일을 연 채로 있는 동안 테스트가 같은 경로를 `fopen`하면 "No such file or directory"가 났다. 짧은 재현(파이썬: 열린 파일을 rename한 뒤 새 이름으로 열기)에서 공유 폴더만 실패하고 컨테이너 자체 `/tmp`는 성공했다. Windows 쪽에서는 보였다. 엔진 동작이 아니라 공유 폴더의 동작으로 판단해, Docker 검증은 저장소를 컨테이너 안에 복사해서 했다(`cp -r /src /w && cd /w && make test`). Phase 3까지의 테스트는 rename을 쓰지 않아 이 현상이 없었다.
+
+spec 대응:
+
+| ID | 테스트 |
+|---|---|
+| D2 | 단위 `test_p4_update_delete_basic`(id·age·범위 조건, 여러 행, 값이 같아도 셈, 새 인덱스로 조회·범위 조회, 트리 불변식, 이어지는 INSERT, 재시작), `test_p4_zero_rows_untouched`(0행이면 다시 쓰지 않음: 실패를 걸어 두고 성공 확인), `test_p4_update_validation`(값 검증 실패 시 무변경, SET에 없는 컬럼은 검사 안 함, Storage 이중 검사), `test_p4_model_random`(무작위 60번 vs 모델). CLI `p4_update_delete_basic`, `p4_zero_rows_leave_file_untouched`(inode·수정 시각), `p4_value_errors_change_nothing`, `p4_fail_fast_keeps_earlier_change`, `p4_timing_lines`, `p4_random_model`(25번, 매번 재시작) |
+| D3 | 단위 `test_p4_next_id`(가장 큰 id 삭제·재시작·전부 삭제·`users.next`가 더 작을 때·손상 8가지). CLI `p4_delete_max_id_keeps_next_id`, `p4_corrupt_next_file_refuses_start` |
+| D4 | 단위 `test_p4_rewrite_failure_keeps_original`(임시 파일 쓰기·users.next·바꿔치기 실패 × DELETE·UPDATE: 파일·조회·트리·엔진 상태 그대로, tmp 없음, 다시 실행하면 성공), `test_p4_windows_reopen_failure_halts`(Windows), `test_p4_startup_removes_tmp`. CLI `p4_stale_tmp_removed_on_start` |
+| D5 | 서버 `update_delete_json_results`(JSON 결과, 실행 오류 시 앞 문장 유지, 다음 id, 재시작 뒤 CLI로 같은 내용), `update_result_space_reserved_before_execution`, `update_delete_syntax_errors_execute_nothing`, `concurrent_mixed_writes_over_http`(8 클라이언트). 단위 `test_p4_concurrent_mixed`(4 스레드 × 150 연산, id 중복·빠짐 없음, 재시작 두 번). `make tsan` |
+| D6 | `docs/phase4/walkthrough.md`, README |
+| D7 | 위 검증 기록의 전체 테스트·sanitize·TSan |
 
 ## 공통 규칙 (Phase 1~3에서 이어짐)
 

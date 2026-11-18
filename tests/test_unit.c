@@ -55,9 +55,14 @@ static const char *fresh_dir(const char *name) {
     static char dir[512];
     char file[600];
 
+    static const char *const files[] = {"users.tsv", "users.tsv.tmp", "users.next", "users.next.tmp"};
+    size_t i;
+
     snprintf(dir, sizeof dir, "%s/%s", g_base, name);
-    snprintf(file, sizeof file, "%s/users.tsv", dir);
-    remove(file);
+    for (i = 0; i < sizeof files / sizeof files[0]; i++) {
+        snprintf(file, sizeof file, "%s/%s", dir, files[i]);
+        remove(file);
+    }
     make_dir(dir);
     return dir;
 }
@@ -443,34 +448,6 @@ static void test_parse_update_delete(void) {
     EXPECT_PARSE_ERROR("EXPLAIN DELETE FROM users WHERE id = 1;", "EXPLAIN은 SELECT 문에만");
 }
 
-static int count_row(const Row *row, void *ctx);
-
-/* P4-01: UPDATE·DELETE는 파싱되지만 실행은 아직 지원하지 않는다. 아무것도 바뀌지 않는다. */
-static void test_executor_update_delete_not_yet(void) {
-    const char *dir = fresh_dir("p4_not_yet");
-    Table *t = NULL;
-    DbError err = {{0}, DBE_NONE};
-    Statement st;
-    int n = 0;
-    int64_t id;
-    ResultSink sink = {NULL, NULL, NULL, NULL};
-
-    CHECK(table_open(dir, &t, &err) == 0);
-    if (t == NULL) {
-        return;
-    }
-    CHECK(table_append(t, "a", 1, &id, &err) == 0);
-    CHECK(parse_one("UPDATE users SET age = 2 WHERE id = 1;", &st, &err) == 1);
-    err.kind = DBE_NONE;
-    CHECK(executor_run(t, &st, &sink, &err) == -1 && err.kind == DBE_SQL && strstr(err.msg, "UPDATE") != NULL);
-    statement_free(&st);
-    CHECK(parse_one("DELETE FROM users WHERE id = 1;", &st, &err) == 1);
-    CHECK(executor_run(t, &st, &sink, &err) == -1 && strstr(err.msg, "DELETE") != NULL);
-    statement_free(&st);
-    CHECK(table_scan(t, count_row, &n, &err) == 0 && n == 1);
-    CHECK(table_close(t, &err) == 0);
-}
-
 static void test_parse_explain(void) {
     Statement st;
     DbError err = {{0}, DBE_NONE};
@@ -792,7 +769,7 @@ static void test_executor_validation(void) {
     {
         Statement st = {STMT_INSERT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0, 0};
         int64_t last = 0;
-        ResultSink sink = {count_insert, NULL, &last, NULL};
+        ResultSink sink = {count_insert, NULL, &last, NULL, NULL};
 
         CHECK(table_open(dir, &t, &err) == 0);
         st.kind = STMT_INSERT;
@@ -822,6 +799,7 @@ static void test_executor_insert_select(void) {
     sink.on_row = collect_row;
     sink.ctx = &last;
     sink.on_plan = NULL;
+    sink.on_change = NULL;
 
     CHECK(table_open(dir, &t, &err) == 0);
     CHECK(executor_run(t, &ins, &sink, &err) == 0 && last == 1);
@@ -841,7 +819,7 @@ static void test_executor_insert_select(void) {
 /* WHERE 조건으로 조회한 id 목록을 ids에 담고 개수를 돌려준다. */
 static int select_where(Table *t, WhereKind kind, int64_t value, int64_t *ids) {
     Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0, 0};
-    ResultSink sink = {NULL, collect_row, NULL, NULL};
+    ResultSink sink = {NULL, collect_row, NULL, NULL, NULL};
     DbError err = {{0}, DBE_NONE};
     Collected c;
     int i;
@@ -917,7 +895,7 @@ static void test_executor_id_uses_index_age_scans(void) {
     Statement by_id2 = {STMT_SELECT, NULL, 0, WHERE_ID, 2, 0, CMP_EQ, 0, 0};
     Statement by_age = {STMT_SELECT, NULL, 0, WHERE_AGE, 25, 0, CMP_EQ, 0, 0};
     Collected c;
-    ResultSink sink = {NULL, collect_row, NULL, NULL};
+    ResultSink sink = {NULL, collect_row, NULL, NULL, NULL};
 
     write_file(dir, good, sizeof good - 1);
     CHECK(table_open(dir, &t, &err) == 0);
@@ -1032,9 +1010,9 @@ static void test_executor_explain_does_not_execute(void) {
     Statement sel_age = {STMT_SELECT, NULL, 0, WHERE_AGE, 25, 0, CMP_EQ, 0, 0};
     Collected c;
     PlanCapture pc;
-    ResultSink sink = {NULL, row_must_not_be_called, NULL, capture_plan};
-    ResultSink rows_only = {NULL, row_must_not_be_called, NULL, NULL};
-    ResultSink collect = {NULL, collect_row, NULL, NULL};
+    ResultSink sink = {NULL, row_must_not_be_called, NULL, capture_plan, NULL};
+    ResultSink rows_only = {NULL, row_must_not_be_called, NULL, NULL, NULL};
+    ResultSink collect = {NULL, collect_row, NULL, NULL, NULL};
 
     write_file(dir, good, sizeof good - 1);
     CHECK(table_open(dir, &t, &err) == 0);
@@ -1071,7 +1049,7 @@ static void test_executor_explain_does_not_execute(void) {
 /* 범위 조회 결과(id 목록)를 out에 담고 개수를 돌려준다. 실패하면 -1. */
 static int select_range(Table *t, CmpOp op, int64_t v1, int64_t v2, int64_t *out, int cap) {
     Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 0, 0, CMP_EQ, 0, 0};
-    ResultSink sink = {NULL, collect_row, NULL, NULL};
+    ResultSink sink = {NULL, collect_row, NULL, NULL, NULL};
     DbError err = {{0}, DBE_NONE};
     Collected c;
     int i;
@@ -1209,7 +1187,7 @@ static void test_executor_range_reads_only_inside(void) {
     Statement r12 = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 1, 0, CMP_BETWEEN, 2, 0};
     Statement empty = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 2, 0, CMP_BETWEEN, 1, 0};
     Collected c;
-    ResultSink sink = {NULL, collect_row, NULL, NULL};
+    ResultSink sink = {NULL, collect_row, NULL, NULL, NULL};
 
     write_file(dir, good, sizeof good - 1);
     CHECK(table_open(dir, &t, &err) == 0);
@@ -1767,14 +1745,14 @@ static int remember_id(int64_t id, void *ctx) {
 
 static int db_insert(Db *db, const char *name, int age, int64_t *out_id, int64_t *stored, DbError *err) {
     Statement st = {STMT_INSERT, (char *)name, age, WHERE_NONE, 0, 0, CMP_EQ, 0, 0};
-    ResultSink sink = {remember_id, NULL, out_id, NULL};
+    ResultSink sink = {remember_id, NULL, out_id, NULL, NULL};
     return db_exec(db, &st, &sink, stored, err);
 }
 
 static int db_count(Db *db, WhereKind where, int64_t v, DbError *err) {
     Statement st = {STMT_SELECT, NULL, 0, where, v, 0, CMP_EQ, 0, 0};
     int n = 0;
-    ResultSink sink = {NULL, count_row, &n, NULL};
+    ResultSink sink = {NULL, count_row, &n, NULL, NULL};
     return db_exec(db, &st, &sink, NULL, err) == 0 ? n : -1;
 }
 
@@ -1806,7 +1784,7 @@ static void test_db_exec_basic_and_kinds(void) {
     {
         Statement st = {STMT_SELECT, NULL, 0, WHERE_ID, 1, 0, CMP_EQ, 0, 0};
         Collected c;
-        ResultSink sink = {NULL, collect_row, &c, NULL};
+        ResultSink sink = {NULL, collect_row, &c, NULL, NULL};
         c.count = 0;
         c.stop_after = 1;
         CHECK(db_exec(db, &st, &sink, NULL, &err) == -1 && err.kind == DBE_SINK);
@@ -1846,7 +1824,7 @@ static void test_db_halt_after_index_failure(void) {
     /* 중단 상태: 조회도 INSERT도 실행하지 않는다 */
     {
         Statement st = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0, 0};
-        ResultSink sink = {NULL, count_row, &n, NULL};
+        ResultSink sink = {NULL, count_row, &n, NULL, NULL};
         CHECK(db_exec(db, &st, &sink, &stored, &err) == -1);
         CHECK(err.kind == DBE_HALTED && stored == 0 && n == 0);
         CHECK(strstr(err.msg, "인덱스를 다시 만듭니다") != NULL);
@@ -1858,7 +1836,7 @@ static void test_db_halt_after_index_failure(void) {
     CHECK(db_open(dir, &db, &err) == 0);
     {
         Statement st = {STMT_SELECT, NULL, 0, WHERE_ID, 64, 0, CMP_EQ, 0, 0};
-        ResultSink sink = {NULL, collect_row, &c, NULL};
+        ResultSink sink = {NULL, collect_row, &c, NULL, NULL};
         c.count = 0;
         c.stop_after = 0;
         CHECK(db_exec(db, &st, &sink, NULL, &err) == 0);
@@ -1974,7 +1952,7 @@ static void *ct_worker(void *arg) {
             int64_t id = 0;
             SeqCheck sc = {0, 0, 0, NULL};
             Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID, 0, 0, CMP_EQ, 0, 0};
-            ResultSink rs = {NULL, seq_row, &sc, NULL};
+            ResultSink rs = {NULL, seq_row, &sc, NULL, NULL};
 
             snprintf(name, sizeof name, "t%d_%d", cs->tid, op);
             if (db_insert(cs->db, name, (cs->tid * 7 + op) % 151, &id, NULL, &err) != 0) {
@@ -2000,7 +1978,7 @@ static void *ct_worker(void *arg) {
             int64_t x;
             SeqCheck sc = {0, 0, 0, NULL};
             Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID, 0, 0, CMP_EQ, 0, 0};
-            ResultSink rs = {NULL, seq_row, &sc, NULL};
+            ResultSink rs = {NULL, seq_row, &sc, NULL, NULL};
 
             if (known_max == 0) {
                 continue;
@@ -2017,7 +1995,7 @@ static void *ct_worker(void *arg) {
             int64_t a, b, want;
             SeqCheck sc = {0, 0, 0, NULL};
             Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID_RANGE, 0, 0, CMP_BETWEEN, 0, 0};
-            ResultSink rs = {NULL, seq_row, &sc, NULL};
+            ResultSink rs = {NULL, seq_row, &sc, NULL, NULL};
 
             if (known_max == 0) {
                 continue;
@@ -2036,7 +2014,7 @@ static void *ct_worker(void *arg) {
         } else if (k < 90) {
             SeqCheck sc = {1, 0, 0, NULL};
             Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0, 0};
-            ResultSink rs = {NULL, seq_row, &sc, NULL};
+            ResultSink rs = {NULL, seq_row, &sc, NULL, NULL};
 
             if (db_exec(cs->db, &sel, &rs, NULL, &err) != 0) {
                 ct_error(cs, &err);
@@ -2048,7 +2026,7 @@ static void *ct_worker(void *arg) {
         } else {
             PlanSeen ps = {-1};
             Statement sel = {STMT_SELECT, NULL, 0, WHERE_AGE, 30, 1, CMP_EQ, 0, 0};
-            ResultSink rs = {NULL, NULL, &ps, plan_seen};
+            ResultSink rs = {NULL, NULL, &ps, plan_seen, NULL};
 
             if (db_exec(cs->db, &sel, &rs, NULL, &err) != 0) {
                 ct_error(cs, &err);
@@ -2142,7 +2120,7 @@ static void test_db_concurrent_correctness(void) {
         for (j = 0; j < st[i].n_ins; j++) {
             Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID, st[i].ids[j], 0, CMP_EQ, 0, 0};
             Collected c;
-            ResultSink rs = {NULL, collect_row, &c, NULL};
+            ResultSink rs = {NULL, collect_row, &c, NULL, NULL};
 
             c.count = 0;
             c.stop_after = 0;
@@ -2163,7 +2141,7 @@ static void test_db_concurrent_correctness(void) {
     {
         FinalCheck f = {0, 1, 0, total, names};
         Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0, 0};
-        ResultSink rs = {NULL, final_row, &f, NULL};
+        ResultSink rs = {NULL, final_row, &f, NULL, NULL};
         CHECK(db_exec(db, &sel, &rs, NULL, &err) == 0);
         CHECK(f.count == total && !f.broken);
     }
@@ -2426,7 +2404,7 @@ static int probe_row(const Row *row, void *ctx) {
 static void *probe_reader(void *arg) {
     LockProbe *p = arg;
     Statement st = {STMT_SELECT, NULL, 0, WHERE_ID, 1, 0, CMP_EQ, 0, 0};
-    ResultSink rs = {NULL, probe_row, p, NULL};
+    ResultSink rs = {NULL, probe_row, p, NULL, NULL};
     DbError err = {{0}, DBE_NONE};
     db_exec(p->db, &st, &rs, NULL, &err);
     return NULL;
@@ -2545,7 +2523,7 @@ static int wf_r2_row(const Row *row, void *ctx) {
 static void *wf_reader(void *arg, RowFn fn) {
     WriterFirst *p = arg;
     Statement st = {STMT_SELECT, NULL, 0, WHERE_ID, 1, 0, CMP_EQ, 0, 0};
-    ResultSink rs = {NULL, fn, p, NULL};
+    ResultSink rs = {NULL, fn, p, NULL, NULL};
     DbError err = {{0}, DBE_NONE};
     db_exec(p->db, &st, &rs, NULL, &err);
     return NULL;
@@ -2566,7 +2544,7 @@ static int wf_on_insert(int64_t id, void *ctx) { /* 엔진 잠금 안에서 불�
 static void *wf_w(void *arg) {
     WriterFirst *p = arg;
     Statement st = {STMT_INSERT, "w", 1, WHERE_NONE, 0, 0, CMP_EQ, 0, 0};
-    ResultSink rs = {wf_on_insert, NULL, p, NULL};
+    ResultSink rs = {wf_on_insert, NULL, p, NULL, NULL};
     DbError err = {{0}, DBE_NONE};
     db_exec(p->db, &st, &rs, NULL, &err);
     return NULL;
@@ -2741,6 +2719,726 @@ static void test_workqueue_threads(void) {
     free(seen);
 }
 
+/* ---------- Phase 4: UPDATE·DELETE ---------- */
+
+typedef struct {
+    int calls;
+    StmtKind kind;
+    int64_t count;
+} ChangeSeen;
+
+static int seen_change(StmtKind kind, int64_t count, void *ctx) {
+    ChangeSeen *c = ctx;
+    c->calls++;
+    c->kind = kind;
+    c->count = count;
+    return 0;
+}
+
+/* 문장 하나를 파싱해 실행한다. 반환: on_change로 받은 행 수, -2 파싱·실행 실패(err), -3 on_change 이상 */
+static int64_t run_change_sql(Table *t, Db *db, const char *sql, DbError *err) {
+    Statement st;
+    ChangeSeen c = {0, STMT_SELECT, -1};
+    ResultSink sink = {NULL, NULL, &c, NULL, seen_change};
+    StmtKind kind;
+    int rc;
+
+    if (parse_one(sql, &st, err) != 1) {
+        return -2;
+    }
+    kind = st.kind;
+    rc = t != NULL ? executor_run(t, &st, &sink, err) : db_exec(db, &st, &sink, NULL, err);
+    statement_free(&st);
+    if (rc != 0) {
+        return c.calls == 0 ? -2 : -3;
+    }
+    return c.calls == 1 && c.kind == kind ? c.count : -3;
+}
+
+#define t_change(t, sql, err) run_change_sql((t), NULL, (sql), (err))
+#define d_change(db, sql, err) run_change_sql(NULL, (db), (sql), (err))
+
+static int file_exists(const char *dir, const char *name) {
+    char path[600];
+    FILE *fp;
+
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    fp = fopen(path, "rb");
+    if (fp == NULL) {
+        return 0;
+    }
+    fclose(fp);
+    return 1;
+}
+
+static void write_named(const char *dir, const char *name, const char *data) {
+    char path[600];
+    FILE *fp;
+
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    fp = fopen(path, "wb");
+    if (fp == NULL) {
+        fprintf(stderr, "테스트 파일 생성 실패: %s\n", path);
+        exit(2);
+    }
+    fwrite(data, 1, strlen(data), fp);
+    fclose(fp);
+}
+
+static void read_named(const char *dir, const char *name, char *buf, size_t cap) {
+    char path[600];
+    FILE *fp;
+    size_t n = 0;
+
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    fp = fopen(path, "rb");
+    if (fp != NULL) {
+        n = fread(buf, 1, cap - 1, fp);
+        fclose(fp);
+    }
+    buf[n] = '\0';
+}
+
+typedef struct {
+    char buf[8192];
+    size_t len;
+} Dump;
+
+static int dump_row(const Row *row, void *ctx) {
+    Dump *d = ctx;
+    int n = snprintf(d->buf + d->len, sizeof d->buf - d->len, "%" PRId64 "\t%s\t%d\n", row->id, row->name, row->age);
+
+    if (n < 0 || (size_t)n >= sizeof d->buf - d->len) {
+        return 1;
+    }
+    d->len += (size_t)n;
+    return 0;
+}
+
+/* D2: 고치고 지운 결과가 파일·인덱스·범위 조회에 그대로 보이고, 다시 열어도 같다 */
+static void test_p4_update_delete_basic(void) {
+    const char *dir = fresh_dir("p4_basic");
+    Table *t = NULL;
+    DbError err = {{0}, DBE_NONE};
+    char buf[512];
+    char why[200] = "";
+    int64_t id;
+    Collected c;
+
+    CHECK(table_open(dir, &t, &err) == 0);
+    if (t == NULL) {
+        return;
+    }
+    CHECK(table_append(t, "a", 10, &id, &err) == 0);
+    CHECK(table_append(t, "b", 20, &id, &err) == 0);
+    CHECK(table_append(t, "c", 20, &id, &err) == 0);
+    CHECK(table_append(t, "d", 30, &id, &err) == 0);
+    CHECK(table_append(t, "e", 40, &id, &err) == 0);
+
+    CHECK(t_change(t, "UPDATE users SET age = 21 WHERE age = 20;", &err) == 2);          /* 선형 탐색 */
+    CHECK(t_change(t, "UPDATE users SET name = 'zz', age = 5 WHERE id = 1;", &err) == 1); /* 인덱스 조회 */
+    CHECK(t_change(t, "UPDATE users SET name = 'r' WHERE id BETWEEN 4 AND 9;", &err) == 2); /* 범위 조회 */
+    CHECK(t_change(t, "UPDATE users SET age = 21 WHERE id = 2;", &err) == 1); /* 값이 같아도 센다(D06) */
+    CHECK(t_change(t, "DELETE FROM users WHERE id = 3;", &err) == 1);
+    CHECK(t_change(t, "DELETE FROM users WHERE id > 100;", &err) == 0);
+    read_file(dir, buf, sizeof buf);
+    CHECK(strcmp(buf, "1\tzz\t5\n2\tb\t21\n4\tr\t30\n5\tr\t40\n") == 0);
+
+    /* 새 인덱스가 새 파일의 위치를 가리킨다 */
+    memset(&c, 0, sizeof c);
+    CHECK(table_find_by_id(t, 4, collect_row, &c, &err) == 0 && c.count == 1 && strcmp(c.names[0], "r") == 0 &&
+          c.ages[0] == 30);
+    c.count = 0;
+    CHECK(table_find_by_id(t, 3, collect_row, &c, &err) == 0 && c.count == 0);
+    c.count = 0;
+    CHECK(table_find_id_range(t, 2, 5, collect_row, &c, &err) == 0 && c.count == 3 && c.ids[0] == 2 &&
+          c.ids[1] == 4 && c.ids[2] == 5);
+    CHECK(table_row_count(t) == 4);
+    CHECK(table_test_validate_index(t, why, sizeof why) == 0);
+    CHECK(!file_exists(dir, "users.tsv.tmp"));
+    CHECK(!file_exists(dir, "users.next")); /* 가장 큰 id(5)는 지우지 않았다 */
+
+    /* 이어지는 INSERT는 새 파일에 덧붙고 인덱스에 들어간다 */
+    CHECK(table_append(t, "f", 50, &id, &err) == 0 && id == 6);
+    c.count = 0;
+    CHECK(table_find_by_id(t, 6, collect_row, &c, &err) == 0 && c.count == 1 && strcmp(c.names[0], "f") == 0);
+    CHECK(table_close(t, &err) == 0);
+
+    t = NULL;
+    CHECK(table_open(dir, &t, &err) == 0);
+    read_file(dir, buf, sizeof buf);
+    CHECK(strcmp(buf, "1\tzz\t5\n2\tb\t21\n4\tr\t30\n5\tr\t40\n6\tf\t50\n") == 0);
+    CHECK(t != NULL && table_last_id(t) == 6 && table_row_count(t) == 5);
+    CHECK(table_close(t, &err) == 0);
+}
+
+/* D06: 조건에 맞는 행이 없으면 0이고 파일을 다시 쓰지 않는다.
+   다시 쓰면 실패하도록 걸어 두고 실행해서, 다시 쓰기가 일어나지 않았음을 확인한다 */
+static void test_p4_zero_rows_untouched(void) {
+    const char *dir = fresh_dir("p4_zero");
+    Table *t = NULL;
+    DbError err = {{0}, DBE_NONE};
+    char before[256], after[256];
+    int64_t id;
+
+    CHECK(table_open(dir, &t, &err) == 0);
+    if (t == NULL) {
+        return;
+    }
+    CHECK(t_change(t, "DELETE FROM users WHERE id = 1;", &err) == 0); /* 빈 테이블 */
+    CHECK(table_append(t, "a", 1, &id, &err) == 0);
+    CHECK(table_append(t, "b", 2, &id, &err) == 0);
+    read_file(dir, before, sizeof before);
+
+    table_test_fail_rewrite(REWRITE_FAIL_WRITE);
+    CHECK(t_change(t, "UPDATE users SET age = 9 WHERE id = 99;", &err) == 0);
+    CHECK(t_change(t, "DELETE FROM users WHERE age = 77;", &err) == 0);
+    CHECK(t_change(t, "DELETE FROM users WHERE id BETWEEN 5 AND 3;", &err) == 0);
+    CHECK(t_change(t, "UPDATE users SET age = 9 WHERE id > 2;", &err) == 0);
+    table_test_fail_rewrite(REWRITE_FAIL_NONE);
+
+    read_file(dir, after, sizeof after);
+    CHECK(strcmp(before, after) == 0);
+    CHECK(!file_exists(dir, "users.tsv.tmp"));
+    CHECK(table_close(t, &err) == 0);
+}
+
+/* SET 값 검증은 INSERT와 같은 규칙이다. 실패하면 아무것도 바뀌지 않는다 */
+static void test_p4_update_validation(void) {
+    const char *dir = fresh_dir("p4_validate");
+    Table *t = NULL;
+    DbError err = {{0}, DBE_NONE};
+    char big[300];
+    char tabbed[] = "a\tb";
+    char empty[] = "";
+    char okname[] = "ok";
+    char buf[256];
+    int64_t id, n = -1;
+    ChangeSeen c = {0, STMT_SELECT, -1};
+    ResultSink sink = {NULL, NULL, &c, NULL, seen_change};
+    Statement up = {STMT_UPDATE, NULL, 151, WHERE_ID, 1, 0, CMP_EQ, 0, SET_COL_AGE};
+    RowUpdate bad = {1, "x\ny", 0, 0};
+
+    CHECK(table_open(dir, &t, &err) == 0);
+    if (t == NULL) {
+        return;
+    }
+    CHECK(table_append(t, "a", 1, &id, &err) == 0);
+
+    CHECK(executor_run(t, &up, &sink, &err) == -1 && err.kind == DBE_SQL && strstr(err.msg, "age") != NULL);
+    up.age = -1;
+    CHECK(executor_run(t, &up, &sink, &err) == -1 && err.kind == DBE_SQL);
+    memset(big, 'x', 256);
+    big[256] = '\0';
+    up.set_cols = SET_COL_NAME;
+    up.age = 0;
+    up.name = big;
+    CHECK(executor_run(t, &up, &sink, &err) == -1 && err.kind == DBE_SQL && strstr(err.msg, "255") != NULL);
+    up.name = tabbed;
+    CHECK(executor_run(t, &up, &sink, &err) == -1 && err.kind == DBE_SQL);
+    up.name = empty;
+    CHECK(executor_run(t, &up, &sink, &err) == -1 && err.kind == DBE_SQL);
+    up.set_cols = SET_COL_NAME | SET_COL_AGE;
+    up.name = okname;
+    up.age = 200;
+    CHECK(executor_run(t, &up, &sink, &err) == -1 && err.kind == DBE_SQL); /* 둘 중 하나라도 틀리면 거부 */
+    CHECK(c.calls == 0);
+    read_file(dir, buf, sizeof buf);
+    CHECK(strcmp(buf, "1\ta\t1\n") == 0);
+
+    /* SET에 없는 컬럼은 검사하지 않는다: age 칸에 범위 밖 값이 있어도 name만 바꾼다 */
+    up.set_cols = SET_COL_NAME;
+    CHECK(executor_run(t, &up, &sink, &err) == 0 && c.calls == 1 && c.count == 1);
+    read_file(dir, buf, sizeof buf);
+    CHECK(strcmp(buf, "1\tok\t1\n") == 0);
+
+    /* Storage도 파일 형식을 깨는 값을 따로 막는다 */
+    err.kind = DBE_NONE;
+    CHECK(table_rewrite(t, NULL, NULL, &bad, &n, &err) == -1 && err.kind == DBE_STORAGE && n == 0);
+    CHECK(!file_exists(dir, "users.tsv.tmp"));
+    CHECK(table_close(t, &err) == 0);
+}
+
+/* D3: 가장 큰 id를 지워도 다음 id는 줄지 않는다. 재시작해도 같다(users.next, DB-P4-D04) */
+static void test_p4_next_id(void) {
+    static const char *const bad_next[] = {"abc\n", "3", "0\n", "", "03\n", "-1\n", "3\n4\n",
+                                           "99999999999999999999\n"};
+    const char *dir = fresh_dir("p4_next");
+    Table *t = NULL;
+    DbError err = {{0}, DBE_NONE};
+    char buf[64];
+    int64_t id = 0;
+    size_t i;
+
+    CHECK(table_open(dir, &t, &err) == 0);
+    if (t == NULL) {
+        return;
+    }
+    CHECK(table_append(t, "a", 1, &id, &err) == 0);
+    CHECK(table_append(t, "b", 2, &id, &err) == 0);
+    CHECK(table_append(t, "c", 3, &id, &err) == 0);
+    CHECK(t_change(t, "DELETE FROM users WHERE id = 1;", &err) == 1);
+    CHECK(!file_exists(dir, "users.next")); /* 가장 큰 id가 아니면 쓰지 않는다 */
+    CHECK(t_change(t, "DELETE FROM users WHERE id = 3;", &err) == 1);
+    read_named(dir, "users.next", buf, sizeof buf);
+    CHECK(strcmp(buf, "3\n") == 0);
+    CHECK(!file_exists(dir, "users.next.tmp"));
+    CHECK(table_append(t, "d", 4, &id, &err) == 0 && id == 4);
+    CHECK(table_close(t, &err) == 0);
+
+    t = NULL;
+    CHECK(table_open(dir, &t, &err) == 0 && t != NULL);
+    if (t == NULL) {
+        return;
+    }
+    CHECK(table_last_id(t) == 4);
+    CHECK(t_change(t, "DELETE FROM users WHERE id >= 2;", &err) == 2); /* 전부 지움 */
+    read_named(dir, "users.next", buf, sizeof buf);
+    CHECK(strcmp(buf, "4\n") == 0);
+    read_file(dir, buf, sizeof buf);
+    CHECK(buf[0] == '\0');
+    CHECK(table_close(t, &err) == 0);
+
+    t = NULL;
+    CHECK(table_open(dir, &t, &err) == 0 && t != NULL);
+    if (t == NULL) {
+        return;
+    }
+    CHECK(table_last_id(t) == 4 && table_row_count(t) == 0);
+    CHECK(table_append(t, "e", 5, &id, &err) == 0 && id == 5);
+    CHECK(table_close(t, &err) == 0);
+
+    /* users.next가 파일의 최대 id보다 작으면 파일 쪽이 이긴다 */
+    dir = fresh_dir("p4_next_small");
+    write_file(dir, "1\ta\t1\n7\tb\t2\n", 12);
+    write_named(dir, "users.next", "3\n");
+    t = NULL;
+    CHECK(table_open(dir, &t, &err) == 0 && t != NULL && table_last_id(t) == 7);
+    CHECK(table_close(t, &err) == 0);
+
+    /* 손상된 users.next는 시작을 거부한다(조용히 0으로 보면 지운 id를 다시 줄 수 있다) */
+    for (i = 0; i < sizeof bad_next / sizeof bad_next[0]; i++) {
+        dir = fresh_dir("p4_next_bad");
+        write_named(dir, "users.next", bad_next[i]);
+        t = NULL;
+        err.kind = DBE_NONE;
+        CHECK(table_open(dir, &t, &err) == -1 && t == NULL && err.kind == DBE_STORAGE &&
+              strstr(err.msg, "다음 id 파일 손상") != NULL);
+    }
+}
+
+/* D4: 다시 쓰기의 어느 단계에서 실패해도 원래 파일·조회 결과가 그대로이고 임시 파일이 남지 않는다 */
+static void test_p4_rewrite_failure_keeps_original(void) {
+    static const int stages[] = {REWRITE_FAIL_WRITE, REWRITE_FAIL_NEXT, REWRITE_FAIL_RENAME};
+    size_t i;
+
+    for (i = 0; i < sizeof stages / sizeof stages[0]; i++) {
+        const char *dir = fresh_dir("p4_fail");
+        DbError err = {{0}, DBE_NONE};
+        Db *db = NULL;
+        char before[256], after[256];
+        char why[200] = "";
+        int64_t id = 0;
+
+        CHECK(db_open(dir, &db, &err) == 0);
+        if (db == NULL) {
+            return;
+        }
+        CHECK(db_insert(db, "a", 1, &id, NULL, &err) == 0);
+        CHECK(db_insert(db, "b", 2, &id, NULL, &err) == 0);
+        CHECK(db_insert(db, "c", 3, &id, NULL, &err) == 0);
+        read_file(dir, before, sizeof before);
+
+        table_test_fail_rewrite(stages[i]);
+        err.kind = DBE_NONE;
+        CHECK(d_change(db, "DELETE FROM users WHERE id = 3;", &err) == -2); /* 가장 큰 id: users.next 단계까지 간다 */
+        CHECK(err.kind == DBE_STORAGE);
+        if (err.kind != DBE_STORAGE) {
+            fprintf(stderr, "    단계 %d: %s\n", stages[i], err.msg);
+        }
+        CHECK(db_state(db) == DB_OK); /* 원래 상태가 남으므로 중단하지 않는다 */
+        read_file(dir, after, sizeof after);
+        CHECK(strcmp(before, after) == 0);
+        CHECK(!file_exists(dir, "users.tsv.tmp"));
+        CHECK(!file_exists(dir, "users.next.tmp"));
+        if (stages[i] != REWRITE_FAIL_RENAME) {
+            CHECK(!file_exists(dir, "users.next")); /* 바꿔치기 실패는 users.next 뒤라 남아도 된다 */
+        }
+        CHECK(db_count(db, WHERE_NONE, 0, &err) == 3);
+        CHECK(db_count(db, WHERE_ID, 3, &err) == 1);
+        CHECK(db_test_validate(db, why, sizeof why) == 0);
+
+        /* UPDATE도 같다 */
+        table_test_fail_rewrite(stages[i] == REWRITE_FAIL_NEXT ? REWRITE_FAIL_WRITE : stages[i]);
+        CHECK(d_change(db, "UPDATE users SET name = 'zz' WHERE id = 1;", &err) == -2 && err.kind == DBE_STORAGE);
+        read_file(dir, after, sizeof after);
+        CHECK(strcmp(before, after) == 0);
+        CHECK(!file_exists(dir, "users.tsv.tmp"));
+
+        /* 같은 문장을 다시 실행하면 성공하고, 다음 id는 지운 id 다음이다 */
+        CHECK(d_change(db, "DELETE FROM users WHERE id = 3;", &err) == 1);
+        CHECK(db_count(db, WHERE_NONE, 0, &err) == 2);
+        CHECK(db_insert(db, "d", 4, &id, NULL, &err) == 0 && id == 4);
+        CHECK(db_close(db, &err) == 0);
+    }
+    table_test_fail_rewrite(REWRITE_FAIL_NONE);
+}
+
+#ifdef _WIN32
+/* Windows: 바꿔치기 뒤 다시 열기에 실패하면 엔진을 중단 상태로 둔다. 파일은 온전하고 재시작하면 복원된다 */
+static void test_p4_windows_reopen_failure_halts(void) {
+    const char *dir = fresh_dir("p4_reopen");
+    DbError err = {{0}, DBE_NONE};
+    Db *db = NULL;
+    char buf[128];
+    int64_t id = 0;
+
+    CHECK(db_open(dir, &db, &err) == 0);
+    if (db == NULL) {
+        return;
+    }
+    CHECK(db_insert(db, "a", 1, &id, NULL, &err) == 0);
+    CHECK(db_insert(db, "b", 2, &id, NULL, &err) == 0);
+    table_test_fail_rewrite(REWRITE_FAIL_REOPEN);
+    CHECK(d_change(db, "DELETE FROM users WHERE id = 1;", &err) == -2 && err.kind == DBE_REOPEN_FAILED);
+    CHECK(db_state(db) == DB_HALTED_REOPEN);
+    err.kind = DBE_NONE;
+    CHECK(db_count(db, WHERE_NONE, 0, &err) == -1 && err.kind == DBE_HALTED);
+    CHECK(db_close(db, &err) == 0);
+    read_file(dir, buf, sizeof buf);
+    CHECK(strcmp(buf, "2\tb\t2\n") == 0);
+    db = NULL;
+    CHECK(db_open(dir, &db, &err) == 0 && db != NULL);
+    CHECK(db_count(db, WHERE_NONE, 0, &err) == 1);
+    CHECK(db_close(db, &err) == 0);
+}
+#endif
+
+/* 이전 실행이 다시 쓰기 도중 끝나 남긴 임시 파일은 시작할 때 지운다 */
+static void test_p4_startup_removes_tmp(void) {
+    const char *dir = fresh_dir("p4_tmp_cleanup");
+    Table *t = NULL;
+    DbError err = {{0}, DBE_NONE};
+    char buf[64];
+
+    write_file(dir, "1\ta\t1\n", 6);
+    write_named(dir, "users.tsv.tmp", "1\tpartial");
+    write_named(dir, "users.next.tmp", "9\n");
+    CHECK(table_open(dir, &t, &err) == 0 && t != NULL);
+    CHECK(!file_exists(dir, "users.tsv.tmp") && !file_exists(dir, "users.next.tmp"));
+    read_file(dir, buf, sizeof buf);
+    CHECK(strcmp(buf, "1\ta\t1\n") == 0);
+    CHECK(t != NULL && table_last_id(t) == 1); /* 남은 users.next.tmp는 반영하지 않는다 */
+    CHECK(table_close(t, &err) == 0);
+}
+
+/* 무작위 UPDATE·DELETE를 모델(배열)과 비교한다: 행 수, 파일 전체, 인덱스 조회, 트리 불변식, 재시작 */
+#define PM_ROWS 200
+static void test_p4_model_random(void) {
+    static struct {
+        int alive;
+        char name[16];
+        int age;
+    } m[PM_ROWS + 1];
+    static Dump got, want;
+    const char *dir = fresh_dir("p4_model");
+    Table *t = NULL;
+    DbError err = {{0}, DBE_NONE};
+    uint32_t seed = 12345u;
+    char why[200] = "";
+    int64_t id;
+    int i, op;
+
+    CHECK(table_open(dir, &t, &err) == 0);
+    if (t == NULL) {
+        return;
+    }
+    for (i = 1; i <= PM_ROWS; i++) {
+        m[i].alive = 1;
+        snprintf(m[i].name, sizeof m[i].name, "n%d", i);
+        m[i].age = (i * 7) % 60;
+        CHECK(table_append(t, m[i].name, m[i].age, &id, &err) == 0);
+    }
+    for (op = 0; op < 60; op++) {
+        uint32_t k = ct_rand(&seed) % 5;
+        int a = 1 + (int)(ct_rand(&seed) % PM_ROWS);
+        int b = a + (int)(ct_rand(&seed) % 30);
+        int v = (int)(ct_rand(&seed) % 60);
+        int64_t expect = 0, n;
+        int alive = 0;
+        char sql[128], newname[16];
+
+        snprintf(newname, sizeof newname, "u%d", op);
+        switch (k) {
+        case 0: snprintf(sql, sizeof sql, "DELETE FROM users WHERE age = %d;", v); break;
+        case 1: snprintf(sql, sizeof sql, "DELETE FROM users WHERE id BETWEEN %d AND %d;", a, b); break;
+        case 2: snprintf(sql, sizeof sql, "UPDATE users SET age = %d WHERE id = %d;", v, a); break;
+        case 3: snprintf(sql, sizeof sql, "UPDATE users SET name = '%s', age = %d WHERE id >= %d;", newname, v, b); break;
+        default: snprintf(sql, sizeof sql, "DELETE FROM users WHERE id = %d;", a); break;
+        }
+        for (i = 1; i <= PM_ROWS; i++) {
+            int hit;
+            if (!m[i].alive) {
+                continue;
+            }
+            switch (k) {
+            case 0: hit = m[i].age == v; break;
+            case 1: hit = i >= a && i <= b; break;
+            case 2: hit = i == a; break;
+            case 3: hit = i >= b; break;
+            default: hit = i == a; break;
+            }
+            if (!hit) {
+                continue;
+            }
+            expect++;
+            if (k == 2 || k == 3) {
+                m[i].age = v;
+                if (k == 3) {
+                    snprintf(m[i].name, sizeof m[i].name, "%s", newname);
+                }
+            } else {
+                m[i].alive = 0;
+            }
+        }
+        n = t_change(t, sql, &err);
+        CHECK(n == expect);
+        if (n != expect) {
+            fprintf(stderr, "    %s → %" PRId64 " (기대 %" PRId64 ") %s\n", sql, n, expect, err.msg);
+        }
+        want.len = 0;
+        want.buf[0] = '\0';
+        for (i = 1; i <= PM_ROWS; i++) {
+            if (m[i].alive) {
+                Row r;
+                r.id = i;
+                r.name = m[i].name;
+                r.age = m[i].age;
+                dump_row(&r, &want);
+                alive++;
+            }
+        }
+        got.len = 0;
+        got.buf[0] = '\0';
+        CHECK(table_scan(t, dump_row, &got, &err) == 0);
+        CHECK(got.len == want.len && strcmp(got.buf, want.buf) == 0);
+        CHECK(table_row_count(t) == alive);
+        CHECK(table_test_validate_index(t, why, sizeof why) == 0);
+        for (i = a - 1; i <= a + 1; i++) {
+            int cnt = 0;
+            if (i < 1 || i > PM_ROWS) {
+                continue;
+            }
+            CHECK(table_find_by_id(t, i, count_row, &cnt, &err) == 0 && cnt == m[i].alive);
+        }
+    }
+    CHECK(table_last_id(t) == PM_ROWS);
+    CHECK(table_close(t, &err) == 0);
+
+    t = NULL;
+    CHECK(table_open(dir, &t, &err) == 0 && t != NULL);
+    if (t == NULL) {
+        return;
+    }
+    got.len = 0;
+    got.buf[0] = '\0';
+    CHECK(table_scan(t, dump_row, &got, &err) == 0 && strcmp(got.buf, want.buf) == 0);
+    CHECK(table_append(t, "z", 1, &id, &err) == 0 && id == PM_ROWS + 1);
+    CHECK(table_close(t, &err) == 0);
+}
+
+/* D5: 여러 스레드가 INSERT·UPDATE·DELETE·SELECT를 섞는다. 각 스레드는 자기가 넣은 행만 고치고 지우므로
+   결과를 정확히 예상할 수 있다. 끝나면 각 스레드의 기록과 실제 내용, 트리 불변식, 재시작 뒤 내용을 비교한다 */
+#define MX_THREADS 4
+#define MX_OPS 150
+
+typedef struct {
+    Db *db;
+    int tid;
+    uint32_t seed;
+    int n;
+    int64_t ids[MX_OPS];
+    int ages[MX_OPS];
+    int alive[MX_OPS];
+    char names[MX_OPS][24];
+    int errors;
+    char first_error[256];
+    int bad;
+} MxState;
+
+typedef struct {
+    int64_t prev;
+    int broken;
+    int64_t count;
+} IncCheck;
+
+static int inc_row(const Row *row, void *ctx) {
+    IncCheck *c = ctx;
+    if (row->id <= c->prev) {
+        c->broken = 1;
+    }
+    c->prev = row->id;
+    c->count++;
+    return 0;
+}
+
+static void mx_error(MxState *s, const DbError *err) {
+    if (s->errors++ == 0) {
+        snprintf(s->first_error, sizeof s->first_error, "%s", err->msg);
+    }
+}
+
+static void *mx_worker(void *arg) {
+    MxState *s = arg;
+    int op;
+
+    for (op = 0; op < MX_OPS; op++) {
+        uint32_t k = ct_rand(&s->seed) % 100;
+        DbError err = {{0}, DBE_NONE};
+        char sql[128];
+
+        if (k < 35 || s->n == 0) {
+            int64_t id = 0;
+            int age = (int)(ct_rand(&s->seed) % 151);
+            snprintf(s->names[s->n], sizeof s->names[0], "m%d_%d", s->tid, op);
+            if (db_insert(s->db, s->names[s->n], age, &id, NULL, &err) != 0) {
+                mx_error(s, &err);
+                continue;
+            }
+            s->ids[s->n] = id;
+            s->ages[s->n] = age;
+            s->alive[s->n] = 1;
+            s->n++;
+        } else {
+            int j = (int)(ct_rand(&s->seed) % (uint32_t)s->n);
+            if (k < 55) {
+                int age = (int)(ct_rand(&s->seed) % 151);
+                int64_t got;
+                snprintf(sql, sizeof sql, "UPDATE users SET age = %d WHERE id = %" PRId64 ";", age, s->ids[j]);
+                got = d_change(s->db, sql, &err);
+                if (got < 0) {
+                    mx_error(s, &err);
+                } else if (got != s->alive[j]) {
+                    s->bad++;
+                } else if (got == 1) {
+                    s->ages[j] = age;
+                }
+            } else if (k < 70) {
+                int64_t got;
+                snprintf(sql, sizeof sql, "DELETE FROM users WHERE id = %" PRId64 ";", s->ids[j]);
+                got = d_change(s->db, sql, &err);
+                if (got < 0) {
+                    mx_error(s, &err);
+                } else if (got != s->alive[j]) {
+                    s->bad++;
+                } else {
+                    s->alive[j] = 0;
+                }
+            } else if (k < 90) {
+                Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID, s->ids[j], 0, CMP_EQ, 0, 0};
+                Collected c;
+                ResultSink rs = {NULL, collect_row, &c, NULL, NULL};
+                c.count = 0;
+                c.stop_after = 0;
+                if (db_exec(s->db, &sel, &rs, NULL, &err) != 0) {
+                    mx_error(s, &err);
+                } else if (c.count != s->alive[j] ||
+                           (c.count == 1 && (c.ages[0] != s->ages[j] || strcmp(c.names[0], s->names[j]) != 0))) {
+                    s->bad++;
+                }
+            } else {
+                IncCheck ic = {0, 0, 0};
+                Statement sel = {STMT_SELECT, NULL, 0, WHERE_NONE, 0, 0, CMP_EQ, 0, 0};
+                ResultSink rs = {NULL, inc_row, &ic, NULL, NULL};
+                if (db_exec(s->db, &sel, &rs, NULL, &err) != 0) {
+                    mx_error(s, &err);
+                } else if (ic.broken) {
+                    s->bad++;
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+static void test_p4_concurrent_mixed(void) {
+    const char *dir = fresh_dir("p4_concurrent");
+    static MxState st[MX_THREADS];
+    static unsigned char seen[MX_THREADS * MX_OPS + 1];
+    pthread_t th[MX_THREADS];
+    DbError err = {{0}, DBE_NONE};
+    Db *db = NULL;
+    int64_t inserted = 0, alive = 0, dup = 0, out_of_range = 0, id = 0;
+    char why[200] = "";
+    int i, j, pass;
+
+    CHECK(db_open(dir, &db, &err) == 0);
+    if (db == NULL) {
+        return;
+    }
+    for (i = 0; i < MX_THREADS; i++) {
+        memset(&st[i], 0, sizeof st[i]);
+        st[i].db = db;
+        st[i].tid = i;
+        st[i].seed = 0x85EBCA6Bu * (uint32_t)(i + 1);
+        CHECK(pthread_create(&th[i], NULL, mx_worker, &st[i]) == 0);
+    }
+    for (i = 0; i < MX_THREADS; i++) {
+        pthread_join(th[i], NULL);
+    }
+    memset(seen, 0, sizeof seen);
+    for (i = 0; i < MX_THREADS; i++) {
+        if (st[i].errors != 0) {
+            fprintf(stderr, "    스레드 %d 첫 오류: %s\n", i, st[i].first_error);
+        }
+        CHECK(st[i].errors == 0);
+        CHECK(st[i].bad == 0);
+        inserted += st[i].n;
+    }
+    /* 받은 id는 1..inserted가 정확히 한 번씩: 지운 id를 다시 주지 않는다 */
+    for (i = 0; i < MX_THREADS; i++) {
+        for (j = 0; j < st[i].n; j++) {
+            int64_t x = st[i].ids[j];
+            if (x < 1 || x > inserted) {
+                out_of_range++;
+            } else if (seen[x]++) {
+                dup++;
+            }
+            alive += st[i].alive[j];
+        }
+    }
+    CHECK(inserted > 0 && dup == 0 && out_of_range == 0);
+
+    /* 실행 중 상태와 재시작 뒤 상태가 모두 각 스레드의 기록과 같다 */
+    for (pass = 0; pass < 2; pass++) {
+        for (i = 0; i < MX_THREADS; i++) {
+            for (j = 0; j < st[i].n; j++) {
+                Statement sel = {STMT_SELECT, NULL, 0, WHERE_ID, st[i].ids[j], 0, CMP_EQ, 0, 0};
+                Collected c;
+                ResultSink rs = {NULL, collect_row, &c, NULL, NULL};
+                c.count = 0;
+                c.stop_after = 0;
+                CHECK(db_exec(db, &sel, &rs, NULL, &err) == 0);
+                CHECK(c.count == st[i].alive[j]);
+                if (c.count == 1) {
+                    CHECK(c.ages[0] == st[i].ages[j] && strcmp(c.names[0], st[i].names[j]) == 0);
+                }
+            }
+        }
+        CHECK(db_count(db, WHERE_NONE, 0, &err) == alive);
+        CHECK(db_test_validate(db, why, sizeof why) == 0);
+        CHECK(db_state(db) == DB_OK);
+        CHECK(db_close(db, &err) == 0);
+        db = NULL;
+        CHECK(db_open(dir, &db, &err) == 0);
+        if (db == NULL) {
+            return;
+        }
+    }
+    CHECK(db_insert(db, "next", 1, &id, NULL, &err) == 0 && id == inserted + 1);
+    CHECK(db_close(db, &err) == 0);
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "사용법: test_unit <임시 디렉터리>\n");
@@ -2763,7 +3461,6 @@ int main(int argc, char **argv) {
     test_parse_next_statement_error_isolated();
     test_parse_errors();
     test_parse_update_delete();
-    test_executor_update_delete_not_yet();
     test_parse_explain();
     test_parse_explain_errors();
     test_parse_id_range();
@@ -2820,6 +3517,18 @@ int main(int argc, char **argv) {
 
     test_workqueue_basic();
     test_workqueue_threads();
+
+    test_p4_update_delete_basic();
+    test_p4_zero_rows_untouched();
+    test_p4_update_validation();
+    test_p4_next_id();
+    test_p4_rewrite_failure_keeps_original();
+#ifdef _WIN32
+    test_p4_windows_reopen_failure_halts();
+#endif
+    test_p4_startup_removes_tmp();
+    test_p4_model_random();
+    test_p4_concurrent_mixed();
 
     printf("단위 테스트: %d개 검사 중 %d개 실패\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
