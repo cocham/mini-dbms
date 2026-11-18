@@ -643,11 +643,24 @@ static int take_fail(int stage) {
 #endif
 
 /* from을 to로 바꾼다(to가 있으면 덮어씀). POSIX rename은 한 번에 일어난다.
-   Windows rename은 있는 파일을 덮어쓰지 않으므로 MoveFileExA를 쓴다. */
+   Windows rename은 있는 파일을 덮어쓰지 않으므로 MoveFileExA를 쓴다.
+   Windows에서는 방금 닫거나 쓴 파일을 다른 프로세스(백신 검사·색인 등)가 잠깐 열고 있으면
+   MoveFileExA가 ERROR_ACCESS_DENIED·ERROR_SHARING_VIOLATION으로 실패한다(단위 테스트의 동시 다시 쓰기에서
+   여러 번 관찰). 그 두 오류만 짧게 기다리며 다시 시도한다(최대 약 1초). 바꿔치기 전이므로 기다려도 원래 상태다. */
 static int replace_file(const char *from, const char *to) {
 #ifdef _WIN32
-    if (MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING)) {
-        return 0;
+    DWORD code;
+    int attempt;
+
+    for (attempt = 0;; attempt++) {
+        if (MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING)) {
+            return 0;
+        }
+        code = GetLastError();
+        if ((code != ERROR_ACCESS_DENIED && code != ERROR_SHARING_VIOLATION) || attempt >= 20) {
+            break;
+        }
+        Sleep((DWORD)(attempt < 5 ? 10 : 50));
     }
     errno = EACCES;
     return -1;
