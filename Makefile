@@ -10,8 +10,8 @@ TSAN_FLAGS = -fsanitize=thread -fno-omit-frame-pointer -O1 -g
 # DB 진입점(db.c)이 pthread mutex를 쓴다. Windows는 TDM-GCC의 winpthreads (Phase 3, DB-P3-D04)
 THREAD_FLAGS = -pthread
 
-SRC = src/common.c src/parser.c src/bptree.c src/storage.c src/executor.c src/db.c src/json.c
-HDR = src/common.h src/parser.h src/bptree.h src/storage.h src/executor.h src/db.h src/json.h
+SRC = src/common.c src/parser.c src/bptree.c src/storage.c src/executor.c src/db.c src/json.c src/workqueue.c
+HDR = src/common.h src/parser.h src/bptree.h src/storage.h src/executor.h src/db.h src/json.h src/workqueue.h
 # API 서버 (Phase 3, POSIX 전용). Windows에서는 빌드하지 않는다 (DB-P3-D02)
 SERVER_SRC = src/http.c src/server.c
 SERVER_HDR = src/http.h
@@ -36,8 +36,9 @@ DEMO_BIN = build/bpt_demo$(EXE)
 
 SERVER_BIN = build/minidb-server
 SERVER_TEST_BIN = build/minidb-server-test
+LOADGEN_BIN = build/loadgen
 
-.PHONY: all test unit cli server sanitize tsan race-demo bench clean
+.PHONY: all test unit cli server sanitize tsan race-demo read-bench load-bench bench clean
 
 ifeq ($(OS),Windows_NT)
 all: $(BIN) $(DEMO_BIN)
@@ -73,8 +74,13 @@ unit: $(TEST_BIN)
 cli: $(BIN)
 	$(PYTHON) tests/cli_test.py $(BIN)
 
-server: $(SERVER_BIN) $(SERVER_TEST_BIN) $(BIN)
+server: $(SERVER_BIN) $(SERVER_TEST_BIN) $(BIN) $(LOADGEN_BIN)
 	$(PYTHON) tests/server_test.py $(SERVER_BIN) $(SERVER_TEST_BIN) $(BIN)
+	$(PYTHON) tests/loadgen_test.py $(LOADGEN_BIN)
+
+# 부하 생성기 (P3-05, POSIX). 측정 도구지만 집계가 틀리면 측정이 틀리므로 make test에서 가짜 서버로 검사한다.
+$(LOADGEN_BIN): tools/loadgen.c | build
+	$(CC) $(CFLAGS) $(THREAD_FLAGS) -o $@ tools/loadgen.c
 
 # Linux 전용: ASan/UBSan과 LeakSanitizer로 단위·CLI 테스트를 다시 실행한다.
 sanitize:
@@ -88,6 +94,8 @@ sanitize:
 	$(CC) $(CFLAGS) $(SAN_FLAGS) $(THREAD_FLAGS) -o build/san/minidb-server $(SRC) $(SERVER_SRC)
 	$(CC) $(CFLAGS) $(SAN_FLAGS) $(THREAD_FLAGS) -DMINIDB_TESTING -Isrc -o build/san/minidb-server-test $(SRC) $(SERVER_SRC)
 	ASAN_OPTIONS=detect_leaks=1 $(PYTHON) tests/server_test.py build/san/minidb-server build/san/minidb-server-test build/san/minidb
+	$(CC) $(CFLAGS) $(SAN_FLAGS) $(THREAD_FLAGS) -o build/san/loadgen tools/loadgen.c
+	ASAN_OPTIONS=detect_leaks=1 $(PYTHON) tests/loadgen_test.py build/san/loadgen
 
 # Linux 전용: ThreadSanitizer로 단위 테스트(동시 정확성 테스트 포함)를 다시 실행한다. 보고가 있으면 실패.
 #   최근 커널(mmap 무작위 비트 32)에서는 GCC 13의 TSan이 주소 배치를 받아들이지 못해 시작하지 못한다.
@@ -122,6 +130,27 @@ race-demo:
 	@printf 'TSan 경고 수: '; grep -c "WARNING: ThreadSanitizer" build/race/tsan.txt || true
 	@grep -E -m8 "WARNING: ThreadSanitizer|^    #0 " build/race/tsan.txt || true
 	@echo '(전체 보고: build/race/tsan.txt)'
+
+# Linux 전용 측정(판정 없음, test에 넣지 않음, P3-04): 같은 데이터로 전역 잠금 빌드와 읽기·쓰기 잠금 빌드를
+#   비교한다. 선형 탐색을 동시에 보냈을 때 전체 시간, 탐색이 도는 동안 INSERT 응답 시간(writer 기아).
+#   make read-bench READ_ROWS=200000 READ_CLIENTS=8 처럼 바꿔 볼 수 있다. 결과는 CPU 수에 따라 다르다.
+READ_ROWS ?= 1000000
+READ_CLIENTS ?= 4
+read-bench: $(SERVER_BIN)
+	$(CC) $(CFLAGS) $(THREAD_FLAGS) -DMINIDB_GLOBAL_LOCK -o build/minidb-server-global $(SRC) $(SERVER_SRC)
+	$(PYTHON) tools/read_parallel.py --rw $(SERVER_BIN) --global build/minidb-server-global \
+		--rows $(READ_ROWS) --clients $(READ_CLIENTS) --threads $(READ_CLIENTS)
+
+# Linux 전용 부하 측정(판정 없음, test에 넣지 않음, P3-05): 워커 수, 요청 종류 × 잠금 방식, 큐 크기별
+#   처리량과 응답 시간 분포. 결과는 build/load_result.md에도 쓴다. docs/phase3/benchmark.md로 옮긴다.
+#   측정 사이에 TIME_WAIT 연결이 빠질 때까지 기다리므로 몇 분 걸린다(tools/load.py 설명).
+#   make load-bench LOAD_ROWS=200000 처럼 줄여 볼 수 있다.
+LOAD_ROWS ?= 1000000
+LOAD_SECONDS ?= 2
+load-bench: $(SERVER_BIN) $(BIN) $(LOADGEN_BIN)
+	$(CC) $(CFLAGS) $(THREAD_FLAGS) -DMINIDB_GLOBAL_LOCK -o build/minidb-server-global $(SRC) $(SERVER_SRC)
+	$(PYTHON) tools/load.py --server $(SERVER_BIN) --global build/minidb-server-global --cli $(BIN) \
+		--loadgen $(LOADGEN_BIN) --rows $(LOAD_ROWS) --seconds $(LOAD_SECONDS)
 
 # 100만 건 생성·삽입 후 인덱스 조회 vs 선형 탐색 측정 (P2-04). 느리므로 test에 넣지 않는다.
 #   make bench BENCH_ROWS=100000 처럼 건수를 줄여 볼 수 있다. 결과는 docs/phase2/benchmark.md로 옮긴다.

@@ -1,3 +1,6 @@
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L /* pread */
+#endif
 #include "storage.h"
 
 #include "bptree.h"
@@ -10,11 +13,15 @@
 #include <string.h>
 
 #ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
 #include <direct.h>
+#include <io.h>
+#include <windows.h>
 #define make_dir(path) _mkdir(path)
 #else
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 #define make_dir(path) mkdir((path), 0755)
 #endif
 
@@ -23,22 +30,110 @@
 #define AGE_MAX_DIGITS 3
 /* 가장 긴 레코드: 19 + 1 + 255 + 1 + 3 = 279바이트. 넉넉히 잡고 넘으면 손상으로 본다. */
 #define LINE_CAP 320
+#define SCAN_BUF (64 * 1024) /* 선형 탐색·범위 조회가 호출마다 따로 쓰는 읽기 버퍼 */
 
 struct Table {
-    FILE *fp;      /* "a+b": 읽기는 아무 위치에서, 쓰기는 항상 파일 끝 */
+    FILE *fp;      /* "a+b". INSERT(쓰기)만 쓴다. 조회는 이 FILE*의 위치·버퍼를 건드리지 않는다 */
+    int fd;        /* fp의 파일 서술자. 조회는 위치를 지정해 읽는다(read_at) */
     char *path;
-    int64_t last_id; /* 파일에 있는 최대 ID. 빈 테이블이면 0 */
-    BpTree *index;   /* id → 그 레코드 줄이 시작하는 바이트 위치. 메모리에만 있다 */
+    int64_t last_id;   /* 파일에 있는 최대 ID. 빈 테이블이면 0 */
+    int64_t file_size; /* 끝까지 기록된 줄의 바이트 합. INSERT가 배타 잠금 안에서 늘린다 */
+    BpTree *index;     /* id → 그 레코드 줄이 시작하는 바이트 위치. 메모리에만 있다 */
 };
 
-/* ---------- 레코드 읽기 ---------- */
+/* ---------- 레코드 읽기 (Phase 3 P3-04: 공유 상태를 쓰지 않는 읽기) ----------
+ *
+ * 조회는 여러 스레드에서 동시에 돌 수 있다(db.c의 공유 잠금). 그래서 조회 경로는 Table을 읽기만 한다.
+ *   - 파일 위치: 공유 FILE*에 fseek하지 않고, 읽을 위치를 매번 지정한다(POSIX pread, Windows ReadFile+OVERLAPPED)
+ *   - 버퍼: 호출마다 자기 Reader(지역 변수)와 버퍼를 쓴다
+ *   - 파일 끝: 조회를 시작할 때의 file_size까지만 읽는다(C2: 시작 시점의 행만 본다)
+ */
+
+/* off에서 최대 n바이트를 읽는다. 읽은 바이트 수(0이면 파일 끝), -1 오류 */
+static long read_at(int fd, char *buf, size_t n, int64_t off) {
+#ifdef _WIN32
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    OVERLAPPED ov;
+    DWORD got = 0;
+
+    if (h == INVALID_HANDLE_VALUE) {
+        return -1;
+    }
+    memset(&ov, 0, sizeof ov);
+    ov.Offset = (DWORD)((uint64_t)off & 0xFFFFFFFFu);
+    ov.OffsetHigh = (DWORD)((uint64_t)off >> 32);
+    if (!ReadFile(h, buf, (DWORD)n, &got, &ov)) {
+        return GetLastError() == ERROR_HANDLE_EOF ? 0 : -1;
+    }
+    return (long)got;
+#else
+    for (;;) {
+        ssize_t r = pread(fd, buf, n, (off_t)off);
+        if (r >= 0) {
+            return (long)r;
+        }
+        if (errno != EINTR) {
+            return -1;
+        }
+    }
+#endif
+}
+
+typedef struct {
+    int fd;
+    char *buf;
+    size_t cap;
+    size_t len, at; /* buf[at, len): 아직 넘겨주지 않은 바이트 */
+    int64_t next;   /* 다음 read_at 위치 */
+    int64_t end;    /* 이 위치 앞까지만 읽는다 */
+} Reader;
+
+static void reader_init(Reader *r, int fd, char *buf, size_t cap, int64_t pos, int64_t end) {
+    r->fd = fd;
+    r->buf = buf;
+    r->cap = cap;
+    r->len = r->at = 0;
+    r->next = pos;
+    r->end = end;
+}
+
+static void reader_seek(Reader *r, int64_t pos) {
+    r->len = r->at = 0;
+    r->next = pos;
+}
+
+/* 바이트 하나(0~255), -1 끝, -2 읽기 오류 */
+static int reader_getc(Reader *r) {
+    if (r->at == r->len) {
+        size_t want = r->cap;
+        long n;
+
+        if (r->next >= r->end) {
+            return -1;
+        }
+        if ((uint64_t)(r->end - r->next) < want) {
+            want = (size_t)(r->end - r->next);
+        }
+        n = read_at(r->fd, r->buf, want, r->next);
+        if (n < 0) {
+            return -2;
+        }
+        if (n == 0) {
+            return -1;
+        }
+        r->len = (size_t)n;
+        r->at = 0;
+        r->next += n;
+    }
+    return (unsigned char)r->buf[r->at++];
+}
 
 /* 1: 한 줄 읽음(LF 제외), 0: 파일 끝, -1: 형식 손상(*why 설정), -2: 읽기 오류 */
-static int read_line(FILE *fp, char *buf, size_t cap, size_t *out_len, const char **why) {
+static int read_line(Reader *rd, char *buf, size_t cap, size_t *out_len, const char **why) {
     size_t n = 0;
     int c;
 
-    while ((c = getc(fp)) != EOF) {
+    while ((c = reader_getc(rd)) >= 0) {
         if (c == '\n') {
             buf[n] = '\0';
             *out_len = n;
@@ -54,7 +149,7 @@ static int read_line(FILE *fp, char *buf, size_t cap, size_t *out_len, const cha
         }
         buf[n++] = (char)c;
     }
-    if (ferror(fp)) {
+    if (c == -2) {
         return -2;
     }
     if (n > 0) {
@@ -130,7 +225,8 @@ static int parse_record(char *line, size_t len, int64_t prev_id, Row *row, const
     return 0;
 }
 
-static int scan_file(Table *t, BpTree *build, RowFn fn, void *ctx, int64_t *out_last_id, DbError *err);
+static int scan_file(Table *t, BpTree *build, RowFn fn, void *ctx, int64_t end, int64_t *out_last_id,
+                     int64_t *out_size, DbError *err);
 
 /* ---------- 공개 함수 ---------- */
 
@@ -166,14 +262,20 @@ int table_open(const char *data_dir, Table **out, DbError *err) {
             goto fail;
         }
     }
+#ifdef _WIN32
+    t->fd = _fileno(t->fp);
+#else
+    t->fd = fileno(t->fp);
+#endif
 
-    /* 시작할 때 한 번만 전체를 검증하며 최대 ID를 복원하고, id 인덱스를 메모리에 다시 만든다. */
+    /* 시작할 때 한 번만 전체(실제 파일 끝까지)를 검증하며 최대 ID와 파일 크기를 복원하고,
+       id 인덱스를 메모리에 다시 만든다. */
     t->index = bpt_create(BPT_DEFAULT_ORDER);
     if (t->index == NULL) {
         db_error_setk(err, DBE_STORAGE, "메모리가 부족합니다");
         goto fail;
     }
-    if (scan_file(t, t->index, NULL, NULL, &t->last_id, err) != 0) {
+    if (scan_file(t, t->index, NULL, NULL, INT64_MAX, &t->last_id, &t->file_size, err) != 0) {
         goto fail;
     }
     *out = t;
@@ -190,30 +292,33 @@ fail:
 }
 
 /*
- * 파일을 처음부터 끝까지 한 줄씩 읽어 검증하고 fn을 호출한다.
+ * 파일을 처음부터 end 앞까지 한 줄씩 읽어 검증하고 fn을 호출한다.
  * build가 NULL이 아니면 각 레코드의 (id, 줄 시작 바이트 위치)를 build 인덱스에 넣는다.
- * 위치는 ftell 대신 직접 센다: 줄 길이 + LF 1바이트. 바이너리 모드라 바이트 수가 정확하다.
- * out_last_id가 NULL이 아니면 마지막 id를 담는다. 시작 시 복원(table_open)만 넘기고,
- * 일반 조회(table_scan)는 NULL을 넘겨 공유 상태(Table)를 바꾸지 않는다(Phase 3, DB-P3-D05).
+ * 위치는 직접 센다: 줄 길이 + LF 1바이트. 바이너리 모드라 바이트 수가 정확하다.
+ * out_last_id·out_size가 NULL이 아니면 마지막 id와 읽은 바이트 수를 담는다. 시작 시 복원(table_open)만
+ * 넘기고, 일반 조회(table_scan)는 NULL을 넘겨 공유 상태(Table)를 바꾸지 않는다(Phase 3, DB-P3-D05).
  */
-static int scan_file(Table *t, BpTree *build, RowFn fn, void *ctx, int64_t *out_last_id, DbError *err) {
+static int scan_file(Table *t, BpTree *build, RowFn fn, void *ctx, int64_t end, int64_t *out_last_id,
+                     int64_t *out_size, DbError *err) {
     char line[LINE_CAP];
-    char eb[128];
     size_t len;
     long lineno = 0;
     int64_t prev_id = 0;
     int64_t offset = 0; /* 다음에 읽을 줄이 시작하는 바이트 위치 */
+    char *buf = malloc(SCAN_BUF);
+    Reader rd;
+    int rc = 0;
 
-    /* 쓰기 직후 읽기로 바꿀 때는 flush/seek가 필요하다(C 표준 규칙). */
-    if (fflush(t->fp) != 0 || fseek(t->fp, 0, SEEK_SET) != 0) {
-        db_error_setk(err, DBE_STORAGE, "데이터 파일 읽기 준비 실패: %s (%s)", t->path, db_errstr(errno, eb, sizeof eb));
+    if (buf == NULL) {
+        db_error_setk(err, DBE_STORAGE, "메모리가 부족합니다");
         return -1;
     }
+    reader_init(&rd, t->fd, buf, SCAN_BUF, 0, end);
     for (;;) {
         Row row;
         const char *why = NULL;
         int64_t line_start = offset;
-        int r = read_line(t->fp, line, sizeof line, &len, &why);
+        int r = read_line(&rd, line, sizeof line, &len, &why);
 
         if (r == 0) {
             break;
@@ -221,40 +326,51 @@ static int scan_file(Table *t, BpTree *build, RowFn fn, void *ctx, int64_t *out_
         lineno++;
         if (r == -2) {
             db_error_setk(err, DBE_STORAGE, "데이터 파일 읽기 실패: %s", t->path);
-            return -1;
+            rc = -1;
+            break;
         }
         if (r == -1 || parse_record(line, len, prev_id, &row, &why) != 0) {
             db_error_setk(err, DBE_STORAGE, "데이터 파일 손상: %s %ld번째 줄: %s", t->path, lineno, why);
-            return -1;
+            rc = -1;
+            break;
         }
         offset += (int64_t)len + 1;
         prev_id = row.id;
         if (build != NULL && bpt_insert(build, row.id, line_start) != BPT_OK) {
             /* id는 위에서 증가 순서를 확인했으므로 중복은 없다. 남은 원인은 메모리 부족뿐이다. */
             db_error_setk(err, DBE_STORAGE, "메모리가 부족해 인덱스를 만들 수 없습니다");
-            return -1;
+            rc = -1;
+            break;
         }
         if (fn != NULL && fn(&row, ctx) != 0) {
             db_error_setk(err, DBE_SINK, "조회 결과 처리에 실패했습니다");
-            return -1;
+            rc = -1;
+            break;
         }
     }
-    if (out_last_id != NULL) {
-        *out_last_id = prev_id;
+    free(buf);
+    if (rc == 0) {
+        if (out_last_id != NULL) {
+            *out_last_id = prev_id;
+        }
+        if (out_size != NULL) {
+            *out_size = offset;
+        }
     }
-    return 0;
+    return rc;
 }
 
 int table_scan(Table *t, RowFn fn, void *ctx, DbError *err) {
-    return scan_file(t, NULL, fn, ctx, NULL, err);
+    return scan_file(t, NULL, fn, ctx, t->file_size, NULL, NULL, err);
 }
 
 int table_find_by_id(Table *t, int64_t id, RowFn fn, void *ctx, DbError *err) {
     char line[LINE_CAP];
-    char eb[128];
+    char buf[LINE_CAP];
     size_t len;
     int64_t offset;
     const char *why = NULL;
+    Reader rd;
     Row row;
     int r;
 
@@ -262,16 +378,9 @@ int table_find_by_id(Table *t, int64_t id, RowFn fn, void *ctx, DbError *err) {
     if (!bpt_search(t->index, id, &offset)) {
         return 0;
     }
-    if (offset > LONG_MAX) {
-        db_error_setk(err, DBE_STORAGE, "데이터 파일이 너무 커서 위치로 이동할 수 없습니다: %s", t->path);
-        return -1;
-    }
-    /* 2) 그 위치로 바로 이동해 한 줄만 읽는다. */
-    if (fflush(t->fp) != 0 || fseek(t->fp, (long)offset, SEEK_SET) != 0) {
-        db_error_setk(err, DBE_STORAGE, "데이터 파일 위치 이동 실패: %s (%s)", t->path, db_errstr(errno, eb, sizeof eb));
-        return -1;
-    }
-    r = read_line(t->fp, line, sizeof line, &len, &why);
+    /* 2) 그 위치에서 한 줄만 읽는다(한 줄은 LINE_CAP 안에 들어간다). */
+    reader_init(&rd, t->fd, buf, sizeof buf, offset, t->file_size);
+    r = read_line(&rd, line, sizeof line, &len, &why);
     if (r == -2) {
         db_error_setk(err, DBE_STORAGE, "데이터 파일 읽기 실패: %s", t->path);
         return -1;
@@ -289,42 +398,34 @@ int table_find_by_id(Table *t, int64_t id, RowFn fn, void *ctx, DbError *err) {
     return 0;
 }
 
-/* table_find_id_range가 bpt_range 콜백으로 넘기는 상태 */
+/* table_find_id_range가 bpt_range 콜백으로 넘기는 상태(호출마다 지역 변수) */
 typedef struct {
     Table *t;
     RowFn fn;
     void *ctx;
     DbError *err;
-    int64_t next_pos; /* 파일 포인터가 지금 있는 위치. -1이면 아직 이동 전 */
+    Reader rd;
+    int64_t next_pos; /* rd가 다음에 넘겨줄 바이트의 위치. -1이면 아직 이동 전 */
 } RangeRead;
 
 /*
  * 리프에서 (id, 위치)를 하나 받을 때마다 그 줄을 읽는다.
  * id가 증가 순서로 저장되므로 범위 안의 줄은 파일에서도 이어져 있다. 그래서 보통 첫 줄에서만
- * fseek하고 나머지는 이어서 읽는다. 위치가 이어지지 않으면(예상 밖 상황) 그 위치로 다시 이동한다.
+ * 위치를 정하고 나머지는 버퍼에서 이어서 읽는다. 위치가 이어지지 않으면(예상 밖 상황) 그 위치로 다시 정한다.
  * 반환: 0 계속, 1 오류(err 설정 완료)
  */
 static int range_visit(int64_t id, int64_t offset, void *vctx) {
     RangeRead *rr = vctx;
     char line[LINE_CAP];
-    char eb[128];
     size_t len;
     const char *why = NULL;
     Row row;
     int r;
 
     if (offset != rr->next_pos) {
-        if (offset > LONG_MAX) {
-            db_error_setk(rr->err, DBE_STORAGE, "데이터 파일이 너무 커서 위치로 이동할 수 없습니다: %s", rr->t->path);
-            return 1;
-        }
-        if ((rr->next_pos < 0 && fflush(rr->t->fp) != 0) ||
-            fseek(rr->t->fp, (long)offset, SEEK_SET) != 0) {
-            db_error_setk(rr->err, DBE_STORAGE, "데이터 파일 위치 이동 실패: %s (%s)", rr->t->path, db_errstr(errno, eb, sizeof eb));
-            return 1;
-        }
+        reader_seek(&rr->rd, offset);
     }
-    r = read_line(rr->t->fp, line, sizeof line, &len, &why);
+    r = read_line(&rr->rd, line, sizeof line, &len, &why);
     if (r == -2) {
         db_error_setk(rr->err, DBE_STORAGE, "데이터 파일 읽기 실패: %s", rr->t->path);
         return 1;
@@ -345,13 +446,22 @@ static int range_visit(int64_t id, int64_t offset, void *vctx) {
 
 int table_find_id_range(Table *t, int64_t lo, int64_t hi, RowFn fn, void *ctx, DbError *err) {
     RangeRead rr;
+    char *buf = malloc(SCAN_BUF);
+    int rc;
 
+    if (buf == NULL) {
+        db_error_setk(err, DBE_STORAGE, "메모리가 부족합니다");
+        return -1;
+    }
     rr.t = t;
     rr.fn = fn;
     rr.ctx = ctx;
     rr.err = err;
+    reader_init(&rr.rd, t->fd, buf, SCAN_BUF, 0, t->file_size);
     rr.next_pos = -1;
-    return bpt_range(t->index, lo, hi, range_visit, &rr) == 0 ? 0 : -1;
+    rc = bpt_range(t->index, lo, hi, range_visit, &rr) == 0 ? 0 : -1;
+    free(buf);
+    return rc;
 }
 
 #ifdef MINIDB_TESTING
@@ -363,6 +473,7 @@ int table_append(Table *t, const char *name, int age, int64_t *out_id, DbError *
     size_t name_len = strlen(name);
     int64_t id;
     long offset;
+    int written;
     char eb[128];
 
     if (out_id != NULL) {
@@ -398,13 +509,15 @@ int table_append(Table *t, const char *name, int age, int64_t *out_id, DbError *
     }
 #endif
     /* 쓰기 도중 실패하면 줄 전체·일부·없음 중 무엇이 남았는지 알 수 없다. */
-    if (fprintf(t->fp, "%" PRId64 "\t%s\t%d\n", id, name, age) < 0 || fflush(t->fp) != 0) {
+    if ((written = fprintf(t->fp, "%" PRId64 "\t%s\t%d\n", id, name, age)) < 0 || fflush(t->fp) != 0) {
         db_error_setk(err, DBE_WRITE_FAILED, "데이터 파일 쓰기 실패: %s (%s)", t->path,
                       db_errstr(errno, eb, sizeof eb));
         return -1;
     }
-    /* 여기부터는 파일 기록 완료(운영체제에 넘어감, fsync는 하지 않음). */
+    /* 여기부터는 파일 기록 완료(운영체제에 넘어감, fsync는 하지 않음).
+       조회가 읽는 끝(file_size)은 줄 전체가 기록된 뒤에만 늘린다: 반쯤 쓰인 줄은 조회에 보이지 않는다. */
     t->last_id = id;
+    t->file_size = (int64_t)offset + written;
     if (out_id != NULL) {
         *out_id = id;
     }
