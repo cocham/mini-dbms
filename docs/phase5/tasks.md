@@ -7,7 +7,7 @@
 | ID | 기능 | 완료 기준 | 상태 |
 |---|---|---|---|
 | P5-00 | 구현 전 결정 | design.md DB-P5-D01~D11 확정 | 완료(2026-11-18) |
-| P5-01 | 엔진 제한 읽기 | E1, E5(단위) | 대기 |
+| P5-01 | 엔진 제한 읽기 | E1, E5(단위) | 완료(검증 대기) |
 | P5-02 | `GET /users` | E2, E3, E4, E5(서버) | 대기 |
 | P5-03 | 100만 행 확인, 문서·실습 | E6, E8 | 대기 |
 
@@ -17,18 +17,28 @@
 
 ### P5-01 — 엔진 제한 읽기
 
-**흐름:** `table_page(t, after_id, limit, fn, ctx, &has_more, err)`가 B+ 트리로 `after_id + 1` 이상인 첫 키를 찾고, 리프 연결을 따라 최대 `limit + 1`행을 위치 지정 읽기로 읽는다. 앞의 `limit`행만 `fn`에 넘기고, `limit + 1`번째가 있으면 `has_more = 1`로 표시한 뒤 정상으로 멈춘다. `db_page`는 이것을 공유 잠금 안에서 부른다.
+**흐름:** `table_page(t, after_id, limit, fn, ctx, &has_more, err)`가 B+ 트리로 `after_id + 1` 이상인 첫 키를 찾고, 리프 연결을 따라 최대 `limit + 1`개의 키를 확인한다. 앞의 `limit`행만 위치 지정 읽기로 읽어 `fn`에 넘기고, `limit + 1`번째 키가 있으면 그 줄은 읽지 않고 `has_more = 1`로 표시한 뒤 정상으로 멈춘다. `db_page`는 이것을 공유 잠금 안에서 부른다.
 
 **확인 시나리오:**
 - id 1~10에서 `limit 3`: 첫 페이지 `[1,2,3]`과 `has_more 1`. `after_id 9`면 `[10]`과 `has_more 0`.
 - 정확히 `limit`행이 남은 경우(id 1~6, `after_id 3`, `limit 3`): `[4,5,6]`, `has_more 0`.
 - 빈 테이블, `after_id ≥ 최대 id`, `after_id = INT64_MAX`: 행 없음, `has_more 0`, 오류 없음.
 - id 3·4·5를 지운 뒤 `limit 3`: `[1,2,6]` → `[7,8,9]` → `[10]`. 지워진 id(예: 4)를 `after_id`로 줘도 `[6,7,8]`.
-- 테스트 빌드의 "읽은 행 수"가 `min(limit + 1, 남은 행)`과 같다. 100만 행이 아니라도(예: 1만 행) "첫 페이지에 4행만 읽었다"로 조기 종료를 확인할 수 있다.
+- 테스트 빌드의 "파일에서 읽은 줄 수"가 `min(limit, 남은 행)`과 같다. 100만 행이 아니라도(예: 1만 행) "첫 페이지에 3줄만 읽었다"로 조기 종료를 확인할 수 있다.
 - UPDATE·DELETE의 다시 쓰기 뒤에도 같은 페이지 결과(파일 위치가 바뀌어도 id 커서는 그대로).
 - 동시성: 한 스레드가 `db_page`로 순회하는 동안 다른 스레드들이 INSERT·UPDATE·DELETE. design.md "동시성"의 (가)(나)(다), TSan 보고 없음.
 
 **파일:** `src/storage.{h,c}`, `src/db.{h,c}`, `tests/test_unit.c`.
+
+**구현 메모 (2026-11-18):**
+- `range_visit`를 `table_find_id_range`와 함께 쓴다. `RangeRead`에 `limit`·`lines`·`has_more`를 더하고, `limit`개를 넘긴 뒤 키를 하나 더 받으면 그 줄은 읽지 않고 `RANGE_STOP`(2)을 돌려준다. `bpt_range`가 그 값을 그대로 돌려주므로 `range_read`가 0·`RANGE_STOP`을 성공으로 본다. B+ 트리 코드는 바꾸지 않았다.
+- N+1번째는 인덱스 키로만 확인한다(파일 줄은 `limit`개만 읽음). spec·design의 "limit+1행을 읽는다"는 문구를 "limit+1개의 키를 확인하고 줄은 limit개만 읽는다"로 고쳤다.
+- 테스트 빌드의 `table_test_page_lines_read()`는 `_Thread_local` 변수라 동시 테스트에서도 경쟁이 없다.
+- `table_page`는 `limit < 1`·`after_id < 0`을 `DBE_SQL`로 거부한다(서버가 먼저 검증하므로 방어용).
+
+**P5-01 단계 테스트 (2026-11-18):** Windows 단위 41,734개 실패 0(10회 연속). Docker `gcc:13` 단위 41,731·CLI 56·서버 28·부하 생성기 9 실패 0, sanitize·TSan 보고 없음.
+
+**같이 고친 Phase 4 문제:** Windows에서 `test_p4_concurrent_mixed`(그리고 새 `test_p5_concurrent_forward_walk`)가 약 절반 확률로 "데이터 파일 바꿔치기 실패 (Permission denied)"로 실패했다. 고치기 전 코드에서도 8회 중 4회 재현됐다. `GetLastError`로 확인하니 `MoveFileExA`의 `ERROR_ACCESS_DENIED`(5)였다. 방금 쓰거나 닫은 파일을 다른 프로세스(백신 검사·색인 등)가 잠깐 여는 경우로 보고(추정), 이 오류와 `ERROR_SHARING_VIOLATION`에 한해 최대 약 1초 다시 시도하게 했다(커밋 `9dfd3a0`, Phase 4 동작 수정). POSIX는 바뀌지 않는다.
 
 ### P5-02 — `GET /users`
 

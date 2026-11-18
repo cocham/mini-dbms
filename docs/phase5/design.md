@@ -5,7 +5,7 @@
 | ID | 항목 | 상태 |
 |---|---|---|
 | DB-P5-D01 | 범위: `GET /users` 커서 페이지 조회 + 엔진 제한 읽기. SQL `LIMIT`·`OFFSET` 제외, `/query`·CLI 무변경 | 확정(2026-11-18, 사용자) |
-| DB-P5-D02 | `has_more`: `limit + 1`행을 읽어 판단, 마지막 한 행은 응답에 넣지 않음 | 확정(2026-11-18, 사용자) |
+| DB-P5-D02 | `has_more`: `limit + 1`번째 행이 있는지로 판단, 그 행은 응답에 넣지 않음(구현: 인덱스 키로 확인하고 줄은 읽지 않음) | 확정(2026-11-18, 사용자) |
 | DB-P5-D03 | `next_cursor`: 응답에 넣은 마지막 행의 id. 빈 페이지면 `null` | 확정(2026-11-18, 사용자) |
 | DB-P5-D04 | 동시 변경: 전체 스냅샷 보장 안 함. 보장은 커서 0에서 시작해 돌려받은 커서를 따라가는 **순방향 조회**로 한정("계속 있던 행은 정확히 한 번"). 같은 페이지 재요청의 exactly-once 전달은 보장 안 함 | 확정(2026-11-18, 사용자, 범위 한정) |
 | DB-P5-D05 | 파라미터: `after_id`(기본 0), `limit`(기본 `min(100, 페이지 상한)`, 최대 페이지 상한) | 확정(2026-11-18, 사용자) |
@@ -46,8 +46,8 @@
   → http_read_request (쿼리 문자열을 따로 보관)
   → 파라미터 검증 (실패 → 400 INVALID_PARAM, 엔진 안 부름)
   → db_page(after_id, limit)            [공유 잠금]
-       → table_page: B+ 트리로 after_id+1 이상의 첫 리프 → 리프 연결을 따라 최대 limit+1행
-       → 앞의 limit행은 콜백으로 JSON에, limit+1번째는 has_more만 표시
+       → table_page: B+ 트리로 after_id+1 이상의 첫 리프 → 리프 연결을 따라 최대 limit+1개의 키
+       → 앞의 limit행만 파일에서 읽어 콜백으로 JSON에, limit+1번째 키는 has_more만 표시(줄은 안 읽음)
   → {"ok":true,...,"has_more":..,"next_cursor":..}
   → 응답 전송 (잠금 밖)
 ```
@@ -58,7 +58,7 @@ flowchart LR
     W -->|"검증 실패"| E400["400 INVALID_PARAM"]
     W -->|"db_page<br/>(공유 잠금)"| P["table_page"]
     P -->|"after_id+1 탐색<br/>(트리 높이만큼)"| T["B+ 트리 리프"]
-    T -->|"리프 연결을 따라<br/>최대 limit+1행"| F["users.tsv<br/>위치 지정 읽기"]
+    T -->|"리프 연결을 따라<br/>최대 limit+1개 키<br/>(줄은 limit개만)"| F["users.tsv<br/>위치 지정 읽기"]
     P -->|"행 limit개 + has_more"| W
     W -->|"JSON (잠금 밖 전송)"| C
 ```
@@ -67,7 +67,7 @@ flowchart LR
 
 ```c
 /* storage.h — id > after_id인 행을 id 순서로 최대 limit개 fn에 넘긴다.
- * limit+1번째 행이 있으면 *has_more = 1 (그 행은 fn에 넘기지 않는다). 거기서 읽기를 멈추며, 이 멈춤은 오류가 아니다.
+ * limit+1번째 키가 인덱스에 있으면 *has_more = 1 (그 줄은 읽지 않는다). 거기서 멈추며, 이 멈춤은 오류가 아니다.
  * after_id가 INT64_MAX면 행 없이 *has_more = 0. 0 성공, -1 실패(err).
  * fn이 0이 아닌 값을 돌려주면 지금 범위 조회와 같이 DBE_SINK 오류다. */
 int table_page(Table *t, int64_t after_id, int64_t limit, RowFn fn, void *ctx, int *has_more, DbError *err);
@@ -76,9 +76,9 @@ int table_page(Table *t, int64_t after_id, int64_t limit, RowFn fn, void *ctx, i
 int db_page(Db *db, int64_t after_id, int64_t limit, RowFn fn, void *ctx, int *has_more, DbError *err);
 ```
 
-- `table_page`는 `table_find_id_range`와 같은 위치 지정 읽기(`range_visit`, P3-04)를 쓴다. 다른 점은 행 수를 세다가 `limit + 1`번째에서 `has_more`만 표시하고 **정상 멈춤 값**을 돌려준다는 것이다. `bpt_range`는 콜백이 0이 아닌 값을 돌려주면 그 값을 그대로 돌려주므로(`bptree.c`), `table_page`가 그 값을 "성공"으로 해석한다. B+ 트리 코드는 바꾸지 않는다.
+- `table_page`는 `table_find_id_range`와 같은 위치 지정 읽기(`range_visit`, P3-04)를 쓴다. 다른 점은 읽은 줄 수를 세다가 `limit + 1`번째 키를 받으면 그 줄은 읽지 않고 `has_more`만 표시한 뒤 **정상 멈춤 값**을 돌려준다는 것이다. `bpt_range`는 콜백이 0이 아닌 값을 돌려주면 그 값을 그대로 돌려주므로(`bptree.c`), `table_page`가 그 값을 "성공"으로 해석한다. B+ 트리 코드는 바꾸지 않는다.
 - 범위는 `[after_id + 1, INT64_MAX]`다. `after_id = INT64_MAX`면 트리를 보지 않고 빈 결과로 끝난다(넘침 방지).
-- 테스트 빌드(`MINIDB_TESTING`)에는 마지막 호출에서 읽은 행 수를 돌려주는 함수를 둔다. E1의 "읽은 행 수 = `min(limit+1, 남은 행)`"을 확인하는 데 쓴다.
+- 테스트 빌드(`MINIDB_TESTING`)에는 이 스레드의 마지막 호출에서 파일에서 읽은 줄 수를 돌려주는 함수(`table_test_page_lines_read`, 스레드마다 따로)를 둔다. E1의 "읽은 줄 수 = `min(limit, 남은 행)`"을 확인하는 데 쓴다.
 - 잠금은 SELECT와 같은 공유 잠금이다. UPDATE·DELETE의 다시 쓰기는 배타 잠금이므로 페이지 하나를 읽는 동안 파일과 인덱스가 바뀌지 않는다.
 
 ## 서버

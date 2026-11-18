@@ -83,6 +83,17 @@ int table_find_by_id(Table *t, int64_t id, RowFn fn, void *ctx, DbError *err);
 int table_find_id_range(Table *t, int64_t lo, int64_t hi, RowFn fn, void *ctx, DbError *err);
 
 /*
+ * 커서 페이지 조회 (Phase 5, DB-P5-D02·D07). id > after_id인 레코드를 id 오름차순으로 최대 limit개 찾아
+ * 하나씩 fn을 호출한다. limit+1번째 키가 인덱스에 있으면 *has_more = 1, 없으면 0.
+ * limit+1번째 키를 확인하면 그 줄은 읽지 않고 멈춘다. 이 멈춤은 오류가 아니다(정상 조기 종료).
+ * 파일에서 읽는 줄은 min(limit, 남은 행)개다.
+ * after_id가 INT64_MAX면 키를 보지 않고 행 없이 0(*has_more = 0).
+ * 0 성공, -1 실패: limit < 1이거나 after_id < 0이면 DBE_SQL. 읽기 오류·인덱스 불일치는 DBE_STORAGE,
+ * fn이 0이 아닌 값을 돌려주면 DBE_SINK(table_find_id_range와 같다).
+ */
+int table_page(Table *t, int64_t after_id, int64_t limit, RowFn fn, void *ctx, int *has_more, DbError *err);
+
+/*
  * 인덱스 통계 (실행 계획용). 메모리의 B+ 트리에서 바로 읽는다.
  * table_open이 시작 시 파일 전체를 읽어 인덱스를 만든 뒤로는, 이 함수들이 파일을 추가로 읽지 않는다.
  * 실제로 조회를 실행해서 잰 값이 아니라 "지금 실행하면 얼마나 읽게 될지"의 근거다.
@@ -113,6 +124,8 @@ enum {
     REWRITE_FAIL_REOPEN  /* Windows 전용: 바꿔치기 뒤 다시 열기 */
 };
 void table_test_fail_rewrite(int stage);
+/* 이 스레드에서 마지막으로 부른 table_page가 파일에서 읽은 줄 수 (조기 종료 확인용) */
+int64_t table_test_page_lines_read(void);
 /* 테스트 전용: 메모리 인덱스의 불변식 검사(bpt_validate). 0이면 정상 */
 int table_test_validate_index(const Table *t, char *why, size_t cap);
 #endif

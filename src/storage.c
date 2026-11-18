@@ -478,7 +478,7 @@ int table_find_by_id(Table *t, int64_t id, RowFn fn, void *ctx, DbError *err) {
     return 0;
 }
 
-/* table_find_id_range가 bpt_range 콜백으로 넘기는 상태(호출마다 지역 변수) */
+/* table_find_id_range·table_page가 bpt_range 콜백으로 넘기는 상태(호출마다 지역 변수) */
 typedef struct {
     Table *t;
     RowFn fn;
@@ -486,13 +486,24 @@ typedef struct {
     DbError *err;
     Reader rd;
     int64_t next_pos; /* rd가 다음에 넘겨줄 바이트의 위치. -1이면 아직 이동 전 */
+    int64_t limit;    /* table_page: 넘길 최대 행 수. 제한 없으면 -1 */
+    int64_t lines;    /* 파일에서 읽은 줄 수 */
+    int has_more;     /* table_page: limit+1번째 키를 만났으면 1 */
 } RangeRead;
+
+#define RANGE_STOP 2 /* range_visit의 정상 멈춤. bpt_range가 그대로 돌려준다 */
+
+#ifdef MINIDB_TESTING
+static _Thread_local int64_t g_page_lines; /* 스레드마다 따로: 동시 테스트에서도 경쟁 없음 */
+int64_t table_test_page_lines_read(void) { return g_page_lines; }
+#endif
 
 /*
  * 리프에서 (id, 위치)를 하나 받을 때마다 그 줄을 읽는다.
  * id가 증가 순서로 저장되므로 범위 안의 줄은 파일에서도 이어져 있다. 그래서 보통 첫 줄에서만
  * 위치를 정하고 나머지는 버퍼에서 이어서 읽는다. 위치가 이어지지 않으면(예상 밖 상황) 그 위치로 다시 정한다.
- * 반환: 0 계속, 1 오류(err 설정 완료)
+ * limit만큼 넘긴 뒤 키를 하나 더 받으면 그 줄은 읽지 않고 has_more만 표시한다(N+1, DB-P5-D02).
+ * 반환: 0 계속, 1 오류(err 설정 완료), RANGE_STOP 정상 멈춤
  */
 static int range_visit(int64_t id, int64_t offset, void *vctx) {
     RangeRead *rr = vctx;
@@ -502,6 +513,11 @@ static int range_visit(int64_t id, int64_t offset, void *vctx) {
     Row row;
     int r;
 
+    if (rr->limit >= 0 && rr->lines >= rr->limit) {
+        rr->has_more = 1;
+        return RANGE_STOP;
+    }
+    rr->lines++;
     if (offset != rr->next_pos) {
         reader_seek(&rr->rd, offset);
     }
@@ -524,10 +540,12 @@ static int range_visit(int64_t id, int64_t offset, void *vctx) {
     return 0;
 }
 
-int table_find_id_range(Table *t, int64_t lo, int64_t hi, RowFn fn, void *ctx, DbError *err) {
+/* [lo, hi]를 id 순서로 읽는다. limit ≥ 0이면 limit개를 넘긴 뒤 다음 키에서 정상으로 멈춘다. */
+static int range_read(Table *t, int64_t lo, int64_t hi, int64_t limit, RowFn fn, void *ctx, int *has_more,
+                      int64_t *lines, DbError *err) {
     RangeRead rr;
     char *buf = malloc(SCAN_BUF);
-    int rc;
+    int r;
 
     if (buf == NULL) {
         db_error_setk(err, DBE_STORAGE, "메모리가 부족합니다");
@@ -539,8 +557,50 @@ int table_find_id_range(Table *t, int64_t lo, int64_t hi, RowFn fn, void *ctx, D
     rr.err = err;
     reader_init(&rr.rd, t->fd, buf, SCAN_BUF, 0, t->file_size);
     rr.next_pos = -1;
-    rc = bpt_range(t->index, lo, hi, range_visit, &rr) == 0 ? 0 : -1;
+    rr.limit = limit;
+    rr.lines = 0;
+    rr.has_more = 0;
+    r = bpt_range(t->index, lo, hi, range_visit, &rr);
     free(buf);
+    if (has_more != NULL) {
+        *has_more = rr.has_more;
+    }
+    if (lines != NULL) {
+        *lines = rr.lines;
+    }
+    return (r == 0 || r == RANGE_STOP) ? 0 : -1;
+}
+
+int table_find_id_range(Table *t, int64_t lo, int64_t hi, RowFn fn, void *ctx, DbError *err) {
+    return range_read(t, lo, hi, -1, fn, ctx, NULL, NULL, err);
+}
+
+int table_page(Table *t, int64_t after_id, int64_t limit, RowFn fn, void *ctx, int *has_more, DbError *err) {
+    int64_t lines = 0;
+    int more = 0;
+    int rc;
+
+    if (has_more != NULL) {
+        *has_more = 0;
+    }
+#ifdef MINIDB_TESTING
+    g_page_lines = 0;
+#endif
+    if (limit < 1 || after_id < 0) {
+        db_error_setk(err, DBE_SQL, "페이지 조회 값이 올바르지 않습니다 (after_id %" PRId64 ", limit %" PRId64 ")",
+                     after_id, limit);
+        return -1;
+    }
+    if (after_id == INT64_MAX) {
+        return 0; /* 그보다 큰 id는 없다. after_id + 1은 넘치므로 트리를 보지 않는다 */
+    }
+    rc = range_read(t, after_id + 1, INT64_MAX, limit, fn, ctx, &more, &lines, err);
+#ifdef MINIDB_TESTING
+    g_page_lines = lines;
+#endif
+    if (rc == 0 && has_more != NULL) {
+        *has_more = more;
+    }
     return rc;
 }
 
