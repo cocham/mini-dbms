@@ -3485,6 +3485,7 @@ static void test_p4_concurrent_mixed(void) {
 typedef struct {
     int64_t ids[PG_CAP];
     char names[PG_CAP][16];
+    int ages[PG_CAP];
     int n;
     int fail_at; /* 0보다 크면 그 번째 행에서 콜백이 실패를 돌려준다 */
 } PageGot;
@@ -3498,6 +3499,7 @@ static int page_row(const Row *row, void *ctx) {
     if (g->n < PG_CAP) {
         g->ids[g->n] = row->id;
         snprintf(g->names[g->n], sizeof g->names[0], "%s", row->name);
+        g->ages[g->n] = row->age;
     }
     g->n++;
     return 0;
@@ -3505,10 +3507,24 @@ static int page_row(const Row *row, void *ctx) {
 
 /* table_page(t) 또는 db_page(db)를 부르고 결과를 g에. 반환값은 그 함수의 반환값 */
 static int run_page(Table *t, Db *db, int64_t after, int64_t limit, PageGot *g, int *more, DbError *err) {
+    PageStats st;
+    int rc;
+
     g->n = 0;
     *more = -1;
-    return t != NULL ? table_page(t, after, limit, page_row, g, more, err)
-                     : db_page(db, after, limit, page_row, g, more, err);
+    st.has_more = -1;
+    rc = t != NULL ? table_page(t, after, limit, NULL, page_row, g, &st, err)
+                   : db_page(db, after, limit, NULL, page_row, g, &st, err);
+    *more = st.has_more;
+    /* 조건 없는 경로의 계측 (DB-P6-D08): E = R(성공 시 = 넘긴 행), T = 0, K = 0, 경로 id.
+       다르면 -9 (동시 테스트의 스레드에서도 불리므로 CHECK 대신 반환값으로 알린다) */
+    if (rc == 0 && !(st.rows_returned == g->n && st.rows_examined == g->n && st.examined_after_last == 0 &&
+                     st.index_keys == 0 && st.used == PAGE_USED_ID)) {
+        fprintf(stderr, "    조건 없는 페이지 계측이 다름: R=%" PRId64 " E=%" PRId64 " T=%" PRId64 " n=%d\n",
+                st.rows_returned, st.rows_examined, st.examined_after_last, g->n);
+        return -9;
+    }
+    return rc;
 }
 
 /* 결과가 ids[0..n)과 같고 has_more가 more인지 */
@@ -3873,6 +3889,581 @@ static void test_p5_concurrent_forward_walk(void) {
     CHECK(db_close(db, &err) == 0);
 }
 
+/* ---------- Phase 6: age 조건 페이지 조회 ---------- */
+
+/* table_page(t) 또는 db_page(db)를 age 조건으로 부른다 */
+static int run_fpage(Table *t, Db *db, int64_t after, int64_t limit, int age, PagePath path, PageGot *g,
+                     PageStats *st, DbError *err) {
+    PageFilter f;
+    int rc, i;
+
+    f.has_age = 1;
+    f.age = age;
+    f.path = path;
+    g->n = 0;
+    rc = t != NULL ? table_page(t, after, limit, &f, page_row, g, st, err)
+                   : db_page(db, after, limit, &f, page_row, g, st, err);
+    /* 넘긴 행 수 = R, 넘긴 행은 모두 조건에 맞음. 다르면 -9 (스레드에서도 불리므로 CHECK 대신 반환값) */
+    if (rc == 0) {
+        if (st->rows_returned != g->n) {
+            return -9;
+        }
+        for (i = 0; i < g->n && i < PG_CAP; i++) {
+            if (g->ages[i] != age) {
+                return -9;
+            }
+        }
+    }
+    return rc;
+}
+
+/* 결과 행·has_more·E·T가 기대값과 같은지 (선형 탐색) */
+static int fpage_is(const PageGot *g, const PageStats *st, const int64_t *ids, int n, int more, int64_t e,
+                    int64_t t) {
+    int i;
+
+    if (g->n != n || st->has_more != more || st->rows_examined != e || st->examined_after_last != t ||
+        st->used != PAGE_USED_SCAN || st->index_keys != 0) {
+        fprintf(stderr, "    기대 n=%d more=%d E=%" PRId64 " T=%" PRId64 " / 실제 n=%d more=%d E=%" PRId64
+                        " T=%" PRId64 " used=%d K=%" PRId64 "\n",
+                n, more, e, t, g->n, st->has_more, st->rows_examined, st->examined_after_last, (int)st->used,
+                st->index_keys);
+        return 0;
+    }
+    for (i = 0; i < n; i++) {
+        if (g->ids[i] != ids[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* id 1~20: 짝수 id는 age 30, 홀수 id는 age 40 */
+static void append_even30(Table *t, int n) {
+    DbError err = {{0}, DBE_NONE};
+    char name[16];
+    int64_t id;
+    int i;
+
+    for (i = 1; i <= n; i++) {
+        snprintf(name, sizeof name, "u%d", i);
+        CHECK(table_append(t, name, i % 2 == 0 ? 30 : 40, &id, &err) == 0);
+    }
+}
+
+/* F1: 선형 탐색 경로의 경우별 R·E·T·has_more (손으로 계산한 값) */
+static void test_p6_scan_basic(void) {
+    const char *dir = fresh_dir("p6_scan_basic");
+    static PageGot g;
+    PageStats st;
+    Table *t = NULL;
+    DbError err = {{0}, DBE_NONE};
+
+    CHECK(table_open(dir, &t, &err) == 0);
+    if (t == NULL) {
+        return;
+    }
+    /* 빈 테이블: 아무것도 읽지 않는다 */
+    CHECK(run_fpage(t, NULL, 0, 3, 30, PAGE_PATH_SCAN, &g, &st, &err) == 0 && fpage_is(&g, &st, NULL, 0, 0, 0, 0));
+    append_even30(t, 20);
+    {
+        static const int64_t p1[] = {2, 4, 6}, p2[] = {8, 10, 12}, tail[] = {18, 20}, ex[] = {15, 17, 19};
+        static const int64_t n1[] = {16, 18}, n2[] = {20}, c5[] = {6, 8};
+        /* 첫 페이지: 1~8번 줄을 읽음. 7·8번은 마지막 반환(6) 뒤, 8이 조건에 맞는 4번째 → has_more */
+        CHECK(run_fpage(t, NULL, 0, 3, 30, PAGE_PATH_SCAN, &g, &st, &err) == 0 && fpage_is(&g, &st, p1, 3, 1, 8, 2));
+        /* 다음 페이지는 마지막 반환 행(6) 뒤부터: 7·8번을 다시 읽는다 */
+        CHECK(run_fpage(t, NULL, 6, 3, 30, PAGE_PATH_SCAN, &g, &st, &err) == 0 && fpage_is(&g, &st, p2, 3, 1, 8, 2));
+        /* 마지막 페이지: 17~20을 읽고 끝. 마지막 줄(20)이 반환 행이라 T 0 */
+        CHECK(run_fpage(t, NULL, 16, 3, 30, PAGE_PATH_SCAN, &g, &st, &err) == 0 &&
+              fpage_is(&g, &st, tail, 2, 0, 4, 0));
+        /* 맞는 행이 정확히 limit개 남고 뒤에 안 맞는 줄(20) 하나: has_more 0, T 1 */
+        CHECK(run_fpage(t, NULL, 13, 3, 40, PAGE_PATH_SCAN, &g, &st, &err) == 0 && fpage_is(&g, &st, ex, 3, 0, 7, 1));
+        /* limit+1번째로 맞는 행이 마지막 줄(20): has_more 1, 다음 요청은 그 한 행 */
+        CHECK(run_fpage(t, NULL, 14, 2, 30, PAGE_PATH_SCAN, &g, &st, &err) == 0 && fpage_is(&g, &st, n1, 2, 1, 6, 2));
+        CHECK(run_fpage(t, NULL, 18, 2, 30, PAGE_PATH_SCAN, &g, &st, &err) == 0 && fpage_is(&g, &st, n2, 1, 0, 2, 0));
+        /* 커서가 조건에 맞지 않는 행(5): 그 뒤 첫 줄(6)부터 */
+        CHECK(run_fpage(t, NULL, 5, 2, 30, PAGE_PATH_SCAN, &g, &st, &err) == 0 && fpage_is(&g, &st, c5, 2, 1, 5, 2));
+    }
+    /* 일치 없음: 커서 뒤 전부를 읽고 R 0, T = E */
+    CHECK(run_fpage(t, NULL, 0, 3, 99, PAGE_PATH_SCAN, &g, &st, &err) == 0 && fpage_is(&g, &st, NULL, 0, 0, 20, 20));
+    CHECK(run_fpage(t, NULL, 12, 3, 99, PAGE_PATH_SCAN, &g, &st, &err) == 0 && fpage_is(&g, &st, NULL, 0, 0, 8, 8));
+    /* 빈 범위 */
+    CHECK(run_fpage(t, NULL, 20, 3, 30, PAGE_PATH_SCAN, &g, &st, &err) == 0 && fpage_is(&g, &st, NULL, 0, 0, 0, 0));
+    CHECK(run_fpage(t, NULL, INT64_MAX, 3, 30, PAGE_PATH_SCAN, &g, &st, &err) == 0 &&
+          fpage_is(&g, &st, NULL, 0, 0, 0, 0));
+    /* 잘못된 값 */
+    CHECK(run_fpage(t, NULL, 0, 3, 151, PAGE_PATH_SCAN, &g, &st, &err) == -1 && err.kind == DBE_SQL && g.n == 0);
+    CHECK(run_fpage(t, NULL, 0, 3, -1, PAGE_PATH_SCAN, &g, &st, &err) == -1 && err.kind == DBE_SQL);
+    CHECK(run_fpage(t, NULL, 0, 0, 30, PAGE_PATH_SCAN, &g, &st, &err) == -1 && err.kind == DBE_SQL);
+    /* 콜백 실패는 DBE_SINK */
+    g.fail_at = 2;
+    CHECK(run_fpage(t, NULL, 0, 5, 30, PAGE_PATH_SCAN, &g, &st, &err) == -1 && err.kind == DBE_SINK &&
+          st.has_more == 0);
+    g.fail_at = 0;
+    CHECK(table_close(t, &err) == 0);
+}
+
+/* F1: id 공백(DELETE), 지워진 커서, UPDATE로 age가 바뀐 뒤(다시 쓰기) */
+static void test_p6_scan_after_rewrite(void) {
+    const char *dir = fresh_dir("p6_scan_rewrite");
+    static PageGot g;
+    PageStats st;
+    Table *t = NULL;
+    DbError err = {{0}, DBE_NONE};
+
+    CHECK(table_open(dir, &t, &err) == 0);
+    if (t == NULL) {
+        return;
+    }
+    append_even30(t, 20);
+    CHECK(t_change(t, "DELETE FROM users WHERE id = 6;", &err) == 1);
+    CHECK(t_change(t, "UPDATE users SET age = 30 WHERE id = 7;", &err) == 1);
+    CHECK(t_change(t, "UPDATE users SET age = 41 WHERE id = 10;", &err) == 1);
+    {
+        /* 남은 행 1~5, 7~20(19행). age 30: 2,4,7,8,12,14,16,18,20 */
+        static const int64_t p1[] = {2, 4, 7}, p2[] = {8, 12, 14}, d6[] = {7, 8};
+        CHECK(run_fpage(t, NULL, 0, 3, 30, PAGE_PATH_SCAN, &g, &st, &err) == 0 && fpage_is(&g, &st, p1, 3, 1, 7, 1));
+        /* 7번 뒤: 8,9,10(41),11,12,13,14, 그리고 N+1 확인 15,16 → E 9, T 2 */
+        CHECK(run_fpage(t, NULL, 7, 3, 30, PAGE_PATH_SCAN, &g, &st, &err) == 0 && fpage_is(&g, &st, p2, 3, 1, 9, 2));
+        /* 지워진 id 6을 커서로: 7부터. 7,8 반환 뒤 9,10,11,12에서 N+1 → E 6, T 4 */
+        CHECK(run_fpage(t, NULL, 6, 2, 30, PAGE_PATH_SCAN, &g, &st, &err) == 0 && fpage_is(&g, &st, d6, 2, 1, 6, 4));
+    }
+    /* 바뀐 age 41은 id 10 하나 */
+    CHECK(run_fpage(t, NULL, 0, 5, 41, PAGE_PATH_SCAN, &g, &st, &err) == 0 && g.n == 1 && g.ids[0] == 10 &&
+          st.rows_examined == 19 && st.examined_after_last == 10 && st.has_more == 0);
+    CHECK(table_close(t, &err) == 0);
+}
+
+/* F5: age 조건 순방향 조회 도중 INSERT·UPDATE(age 변경)·DELETE.
+ * 고정 집합(id ≡ 0 mod 6, age 30)은 쓰기 스레드가 건드리지 않는다.
+ * (가) 순회의 id가 엄격하게 증가 (나) 고정 집합은 순회마다 정확히 한 번 (다) 넘겨받은 행은 모두 age 30 */
+#define FW_ROWS 300
+#define FW_WRITERS 3
+#define FW_OPS 120
+#define FW_WALKS 10
+
+typedef struct {
+    Db *db;
+    uint32_t seed;
+    int errors;
+    char first_error[256];
+} FwWriter;
+
+typedef struct {
+    Db *db;
+    PagePath path;
+    int errors;
+    char first_error[256];
+    int not_increasing;
+    int wrong_age;
+    int bad_stable; /* 고정 집합이 0번 또는 2번 이상 나온 순회 수 */
+    int walks;
+} FwReader;
+
+static void *fw_writer(void *arg) {
+    FwWriter *w = arg;
+    int op;
+
+    for (op = 0; op < FW_OPS; op++) {
+        DbError err = {{0}, DBE_NONE};
+        uint32_t k = ct_rand(&w->seed) % 100;
+        int64_t target = 1 + (int64_t)(ct_rand(&w->seed) % (FW_ROWS + FW_WRITERS * FW_OPS));
+        char sql[128];
+        int rc = 0;
+
+        if (target % 6 == 0) {
+            target++; /* 고정 집합은 건드리지 않는다 */
+        }
+        if (k < 35) {
+            int64_t id = 0;
+            rc = db_insert(w->db, "ins", ct_rand(&w->seed) % 2 ? 30 : 31, &id, NULL, &err);
+        } else if (k < 75) {
+            snprintf(sql, sizeof sql, "UPDATE users SET age = %d WHERE id = %" PRId64 ";",
+                     ct_rand(&w->seed) % 2 ? 30 : 31, target);
+            rc = d_change(w->db, sql, &err) < 0 ? -1 : 0;
+        } else {
+            snprintf(sql, sizeof sql, "DELETE FROM users WHERE id = %" PRId64 ";", target);
+            rc = d_change(w->db, sql, &err) < 0 ? -1 : 0;
+        }
+        if (rc != 0 && w->errors++ == 0) {
+            snprintf(w->first_error, sizeof w->first_error, "%s", err.msg);
+        }
+    }
+    return NULL;
+}
+
+static void *fw_reader(void *arg) {
+    FwReader *r = arg;
+    static PageGot g; /* 이 테스트에서 읽는 스레드는 하나뿐 */
+    int w;
+
+    for (w = 0; w < FW_WALKS; w++) {
+        static unsigned char seen[FW_ROWS + 1];
+        int64_t after = 0, prev = 0;
+        int more = 1, i;
+
+        memset(seen, 0, sizeof seen);
+        while (more) {
+            DbError err = {{0}, DBE_NONE};
+            PageStats st;
+            if (run_fpage(NULL, r->db, after, 5, 30, r->path, &g, &st, &err) != 0) {
+                if (r->errors++ == 0) {
+                    snprintf(r->first_error, sizeof r->first_error, "%s", err.msg);
+                }
+                break;
+            }
+            more = st.has_more;
+            for (i = 0; i < g.n; i++) {
+                if (g.ids[i] <= prev) {
+                    r->not_increasing++;
+                }
+                if (g.ages[i] != 30) {
+                    r->wrong_age++;
+                }
+                prev = g.ids[i];
+                if (g.ids[i] <= FW_ROWS && g.ids[i] % 6 == 0 && seen[g.ids[i]] < 255) {
+                    seen[g.ids[i]]++;
+                }
+            }
+            if (g.n > 0) {
+                after = g.ids[g.n - 1];
+            }
+        }
+        for (i = 6; i <= FW_ROWS; i += 6) {
+            if (seen[i] != 1) {
+                r->bad_stable++;
+                break;
+            }
+        }
+        r->walks++;
+    }
+    return NULL;
+}
+
+static void run_filtered_concurrent(const char *name, PagePath path) {
+    const char *dir = fresh_dir(name);
+    static FwWriter ws[FW_WRITERS];
+    static FwReader rd;
+    pthread_t th[FW_WRITERS + 1];
+    DbError err = {{0}, DBE_NONE};
+    Db *db = NULL;
+    int64_t id = 0;
+    char nm[16];
+    int i;
+
+    CHECK(db_open(dir, &db, &err) == 0);
+    if (db == NULL) {
+        return;
+    }
+    for (i = 1; i <= FW_ROWS; i++) {
+        snprintf(nm, sizeof nm, "s%d", i);
+        CHECK(db_insert(db, nm, i % 6 == 0 || i % 4 == 1 ? 30 : 31, &id, NULL, &err) == 0);
+    }
+    memset(&rd, 0, sizeof rd);
+    rd.db = db;
+    rd.path = path;
+    CHECK(pthread_create(&th[FW_WRITERS], NULL, fw_reader, &rd) == 0);
+    for (i = 0; i < FW_WRITERS; i++) {
+        memset(&ws[i], 0, sizeof ws[i]);
+        ws[i].db = db;
+        ws[i].seed = 0x85EBCA6Bu * (uint32_t)(i + 3);
+        CHECK(pthread_create(&th[i], NULL, fw_writer, &ws[i]) == 0);
+    }
+    for (i = 0; i <= FW_WRITERS; i++) {
+        pthread_join(th[i], NULL);
+    }
+    for (i = 0; i < FW_WRITERS; i++) {
+        if (ws[i].errors != 0) {
+            fprintf(stderr, "    쓰기 스레드 %d 첫 오류: %s\n", i, ws[i].first_error);
+        }
+        CHECK(ws[i].errors == 0);
+    }
+    if (rd.errors != 0) {
+        fprintf(stderr, "    읽기 스레드 첫 오류: %s\n", rd.first_error);
+    }
+    CHECK(rd.errors == 0 && rd.walks == FW_WALKS);
+    CHECK(rd.not_increasing == 0 && rd.wrong_age == 0 && rd.bad_stable == 0);
+    CHECK(db_close(db, &err) == 0);
+}
+
+static void test_p6_scan_concurrent(void) { run_filtered_concurrent("p6_scan_concurrent", PAGE_PATH_SCAN); }
+
+/* ---------- Phase 6: age 보조 인덱스 (P6-04) ---------- */
+
+/* 같은 Table·같은 요청을 두 경로로 실행해 행·has_more가 같고, 인덱스 경로의 계측이 E = R, T = 0,
+ * K = R + has_more인지. 다르면 0 */
+static int paths_agree(Table *t, Db *db, int64_t after, int64_t limit, int age) {
+    static PageGot gs, gi;
+    PageStats ss, si;
+    DbError err = {{0}, DBE_NONE};
+    int i;
+
+    if (run_fpage(t, db, after, limit, age, PAGE_PATH_SCAN, &gs, &ss, &err) != 0 ||
+        run_fpage(t, db, after, limit, age, PAGE_PATH_INDEX, &gi, &si, &err) != 0) {
+        fprintf(stderr, "    실패: %s\n", err.msg);
+        return 0;
+    }
+    if (ss.used != PAGE_USED_SCAN || si.used != PAGE_USED_AGE_INDEX || gs.n != gi.n || ss.has_more != si.has_more ||
+        si.rows_examined != si.rows_returned || si.examined_after_last != 0 ||
+        si.index_keys != si.rows_returned + si.has_more) {
+        fprintf(stderr, "    age %d after %" PRId64 " limit %" PRId64 ": scan n=%d more=%d / index n=%d more=%d E=%" PRId64
+                        " T=%" PRId64 " K=%" PRId64 "\n",
+                age, after, limit, gs.n, ss.has_more, gi.n, si.has_more, si.rows_examined, si.examined_after_last,
+                si.index_keys);
+        return 0;
+    }
+    for (i = 0; i < gs.n && i < PG_CAP; i++) {
+        if (gs.ids[i] != gi.ids[i] || strcmp(gs.names[i], gi.names[i]) != 0 || gs.ages[i] != gi.ages[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int age_index_ok(Table *t) {
+    char why[200] = "";
+    if (table_test_validate_age_index(t, why, sizeof why) != 0) {
+        fprintf(stderr, "    age 인덱스 불일치: %s\n", why);
+        return 0;
+    }
+    return 1;
+}
+
+/* 인덱스 경로의 손으로 계산한 값, 경로 선택, 두 경로 동등 */
+static void test_p6_index_basic(void) {
+    const char *dir = fresh_dir("p6_index_basic");
+    static PageGot g;
+    PageStats st;
+    Table *t = NULL;
+    DbError err = {{0}, DBE_NONE};
+    int64_t after;
+    int age, limit;
+
+    CHECK(table_open(dir, &t, &err) == 0);
+    if (t == NULL) {
+        return;
+    }
+    CHECK(age_index_ok(t));
+    CHECK(run_fpage(t, NULL, 0, 3, 30, PAGE_PATH_INDEX, &g, &st, &err) == 0 && g.n == 0 && st.has_more == 0 &&
+          st.rows_examined == 0 && st.index_keys == 0 && st.used == PAGE_USED_AGE_INDEX);
+    append_even30(t, 20);
+    CHECK(age_index_ok(t));
+    /* 첫 페이지: 항목 2,4,6을 읽고 8은 인덱스 항목으로만 확인 → E 3, K 4, T 0 */
+    CHECK(run_fpage(t, NULL, 0, 3, 30, PAGE_PATH_INDEX, &g, &st, &err) == 0 && g.n == 3 && g.ids[0] == 2 &&
+          g.ids[2] == 6 && st.has_more == 1 && st.rows_examined == 3 && st.index_keys == 4 &&
+          st.examined_after_last == 0);
+    CHECK(table_test_page_lines_read() == 3 && table_test_page_keys_seen() == 4);
+    /* 정확히 limit개 남음: N+1 항목이 없어 K = R */
+    CHECK(run_fpage(t, NULL, 14, 3, 30, PAGE_PATH_INDEX, &g, &st, &err) == 0 && g.n == 3 && st.has_more == 0 &&
+          st.rows_examined == 3 && st.index_keys == 3);
+    /* 일치 없음: 파일을 읽지 않는다 */
+    CHECK(run_fpage(t, NULL, 0, 3, 99, PAGE_PATH_INDEX, &g, &st, &err) == 0 && g.n == 0 && st.rows_examined == 0 &&
+          st.index_keys == 0 && st.examined_after_last == 0);
+    /* AUTO는 인덱스 */
+    CHECK(run_fpage(t, NULL, 0, 3, 30, PAGE_PATH_AUTO, &g, &st, &err) == 0 && st.used == PAGE_USED_AGE_INDEX);
+    CHECK(run_fpage(t, NULL, INT64_MAX, 3, 30, PAGE_PATH_INDEX, &g, &st, &err) == 0 && g.n == 0 && st.index_keys == 0);
+    CHECK(run_fpage(t, NULL, 0, 3, 151, PAGE_PATH_INDEX, &g, &st, &err) == -1 && err.kind == DBE_SQL);
+    g.fail_at = 2;
+    CHECK(run_fpage(t, NULL, 0, 5, 30, PAGE_PATH_INDEX, &g, &st, &err) == -1 && err.kind == DBE_SINK &&
+          st.has_more == 0);
+    g.fail_at = 0;
+    /* 모든 커서·limit·age에서 두 경로가 같다 */
+    for (age = 29; age <= 41; age++) {
+        for (after = 0; after <= 21; after++) {
+            for (limit = 1; limit <= 11; limit += 2) {
+                CHECK(paths_agree(t, NULL, after, limit, age));
+            }
+        }
+    }
+    CHECK(table_close(t, &err) == 0);
+}
+
+/* F8: INSERT·UPDATE(age 변경·name만)·DELETE·다시 쓰기 실패·등록 실패·재시작 뒤 age 인덱스 = 파일 */
+static void test_p6_index_maintenance(void) {
+    const char *dir = fresh_dir("p6_index_maint");
+    static PageGot g;
+    PageStats st;
+    Table *t = NULL;
+    DbError err = {{0}, DBE_NONE};
+    int64_t id;
+    int stage;
+
+    CHECK(table_open(dir, &t, &err) == 0);
+    if (t == NULL) {
+        return;
+    }
+    append_even30(t, 30);
+    CHECK(age_index_ok(t));
+    CHECK(t_change(t, "UPDATE users SET age = 77 WHERE id BETWEEN 5 AND 9;", &err) == 5 && age_index_ok(t));
+    CHECK(t_change(t, "UPDATE users SET name = 'only' WHERE id = 10;", &err) == 1 && age_index_ok(t));
+    CHECK(t_change(t, "DELETE FROM users WHERE age = 77;", &err) == 5 && age_index_ok(t));
+    CHECK(t_change(t, "DELETE FROM users WHERE id = 30;", &err) == 1 && age_index_ok(t)); /* 가장 큰 id */
+    CHECK(table_append(t, "new", 77, &id, &err) == 0 && id == 31 && age_index_ok(t));
+    CHECK(run_fpage(t, NULL, 0, 10, 77, PAGE_PATH_INDEX, &g, &st, &err) == 0 && g.n == 1 && g.ids[0] == 31);
+    CHECK(paths_agree(t, NULL, 0, 4, 30) && paths_agree(t, NULL, 0, 4, 40) && paths_agree(t, NULL, 3, 2, 30));
+
+    /* 다시 쓰기가 단계마다 실패해도 옛 인덱스 그대로 */
+    for (stage = REWRITE_FAIL_WRITE; stage <= REWRITE_FAIL_RENAME; stage++) {
+        if (stage == REWRITE_FAIL_NEXT) {
+            continue; /* users.next는 가장 큰 id를 지울 때만 쓴다: 이 UPDATE에는 그 단계가 없다 */
+        }
+        table_test_fail_rewrite(stage);
+        CHECK(t_change(t, "UPDATE users SET age = 99 WHERE id = 2;", &err) == -2 && err.kind == DBE_STORAGE);
+        table_test_fail_rewrite(REWRITE_FAIL_NONE);
+        CHECK(age_index_ok(t));
+        CHECK(run_fpage(t, NULL, 0, 10, 99, PAGE_PATH_INDEX, &g, &st, &err) == 0 && g.n == 0);
+    }
+    /* 다시 쓰기 중 age 인덱스를 만들 메모리가 없음 → 바꾸지 않음 */
+    table_test_fail_age_push(1);
+    CHECK(t_change(t, "UPDATE users SET age = 99 WHERE id = 2;", &err) == -2 && err.kind == DBE_STORAGE);
+    table_test_fail_age_push(0);
+    CHECK(age_index_ok(t) && run_fpage(t, NULL, 0, 10, 99, PAGE_PATH_INDEX, &g, &st, &err) == 0 && g.n == 0);
+
+    /* INSERT의 age 인덱스 등록 실패: 레코드는 파일·id 인덱스에 있고 age 인덱스에는 없다 → DBE_INDEX_FAILED.
+       (db.c는 이때 엔진을 중단 상태로 둔다.) 다시 열면 파일에서 재구성된다 */
+    table_test_fail_age_push(1);
+    CHECK(table_append(t, "lost", 55, &id, &err) == -1 && err.kind == DBE_INDEX_FAILED && id == 32);
+    table_test_fail_age_push(0);
+    CHECK(!age_index_ok(t));
+    CHECK(table_close(t, &err) == 0);
+    t = NULL;
+    CHECK(table_open(dir, &t, &err) == 0);
+    if (t == NULL) {
+        return;
+    }
+    CHECK(age_index_ok(t));
+    CHECK(run_fpage(t, NULL, 0, 10, 55, PAGE_PATH_INDEX, &g, &st, &err) == 0 && g.n == 1 && g.ids[0] == 32);
+    CHECK(paths_agree(t, NULL, 0, 7, 30) && paths_agree(t, NULL, 0, 100, 40));
+    CHECK(table_close(t, &err) == 0);
+    t = NULL;
+    /* 열 때 age 인덱스를 만들 메모리가 없으면 열기 실패 */
+    table_test_fail_age_push(1);
+    CHECK(table_open(dir, &t, &err) == -1 && err.kind == DBE_STORAGE && t == NULL);
+    table_test_fail_age_push(0);
+}
+
+/* 인덱스 불일치는 엉뚱한 행 대신 DBE_STORAGE */
+static void test_p6_index_mismatch_detected(void) {
+    const char *dir = fresh_dir("p6_index_mismatch");
+    static PageGot g;
+    PageStats st;
+    Table *t = NULL;
+    DbError err = {{0}, DBE_NONE};
+
+    CHECK(table_open(dir, &t, &err) == 0);
+    if (t == NULL) {
+        return;
+    }
+    append_even30(t, 10);
+    CHECK(table_test_age_index_inject(t, 30, 11) == 0); /* 없는 id */
+    CHECK(run_fpage(t, NULL, 8, 5, 30, PAGE_PATH_INDEX, &g, &st, &err) == -1 && err.kind == DBE_STORAGE &&
+          strstr(err.msg, "id 인덱스") != NULL && st.has_more == 0);
+    CHECK(table_close(t, &err) == 0);
+    t = NULL;
+    CHECK(table_open(dir, &t, &err) == 0);
+    if (t == NULL) {
+        return;
+    }
+    CHECK(table_test_age_index_inject(t, 40, 10) == 0); /* 있는 id지만 age 30인 행 */
+    CHECK(run_fpage(t, NULL, 8, 5, 40, PAGE_PATH_INDEX, &g, &st, &err) == -1 && err.kind == DBE_STORAGE &&
+          strstr(err.msg, "데이터 파일") != NULL);
+    CHECK(table_close(t, &err) == 0);
+}
+
+/* F9: 무작위 데이터·무작위 쓰기 뒤 모든 age·여러 커서·여러 limit에서 두 경로가 같다. 재시작 뒤에도 */
+static void test_p6_paths_equivalent_random(void) {
+    const char *dir = fresh_dir("p6_index_random");
+    Table *t = NULL;
+    DbError err = {{0}, DBE_NONE};
+    uint32_t seed = 0xC0FFEEu;
+    char sql[128], name[16];
+    int64_t id, last = 0;
+    int i, round, age;
+
+    CHECK(table_open(dir, &t, &err) == 0);
+    if (t == NULL) {
+        return;
+    }
+    for (i = 0; i < 300; i++) {
+        snprintf(name, sizeof name, "r%d", i);
+        CHECK(table_append(t, name, (int)(ct_rand(&seed) % 6) * 30, &id, &err) == 0); /* age 0,30,...,150 */
+        last = id;
+    }
+    for (round = 0; round < 25; round++) {
+        uint32_t k = ct_rand(&seed) % 3;
+        int64_t a = 1 + (int64_t)(ct_rand(&seed) % (uint32_t)last), b = a + (int64_t)(ct_rand(&seed) % 20);
+        if (k == 0) {
+            snprintf(sql, sizeof sql, "UPDATE users SET age = %d WHERE id BETWEEN %" PRId64 " AND %" PRId64 ";",
+                     (int)(ct_rand(&seed) % 6) * 30, a, b);
+            CHECK(t_change(t, sql, &err) >= 0);
+        } else if (k == 1) {
+            snprintf(sql, sizeof sql, "DELETE FROM users WHERE id BETWEEN %" PRId64 " AND %" PRId64 ";", a, b);
+            CHECK(t_change(t, sql, &err) >= 0);
+        } else {
+            for (i = 0; i < 10; i++) {
+                CHECK(table_append(t, "ins", (int)(ct_rand(&seed) % 6) * 30, &id, &err) == 0);
+                last = id;
+            }
+        }
+        CHECK(age_index_ok(t));
+        if (round % 5 == 4) {
+            CHECK(table_close(t, &err) == 0);
+            t = NULL;
+            CHECK(table_open(dir, &t, &err) == 0);
+            if (t == NULL) {
+                return;
+            }
+            CHECK(age_index_ok(t));
+        }
+        for (age = 0; age <= 150; age += 15) {
+            int64_t cursors[5];
+            int c;
+            cursors[0] = 0;
+            cursors[1] = 1 + (int64_t)(ct_rand(&seed) % (uint32_t)last);
+            cursors[2] = 1 + (int64_t)(ct_rand(&seed) % (uint32_t)last);
+            cursors[3] = last - 3;
+            cursors[4] = last;
+            for (c = 0; c < 5; c++) {
+                CHECK(paths_agree(t, NULL, cursors[c], 1, age));
+                CHECK(paths_agree(t, NULL, cursors[c], 3, age));
+                CHECK(paths_agree(t, NULL, cursors[c], 100, age));
+            }
+        }
+    }
+    CHECK(table_close(t, &err) == 0);
+}
+
+/* db_page 경로: INSERT의 age 인덱스 등록 실패 → 엔진 중단(DB_HALTED_INDEX), 페이지 조회는 DBE_HALTED */
+static void test_p6_db_age_push_failure_halts(void) {
+    const char *dir = fresh_dir("p6_db_halt");
+    static PageGot g;
+    PageStats st;
+    DbError err = {{0}, DBE_NONE};
+    Db *db = NULL;
+    int64_t id, stored;
+
+    CHECK(db_open(dir, &db, &err) == 0);
+    if (db == NULL) {
+        return;
+    }
+    CHECK(db_insert(db, "a", 30, &id, &stored, &err) == 0);
+    table_test_fail_age_push(1);
+    CHECK(db_insert(db, "b", 30, &id, &stored, &err) == -1 && err.kind == DBE_INDEX_FAILED);
+    table_test_fail_age_push(0);
+    CHECK(db_state(db) == DB_HALTED_INDEX);
+    CHECK(run_fpage(NULL, db, 0, 10, 30, PAGE_PATH_INDEX, &g, &st, &err) == -1 && err.kind == DBE_HALTED);
+    CHECK(db_close(db, &err) == 0);
+    db = NULL;
+    CHECK(db_open(dir, &db, &err) == 0);
+    if (db == NULL) {
+        return;
+    }
+    CHECK(run_fpage(NULL, db, 0, 10, 30, PAGE_PATH_INDEX, &g, &st, &err) == 0 && g.n == 2);
+    CHECK(db_close(db, &err) == 0);
+}
+
+static void test_p6_index_concurrent(void) { run_filtered_concurrent("p6_index_concurrent", PAGE_PATH_INDEX); }
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "사용법: test_unit <임시 디렉터리>\n");
@@ -3969,6 +4560,15 @@ int main(int argc, char **argv) {
     test_p5_page_early_stop_and_full_walk();
     test_p5_db_page_halted();
     test_p5_concurrent_forward_walk();
+    test_p6_scan_basic();
+    test_p6_scan_after_rewrite();
+    test_p6_scan_concurrent();
+    test_p6_index_basic();
+    test_p6_index_maintenance();
+    test_p6_index_mismatch_detected();
+    test_p6_paths_equivalent_random();
+    test_p6_db_age_push_failure_halts();
+    test_p6_index_concurrent();
 
     printf("단위 테스트: %d개 검사 중 %d개 실패\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

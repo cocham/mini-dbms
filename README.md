@@ -1,6 +1,17 @@
 # 미니 DBMS
 
-C로 SQL 파일을 실행하고 데이터를 파일에 저장하는 CLI(Phase 1)에, id B+ 트리 인덱스(Phase 2), API 서버(Phase 3), UPDATE·DELETE(Phase 4), 커서 페이지 조회(Phase 5)를 붙였다.
+C로 SQL 파일을 실행하고 데이터를 파일에 저장하는 CLI(Phase 1)에, id B+ 트리 인덱스(Phase 2), API 서버(Phase 3), UPDATE·DELETE(Phase 4), 커서 페이지 조회(Phase 5), age 조건 페이지 조회와 age 보조 인덱스(Phase 6)를 붙였다.
+
+## Phase 6 — age 조건 페이지 조회와 age 보조 인덱스 (구현 완료, 검증 대기)
+
+현재 상태: **P6-01~P6-05 구현, 대표 실험 완료(검증 대기).** `GET /users?age=25&after_id=0&limit=100`처럼 age가 같은 행만 id 순서로 페이지 조회한다. 커서·`has_more`(조건에 맞는 `limit+1`번째 행) 규칙은 Phase 5와 같다. 탐색 경로는 둘이다. 선형 탐색(`--age-path scan`, 기준 구현)은 커서 뒤 줄을 차례로 읽어 age를 비교한다. age 보조 인덱스(`--age-path index`, 기본)는 age마다 id 배열을 두고 필요한 줄만 읽는다. 두 경로의 응답 본문은 같다. 응답 헤더 `X-Rows-Examined`(파일 행 확인)·`X-Rows-Examined-After-Last`·`X-Age-Index-Keys`(인덱스 항목 확인)·`X-Access-Path`·`X-Engine-Us`로 검사량을 본다.
+
+대표 실험([정리 문서](docs/phase6/README.md), 변경 없는 100만 행 중 age 25가 0.1%, `age=25&after_id=0&limit=100`, Docker): 두 경로의 응답 본문은 바이트 단위로 같다. 파일 행 확인은 scan 100,001 → index 100이고, 클라이언트 응답 시간 중앙값은 7.167 → 0.347 ms다(이 환경, 경로별 60회). 쓰기 시간·메모리는 재지 않았다.
+
+1. [개선 정리](docs/phase6/README.md): 문제 → age 인덱스 조회 → 측정 방법 → 결과 → 유지 비용, 실험 재현 명령
+2. [개발 명세](docs/phase6/spec.md): API 계약, 입력 검증, 계측 정의, 인덱스 경로가 같아야 하는 것, 대표 실험
+3. [설계와 결정](docs/phase6/design.md): D01~D17(인덱스 구조·행 연결·유지·경로 선택의 선택지와 이유)
+4. [작업 순서](docs/phase6/tasks.md): P6-01~P6-05, 구현 메모, 검증 기록
 
 ## Phase 5 — 커서 페이지 조회 `GET /users` (구현 완료, 검증 대기)
 
@@ -126,7 +137,7 @@ docker run --rm -v "%cd%:/src" -w /src gcc:13 make sanitize
 | src/main.c | CLI: 인자·SQL 파일 읽기, 문장 순차 실행, 결과·오류 출력, 종료 코드 |
 | src/parser.c | Lexer + 재귀 하강 파서: SQL 텍스트 → Statement |
 | src/executor.c | 값 검증 후 Storage에 저장·조회 요청. WHERE는 조회 콜백 앞의 필터로 검사, 결과는 콜백으로 전달 |
-| src/storage.c | users.tsv 열기·검증·순차 읽기·추가, 다음 ID 복원. Phase 2: id 인덱스 구축·등록·`table_find_by_id`. Phase 4: `table_rewrite`(임시 파일 + 바꿔치기), `users.next`. Phase 5: `table_page`(커서 뒤 limit줄만 읽기) |
+| src/storage.c | users.tsv 열기·검증·순차 읽기·추가, 다음 ID 복원. Phase 2: id 인덱스 구축·등록·`table_find_by_id`. Phase 4: `table_rewrite`(임시 파일 + 바꿔치기), `users.next`. Phase 5: `table_page`(커서 뒤 limit줄만 읽기). Phase 6: age 조건(선형 탐색), age 보조 인덱스(age별 id 배열) 구축·유지·조회 |
 | src/bptree.c | (Phase 2) 메모리 B+ 트리: id → 레코드 바이트 위치 |
 | tools/bpt_demo.c | (Phase 2) 트리 모양·탐색 경로를 보는 학습 도구 |
 | tests/test_unit.c | Parser·Storage·Executor 단위 테스트 |

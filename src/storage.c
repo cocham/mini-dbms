@@ -46,7 +46,98 @@ struct Table {
     int64_t last_id;   /* 마지막으로 부여한 ID = max(파일의 최대 ID, users.next). 빈 테이블이면 0 */
     int64_t file_size; /* 끝까지 기록된 줄의 바이트 합. INSERT가 배타 잠금 안에서 늘린다 */
     BpTree *index;     /* id → 그 레코드 줄이 시작하는 바이트 위치. 메모리에만 있다 */
+    struct AgeIndex *age_index; /* age → 그 age인 id 목록(오름차순). 메모리에만 있다 (Phase 6, DB-P6-D14) */
 };
+
+/* ---------- age 보조 인덱스 (Phase 6, DB-P6-D14~D16) ----------
+ *
+ * age는 AGE_MIN~AGE_MAX(0~150)의 작은 정수라 age마다 id 배열 하나를 둔다. 배열에는 id만 있고, 줄 위치는
+ * id 인덱스(B+ 트리)로 찾는다(D15): 줄 위치의 주인은 id 인덱스 하나다.
+ * id는 증가 순서로만 부여되므로 INSERT는 배열 끝에 붙이면 정렬이 유지된다. UPDATE·DELETE는 파일을 통째로
+ * 다시 쓰므로, 그때 id 인덱스와 함께 새로 만들어 함께 바꾼다(D16). 열 때도 시작 탐색에서 함께 만든다.
+ * 바꾸는 쪽(INSERT·다시 쓰기)은 배타 잠금 안, 읽는 쪽(페이지 조회)은 공유 잠금 안이다(db.c).
+ */
+typedef struct {
+    int64_t *ids; /* 오름차순 */
+    size_t n, cap;
+} IdList;
+
+typedef struct AgeIndex {
+    IdList by[AGE_MAX + 1];
+} AgeIndex;
+
+#ifdef MINIDB_TESTING
+static int g_fail_age_push; /* 1이면 다음 age_index_push가 메모리 부족처럼 실패한다 (단일 스레드 테스트 전용) */
+void table_test_fail_age_push(int on) { g_fail_age_push = on; }
+#endif
+
+static AgeIndex *age_index_new(void) { return calloc(1, sizeof(AgeIndex)); }
+
+static void age_index_free(AgeIndex *a) {
+    int i;
+
+    if (a == NULL) {
+        return;
+    }
+    for (i = 0; i <= AGE_MAX; i++) {
+        free(a->by[i].ids);
+    }
+    free(a);
+}
+
+/* age 목록 끝에 id를 붙인다. 호출자는 id가 그 목록의 모든 id보다 크도록 부른다(id 증가 순서). 0 성공, -1 메모리 부족 */
+static int age_index_push(AgeIndex *a, int age, int64_t id) {
+    IdList *l = &a->by[age];
+
+#ifdef MINIDB_TESTING
+    if (g_fail_age_push) {
+        g_fail_age_push = 0;
+        return -1;
+    }
+#endif
+    if (l->n == l->cap) {
+        size_t nc = l->cap != 0 ? l->cap * 2 : 16;
+        int64_t *nb = realloc(l->ids, nc * sizeof *nb);
+        if (nb == NULL) {
+            return -1;
+        }
+        l->ids = nb;
+        l->cap = nc;
+    }
+    l->ids[l->n++] = id;
+    return 0;
+}
+
+/* ids[i] > after인 첫 i (이진 탐색). 없으면 n */
+static size_t id_list_upper(const IdList *l, int64_t after) {
+    size_t lo = 0, hi = l->n;
+
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (l->ids[mid] <= after) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+/* table_open의 시작 탐색에서 행마다 불린다 */
+typedef struct {
+    AgeIndex *a;
+    int failed;
+} AgeBuild;
+
+static int age_build_row(const Row *row, void *ctx) {
+    AgeBuild *b = ctx;
+
+    if (age_index_push(b->a, row->age, row->id) != 0) {
+        b->failed = 1;
+        return 1;
+    }
+    return 0;
+}
 
 /* ---------- 레코드 읽기 (Phase 3 P3-04: 공유 상태를 쓰지 않는 읽기) ----------
  *
@@ -249,6 +340,7 @@ static char *join_path(const char *dir, const char *name, const char *suffix) {
 /* FILE*는 닫은 뒤 부른다 */
 static void table_free(Table *t) {
     bpt_destroy(t->index);
+    age_index_free(t->age_index);
     free(t->path);
     free(t->tmp_path);
     free(t->next_path);
@@ -349,12 +441,21 @@ int table_open(const char *data_dir, Table **out, DbError *err) {
     /* 시작할 때 한 번만 전체(실제 파일 끝까지)를 검증하며 최대 ID와 파일 크기를 복원하고,
        id 인덱스를 메모리에 다시 만든다. */
     t->index = bpt_create(BPT_DEFAULT_ORDER);
-    if (t->index == NULL) {
+    t->age_index = age_index_new();
+    if (t->index == NULL || t->age_index == NULL) {
         db_error_setk(err, DBE_STORAGE, "메모리가 부족합니다");
         goto fail;
     }
-    if (scan_file(t, t->index, NULL, NULL, INT64_MAX, &t->last_id, &t->file_size, err) != 0 ||
-        read_next_file(t, err) != 0) {
+    {
+        AgeBuild ab = {t->age_index, 0};
+        if (scan_file(t, t->index, age_build_row, &ab, INT64_MAX, &t->last_id, &t->file_size, err) != 0) {
+            if (ab.failed) {
+                db_error_setk(err, DBE_STORAGE, "메모리가 부족해 age 인덱스를 만들 수 없습니다");
+            }
+            goto fail;
+        }
+    }
+    if (read_next_file(t, err) != 0) {
         goto fail;
     }
     if (t->next_saved > t->last_id) {
@@ -487,9 +588,13 @@ typedef struct {
     Reader rd;
     int64_t next_pos; /* rd가 다음에 넘겨줄 바이트의 위치. -1이면 아직 이동 전 */
     int64_t limit;    /* table_page: 넘길 최대 행 수. 제한 없으면 -1 */
-    int64_t lines;    /* 파일에서 읽은 줄 수 */
+    int64_t lines;    /* 파일에서 읽은 줄 수 (E) */
     int64_t keys;     /* 리프에서 받은 키 수 (줄을 읽지 않은 limit+1번째 포함) */
-    int has_more;     /* table_page: limit+1번째 키를 만났으면 1 */
+    int has_more;     /* table_page: 조건에 맞는 limit+1번째를 만났으면 1 */
+    int has_age;      /* table_page 선형 탐색: age 조건이 있으면 1 */
+    int age;
+    int64_t returned; /* fn에 넘긴 행 (R) */
+    int64_t after_last; /* 마지막으로 넘긴 행 뒤에서 읽은 줄 (T, returned > 0일 때만 셈) */
 } RangeRead;
 
 #define RANGE_STOP 2 /* range_visit의 정상 멈춤. bpt_range가 그대로 돌려준다 */
@@ -518,7 +623,8 @@ static int range_visit(int64_t id, int64_t offset, void *vctx) {
     int r;
 
     rr->keys++;
-    if (rr->limit >= 0 && rr->lines >= rr->limit) {
+    /* 조건 없음: limit+1번째는 키만 보고 멈춘다(줄을 읽지 않음, DB-P5-D02) */
+    if (!rr->has_age && rr->limit >= 0 && rr->returned >= rr->limit) {
         rr->has_more = 1;
         return RANGE_STOP;
     }
@@ -538,6 +644,21 @@ static int range_visit(int64_t id, int64_t offset, void *vctx) {
         return 1;
     }
     rr->next_pos = offset + (int64_t)len + 1;
+    if (rr->has_age) {
+        /* 조건 있음(선형 탐색, DB-P6-D07): age는 인덱스에 없으므로 줄을 읽어야 판단할 수 있다 */
+        if (rr->returned > 0) {
+            rr->after_last++;
+        }
+        if (row.age != rr->age) {
+            return 0;
+        }
+        if (rr->limit >= 0 && rr->returned >= rr->limit) {
+            rr->has_more = 1; /* 조건에 맞는 limit+1번째: 넘기지 않고 멈춘다 */
+            return RANGE_STOP;
+        }
+        rr->after_last = 0;
+    }
+    rr->returned++;
     if (rr->fn != NULL && rr->fn(&row, rr->ctx) != 0) {
         db_error_setk(rr->err, DBE_SINK, "조회 결과 처리에 실패했습니다");
         return 1;
@@ -545,9 +666,10 @@ static int range_visit(int64_t id, int64_t offset, void *vctx) {
     return 0;
 }
 
-/* [lo, hi]를 id 순서로 읽는다. limit ≥ 0이면 limit개를 넘긴 뒤 다음 키에서 정상으로 멈춘다. */
-static int range_read(Table *t, int64_t lo, int64_t hi, int64_t limit, RowFn fn, void *ctx, int *has_more,
-                      int64_t *lines, int64_t *keys, DbError *err) {
+/* [lo, hi]를 id 순서로 읽는다. limit ≥ 0이면 limit개를 넘긴 뒤 다음 (맞는) 키에서 정상으로 멈춘다.
+ * has_age면 age가 같은 줄만 넘긴다. out이 NULL이 아니면 계측 값을 담는다(실패해도 거기까지). */
+static int range_read(Table *t, int64_t lo, int64_t hi, int64_t limit, int has_age, int age, RowFn fn, void *ctx,
+                      RangeRead *out, DbError *err) {
     RangeRead rr;
     char *buf = malloc(SCAN_BUF);
     int r;
@@ -556,6 +678,7 @@ static int range_read(Table *t, int64_t lo, int64_t hi, int64_t limit, RowFn fn,
         db_error_setk(err, DBE_STORAGE, "메모리가 부족합니다");
         return -1;
     }
+    memset(&rr, 0, sizeof rr);
     rr.t = t;
     rr.fn = fn;
     rr.ctx = ctx;
@@ -563,40 +686,88 @@ static int range_read(Table *t, int64_t lo, int64_t hi, int64_t limit, RowFn fn,
     reader_init(&rr.rd, t->fd, buf, SCAN_BUF, 0, t->file_size);
     rr.next_pos = -1;
     rr.limit = limit;
-    rr.lines = 0;
-    rr.keys = 0;
-    rr.has_more = 0;
+    rr.has_age = has_age;
+    rr.age = age;
     r = bpt_range(t->index, lo, hi, range_visit, &rr);
     free(buf);
-    if (has_more != NULL) {
-        *has_more = rr.has_more;
-    }
-    if (lines != NULL) {
-        *lines = rr.lines;
-    }
-    if (keys != NULL) {
-        *keys = rr.keys;
+    if (out != NULL) {
+        *out = rr;
     }
     return (r == 0 || r == RANGE_STOP) ? 0 : -1;
 }
 
 int table_find_id_range(Table *t, int64_t lo, int64_t hi, RowFn fn, void *ctx, DbError *err) {
-    return range_read(t, lo, hi, -1, fn, ctx, NULL, NULL, NULL, err);
+    return range_read(t, lo, hi, -1, 0, 0, fn, ctx, NULL, err);
 }
 
-int table_page(Table *t, int64_t after_id, int64_t limit, RowFn fn, void *ctx, int *has_more, DbError *err) {
-    int64_t lines = 0, keys = 0;
-    int more = 0;
+/*
+ * age 인덱스 경로 (DB-P6-D14·D15): age 목록에서 after_id보다 큰 첫 항목(이진 탐색)부터 차례로 본다(K).
+ * limit개를 넘긴 뒤 다음 항목이 있으면 has_more = 1, 그 줄은 읽지 않는다. 항목마다 id 인덱스로 줄 위치를 찾아
+ * 한 줄만 읽고 id·age를 다시 확인한다. 다르면 엉뚱한 행 대신 DBE_STORAGE.
+ */
+static int age_index_page(Table *t, int64_t after_id, int64_t limit, int age, RowFn fn, void *ctx, PageStats *st,
+                          DbError *err) {
+    const IdList *l = &t->age_index->by[age];
+    size_t i;
+
+    for (i = id_list_upper(l, after_id); i < l->n; i++) {
+        char line[LINE_CAP], buf[LINE_CAP];
+        int64_t id = l->ids[i], offset;
+        size_t len;
+        const char *why = NULL;
+        Reader rd;
+        Row row;
+        int r;
+
+        st->index_keys++;
+        if (st->rows_returned >= limit) {
+            st->has_more = 1; /* limit+1번째 항목: 인덱스만 보고 멈춘다 */
+            break;
+        }
+        if (!bpt_search(t->index, id, &offset)) {
+            db_error_setk(err, DBE_STORAGE, "age 인덱스와 id 인덱스가 일치하지 않습니다: %s (id %" PRId64 ", age %d)",
+                         t->path, id, age);
+            return -1;
+        }
+        reader_init(&rd, t->fd, buf, sizeof buf, offset, t->file_size);
+        r = read_line(&rd, line, sizeof line, &len, &why);
+        st->rows_examined++;
+        if (r == -2) {
+            db_error_setk(err, DBE_STORAGE, "데이터 파일 읽기 실패: %s", t->path);
+            return -1;
+        }
+        if (r != 1 || parse_record(line, len, 0, &row, &why) != 0 || row.id != id || row.age != age) {
+            db_error_setk(err, DBE_STORAGE,
+                         "age 인덱스와 데이터 파일이 일치하지 않습니다: %s (id %" PRId64 ", age %d, 위치 %" PRId64 ")",
+                         t->path, id, age, offset);
+            return -1;
+        }
+        st->rows_returned++;
+        if (fn != NULL && fn(&row, ctx) != 0) {
+            db_error_setk(err, DBE_SINK, "조회 결과 처리에 실패했습니다");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int table_page(Table *t, int64_t after_id, int64_t limit, const PageFilter *filter, RowFn fn, void *ctx,
+               PageStats *st, DbError *err) {
+    PageStats z;
+    RangeRead rr;
+    int has_age = filter != NULL && filter->has_age;
     int rc;
 
-    if (has_more != NULL) {
-        *has_more = 0;
+    if (st == NULL) {
+        st = &z;
     }
+    memset(st, 0, sizeof *st);
+    st->used = !has_age ? PAGE_USED_ID : filter->path == PAGE_PATH_SCAN ? PAGE_USED_SCAN : PAGE_USED_AGE_INDEX;
 #ifdef MINIDB_TESTING
     g_page_lines = 0;
     g_page_keys = 0;
 #endif
-    if (limit < 1 || after_id < 0) {
+    if (limit < 1 || after_id < 0 || (has_age && (filter->age < AGE_MIN || filter->age > AGE_MAX))) {
         db_error_setk(err, DBE_SQL, "페이지 조회 값이 올바르지 않습니다 (after_id %" PRId64 ", limit %" PRId64 ")",
                      after_id, limit);
         return -1;
@@ -604,16 +775,28 @@ int table_page(Table *t, int64_t after_id, int64_t limit, RowFn fn, void *ctx, i
     if (after_id == INT64_MAX) {
         return 0; /* 그보다 큰 id는 없다. after_id + 1은 넘치므로 트리를 보지 않는다 */
     }
-    rc = range_read(t, after_id + 1, INT64_MAX, limit, fn, ctx, &more, &lines, &keys, err);
+    if (st->used == PAGE_USED_AGE_INDEX) {
+        int more_rc = age_index_page(t, after_id, limit, filter->age, fn, ctx, st, err);
+        if (more_rc != 0) {
+            st->has_more = 0;
+        }
 #ifdef MINIDB_TESTING
-    g_page_lines = lines;
-    g_page_keys = keys;
-#else
-    (void)keys;
+        g_page_lines = st->rows_examined;
+        g_page_keys = st->index_keys;
 #endif
-    if (rc == 0 && has_more != NULL) {
-        *has_more = more;
+        return more_rc; /* T = 0: 마지막 반환 행 뒤의 줄은 읽지 않는다 */
     }
+    rc = range_read(t, after_id + 1, INT64_MAX, limit, has_age, has_age ? filter->age : 0, fn, ctx, &rr, err);
+    st->rows_returned = rr.returned;
+    st->rows_examined = rr.lines;
+    st->examined_after_last = rr.returned > 0 ? rr.after_last : rr.lines;
+    if (rc == 0) {
+        st->has_more = rr.has_more;
+    }
+#ifdef MINIDB_TESTING
+    g_page_lines = rr.lines;
+    g_page_keys = rr.keys;
+#endif
     return rc;
 }
 
@@ -686,6 +869,13 @@ int table_append(Table *t, const char *name, int age, int64_t *out_id, DbError *
     default:
         db_error_setk(err, DBE_INDEX_FAILED,
                       "메모리가 부족해 id %" PRId64 "를 인덱스에 등록하지 못했습니다 "
+                      "(레코드는 저장됨, 다시 실행하면 인덱스가 재구성됨)", id);
+        return -1;
+    }
+    /* age 인덱스(DB-P6-D16): id 인덱스와 같은 규칙. 실패하면 엔진이 중단 상태가 되고 다시 실행하면 재구성된다 */
+    if (age_index_push(t->age_index, age, id) != 0) {
+        db_error_setk(err, DBE_INDEX_FAILED,
+                      "메모리가 부족해 id %" PRId64 "를 age 인덱스에 등록하지 못했습니다 "
                       "(레코드는 저장됨, 다시 실행하면 인덱스가 재구성됨)", id);
         return -1;
     }
@@ -770,6 +960,7 @@ typedef struct {
     const RowUpdate *upd; /* NULL이면 DELETE */
     FILE *out;            /* users.tsv.tmp */
     BpTree *index;        /* 새 파일 기준 id → 바이트 위치 */
+    AgeIndex *age;        /* 새 파일 기준 age → id 목록 (DB-P6-D16) */
     int64_t size;         /* 새 파일에 쓴 바이트 수 = 다음 줄이 시작할 위치 */
     int64_t max_id;       /* 새 파일의 최대 id. 비면 0 */
     int64_t count;        /* 조건에 맞은 행 수 */
@@ -810,7 +1001,7 @@ static int rewrite_row(const Row *row, void *vctx) {
         return 1;
     }
     /* id는 원래 파일에서 증가 순서였고 그 순서대로 쓰므로 중복은 없다. 실패 원인은 메모리 부족뿐이다. */
-    if (bpt_insert(rc->index, row->id, rc->size) != BPT_OK) {
+    if (bpt_insert(rc->index, row->id, rc->size) != BPT_OK || age_index_push(rc->age, age, row->id) != 0) {
         db_error_setk(&rc->err, DBE_STORAGE, "메모리가 부족해 새 인덱스를 만들 수 없습니다");
         rc->failed = 1;
         return 1;
@@ -856,7 +1047,10 @@ int table_rewrite(Table *t, RowPred match, void *match_ctx, const RowUpdate *upd
     rc.upd = upd;
     rc.tmp_path = t->tmp_path;
     rc.index = bpt_create(BPT_DEFAULT_ORDER);
-    if (rc.index == NULL) {
+    rc.age = age_index_new();
+    if (rc.index == NULL || rc.age == NULL) {
+        bpt_destroy(rc.index);
+        age_index_free(rc.age);
         db_error_setk(err, DBE_STORAGE, "메모리가 부족합니다");
         return -1;
     }
@@ -922,6 +1116,7 @@ int table_rewrite(Table *t, RowPred match, void *match_ctx, const RowUpdate *upd
         if (reopen_table_file(t) != 0) {
             remove(t->tmp_path);
             bpt_destroy(rc.index);
+            age_index_free(rc.age);
             db_error_setk(err, DBE_REOPEN_FAILED,
                           "데이터 파일 바꿔치기 실패 뒤 원래 파일을 다시 열지 못했습니다: %s (변경 없음, 다시 실행하면 복원)",
                           t->path);
@@ -933,6 +1128,8 @@ int table_rewrite(Table *t, RowPred match, void *match_ctx, const RowUpdate *upd
 #endif
     bpt_destroy(t->index);
     t->index = rc.index;
+    age_index_free(t->age_index); /* 새 파일과 id 인덱스에 맞춘 age 인덱스로 함께 바꾼다 */
+    t->age_index = rc.age;
     t->file_size = rc.size;
     *out_count = rc.count;
 #ifdef _WIN32
@@ -956,6 +1153,7 @@ fail:
     }
     remove(t->tmp_path);
     bpt_destroy(rc.index);
+    age_index_free(rc.age);
     return -1;
 }
 
@@ -963,6 +1161,46 @@ int64_t table_last_id(const Table *t) { return t->last_id; }
 
 #ifdef MINIDB_TESTING
 int table_test_validate_index(const Table *t, char *why, size_t cap) { return bpt_validate(t->index, why, cap); }
+
+int table_test_age_index_inject(Table *t, int age, int64_t id) { return age_index_push(t->age_index, age, id); }
+
+/* 파일 전체를 읽어 age별 id 목록을 새로 만들고 메모리의 age 인덱스와 비교한다 */
+int table_test_validate_age_index(Table *t, char *why, size_t cap) {
+    AgeIndex *want = age_index_new();
+    AgeBuild ab;
+    DbError err = {{0}, DBE_NONE};
+    int age, rc = 0;
+
+    if (want == NULL) {
+        snprintf(why, cap, "메모리 부족");
+        return -1;
+    }
+    ab.a = want;
+    ab.failed = 0;
+    if (table_scan(t, age_build_row, &ab, &err) != 0) {
+        snprintf(why, cap, "파일 읽기 실패: %s", err.msg);
+        age_index_free(want);
+        return -1;
+    }
+    for (age = 0; age <= AGE_MAX && rc == 0; age++) {
+        const IdList *a = &t->age_index->by[age], *b = &want->by[age];
+        size_t i;
+        if (a->n != b->n) {
+            snprintf(why, cap, "age %d: 인덱스 %zu개, 파일 %zu개", age, a->n, b->n);
+            rc = -1;
+            break;
+        }
+        for (i = 0; i < a->n; i++) {
+            if (a->ids[i] != b->ids[i] || (i > 0 && a->ids[i] <= a->ids[i - 1])) {
+                snprintf(why, cap, "age %d의 %zu번째: 인덱스 %" PRId64 ", 파일 %" PRId64, age, i, a->ids[i], b->ids[i]);
+                rc = -1;
+                break;
+            }
+        }
+    }
+    age_index_free(want);
+    return rc;
+}
 #endif
 
 int table_index_height(const Table *t) { return bpt_height(t->index); }

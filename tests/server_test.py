@@ -402,7 +402,8 @@ def usage_and_start_errors():
     d = fresh("usage")
     for args in (["--port", "70000"], ["--port", "x"], ["--max-rows", "0"], ["--max-response", "100"],
                  ["--host", "localhost"], ["--threads", "0"], ["--threads", "257"], ["--queue", "0"],
-                 ["--queue", "4097"], ["--queue", "x"], ["--data-dir"]):
+                 ["--queue", "4097"], ["--queue", "x"], ["--data-dir"], ["--age-path"], ["--age-path", "Index"],
+                 ["--age-path", "both"]):
         code, out, err = run_start_fail(d, *args)
         eq(code, 2, "사용법 오류 %r: %s" % (args, err))
         ok("사용법" in err, err)
@@ -1046,6 +1047,279 @@ def users_forward_walk_during_writes():
             ok(all(a < b for a, b in zip(w, w[1:])), "엄격하게 증가")
             eq(sorted(both - set(w)), [], "계속 있던 행 누락")
             ok(all(1 <= x < max_id for x in w), "부여된 적 없는 id")
+
+
+# ---------- Phase 6: age 조건 페이지 조회 ----------
+
+def users_h(port, qs=""):
+    """(상태, JSON, 헤더, 본문 바이트)"""
+    st, h, data = request(port, "GET", "/users" + qs)
+    return st, json.loads(data.decode("utf-8")), h, data
+
+
+def metrics(h):
+    """계측 헤더 → (E, T, K, 경로). 엔진 시간은 값이 흔들리므로 정수인지만 본다"""
+    ok(h.get("x-engine-us", "").isdigit(), "X-Engine-Us: %r" % h.get("x-engine-us"))
+    return (int(h["x-rows-examined"]), int(h["x-rows-examined-after-last"]), int(h["x-age-index-keys"]),
+            h["x-access-path"])
+
+
+def walk_age(port, age, limit, guard=100000, extra=""):
+    """같은 age를 유지하며 커서 0부터 순방향 순회. (모든 행, 페이지 수, 페이지별 계측)"""
+    rows, after, pages, ms = [], 0, 0, []
+    while pages < guard:
+        st, r, h, _ = users_h(port, "?age=%d&after_id=%d&limit=%d%s" % (age, after, limit, extra))
+        eq(st, 200, "페이지 %d" % pages)
+        pages += 1
+        ms.append(metrics(h))
+        for row in r["rows"]:
+            eq(row[2], age, "조건에 맞는 행만")
+        rows += r["rows"]
+        if r["rows"]:
+            eq(r["next_cursor"], r["rows"][-1][0], "next_cursor = 마지막 행 id")
+            after = r["next_cursor"]
+        else:
+            eq(r["next_cursor"], None, "빈 페이지의 next_cursor")
+        if not r["has_more"]:
+            return rows, pages, ms
+    raise Fail("순회가 끝나지 않음")
+
+
+AGE_SCAN = ["--age-path", "scan"]  # 선형 탐색(기준 구현)으로 띄운다. 기본값은 index
+
+EVEN30 = [(i, "u%d" % i, 30 if i % 2 == 0 else 40) for i in range(1, 21)]
+
+
+@test
+def users_age_pages_and_metrics():
+    # F3: 응답 형식·계측 헤더(선형 탐색, 손으로 계산한 E·T). id 1~20, 짝수 age 30, 홀수 age 40
+    d = fresh("p6_age_basic")
+    write_rows(d, EVEN30)
+    with Server(d, *AGE_SCAN) as s:
+        st, r, h, _ = users_h(s.port, "?age=30&limit=3")
+        eq((st, sorted(r), page_ids(r), r["has_more"], r["next_cursor"]),
+           (200, ["columns", "has_more", "next_cursor", "ok", "rows"], [2, 4, 6], True, 6))
+        eq(r["rows"][0], [2, "u2", 30])
+        eq(metrics(h), (8, 2, 0, "scan"), "1~8번 줄, 마지막 반환 뒤 7·8")
+        cases = [("?age=30&after_id=6&limit=3", [8, 10, 12], True, (8, 2, 0, "scan")),
+                 ("?limit=3&after_id=16&age=30", [18, 20], False, (4, 0, 0, "scan")),
+                 ("?age=40&after_id=13&limit=3", [15, 17, 19], False, (7, 1, 0, "scan")),
+                 ("?age=30&after_id=14&limit=2", [16, 18], True, (6, 2, 0, "scan")),
+                 ("?age=30&after_id=5&limit=2", [6, 8], True, (5, 2, 0, "scan")),
+                 ("?age=99", [], False, (20, 20, 0, "scan")),
+                 ("?age=30&after_id=20", [], False, (0, 0, 0, "scan")),
+                 ("?age=30&after_id=9223372036854775807", [], False, (0, 0, 0, "scan")),
+                 ("?age=30", [2, 4, 6, 8, 10, 12, 14, 16, 18, 20], False, (20, 0, 0, "scan"))]
+        for qs, ids, more, m in cases:
+            st, r, h, _ = users_h(s.port, qs)
+            eq((st, page_ids(r), r["has_more"], metrics(h)), (200, ids, more, m), qs)
+            eq(r["next_cursor"], ids[-1] if ids else None, qs + " next_cursor")
+        ok(any("GET /users → 200, scan R=3 E=8 T=2 K=0" in ln for ln in s.log), "요청 로그: " + "".join(s.log[-3:]))
+
+
+@test
+def users_without_age_unchanged():
+    # F3: 조건 없는 응답 본문은 Phase 5와 같다(바이트 비교). 계측은 E = R, T = 0, K = 0, 경로 id
+    d = fresh("p6_plain")
+    write_rows(d, EVEN30)
+    with Server(d, *AGE_SCAN) as s:
+        st, r, h, body = users_h(s.port, "?limit=3")
+        eq(body, b'{"ok":true,"columns":["id","name","age"],"rows":[[1,"u1",40],[2,"u2",30],[3,"u3",40]],'
+                 b'"has_more":true,"next_cursor":3}', "Phase 5와 같은 본문")
+        eq(metrics(h), (3, 0, 0, "id"))
+        st, r, h, body = users_h(s.port, "?after_id=20")
+        eq(body, b'{"ok":true,"columns":["id","name","age"],"rows":[],"has_more":false,"next_cursor":null}')
+        eq(metrics(h), (0, 0, 0, "id"))
+        st, r, h, body = users_h(s.port, "?after_id=17&limit=3")
+        eq((page_ids(r), r["has_more"], metrics(h)), ([18, 19, 20], False, (3, 0, 0, "id")), "N+1은 키로만")
+
+
+@test
+def users_age_invalid_params():
+    # F3: age 입력 검증 → 400 INVALID_PARAM, 엔진 안 부름
+    bad = ["age=abc", "age=", "age=30.0", "age=-1", "age=+30", "age=030", "age=00", "age=151", "age=999",
+           "age=9223372036854775808", "age=30&age=40", "age=30&age=30", "age", "age=%33%30", "AGE=30",
+           "name=kim", "age_min=30", "age=30&", "age=30&&limit=1", "age=3 0"]
+    d = fresh("p6_age_invalid")
+    write_rows(d, EVEN30)
+    with Server(d, *AGE_SCAN) as s:
+        for qs in bad:
+            st, h, data = request(s.port, "GET", "/users?" + qs.replace(" ", "%20"))
+            r = json.loads(data)
+            eq((st, r["error"]["code"], sorted(r)), (400, "INVALID_PARAM", ["error", "ok"]), "거부: " + qs)
+            ok("x-rows-examined" not in h, "400에는 계측 헤더 없음: " + qs)
+        st, r, _, _ = users_h(s.port, "?age=151")
+        ok("150" in r["error"]["message"], "허용 범위 안내: " + r["error"]["message"])
+        st, r, _, _ = users_h(s.port, "?name=kim")
+        ok("after_id, limit, age" in r["error"]["message"], r["error"]["message"])
+        st, r, _, _ = users_h(s.port, "?age=30&age=40")
+        ok("두 번" in r["error"]["message"], r["error"]["message"])
+        for qs, want in (("age=0", []), ("age=150", []), ("age=40&limit=1", [1]), ("after_id=0&age=30&limit=1", [2])):
+            st, r, _, _ = users_h(s.port, "?" + qs)
+            eq((st, page_ids(r)), (200, want), "허용: " + qs)
+        eq(sum(1 for ln in s.log if "INVALID_PARAM" in ln), len(bad) + 3, "거부 로그 수")
+
+
+@test
+def users_age_forward_walk_matches_file():
+    # F4: 같은 age로 끝까지 따라가면 파일에서 그 age인 행 전부를 id 순서로 중복·누락 없이
+    d = fresh("p6_age_walk")
+    want = [[i, "n%d" % i, i % 7] for i in range(1, 3001)]
+    write_rows(d, want)
+    with Server(d, *AGE_SCAN) as s:
+        for age, limit in ((3, 100), (3, 7), (0, 1000), (6, 428)):
+            rows, pages, ms = walk_age(s.port, age, limit)
+            exp = [x for x in want if x[2] == age]
+            eq(rows == exp, True, "age %d limit %d 결과" % (age, limit))
+            eq(pages, max(1, -(-len(exp) // limit)), "페이지 수")
+            eq(sum(m[0] for m in ms) >= 3000, True, "순회 전체의 E 합계 ≥ 행 수 (다음 페이지가 T를 다시 검사)")
+        rows, pages, ms = walk_age(s.port, 99, 100)
+        eq((rows, pages, ms), ([], 1, [(3000, 3000, 0, "scan")]), "일치 없음: 한 요청이 전부 검사")
+
+
+@test
+def users_age_forward_walk_during_writes():
+    # F5: age 조건 순방향 조회 도중 INSERT·UPDATE(age 변경)·DELETE.
+    # 고정 집합(id ≡ 0 mod 6, age 30)은 건드리지 않는다. (가) 엄격하게 증가 (나) 고정 집합은 정확히 한 번
+    # (다) 받은 행은 모두 age 30
+    run_age_walk_during_writes("p6_age_concurrent", AGE_SCAN)
+
+
+def run_age_walk_during_writes(name, args):
+    d = fresh(name)
+    start = 300
+    write_rows(d, [(i, "s%d" % i, 30 if i % 6 == 0 or i % 4 == 1 else 31) for i in range(1, start + 1)])
+    stable = set(range(6, start + 1, 6))
+    with Server(d, "--threads", "4", *args) as s:
+        done = threading.Event()
+
+        def writer(c):
+            rng = random.Random(200 + c)
+            for i in range(40):
+                k = rng.random()
+                target = rng.randint(1, start + 120)
+                if target % 6 == 0:
+                    target += 1
+                if k < 0.35:
+                    st, r = query(s.port, ins("w%d_%d" % (c, i), rng.choice((30, 31))))
+                elif k < 0.75:
+                    st, r = query(s.port, "UPDATE users SET age = %d WHERE id = %d;" % (rng.choice((30, 31)), target))
+                else:
+                    st, r = query(s.port, "DELETE FROM users WHERE id = %d;" % target)
+                eq(st, 200, "쓰기")
+
+        def reader():
+            walks = []
+            while not done.is_set() or len(walks) < 2:
+                rows, _, _ = walk_age(s.port, 30, 5)
+                walks.append([x[0] for x in rows])
+            return walks
+
+        rt, rbox = in_thread(reader)
+        ws = [in_thread(writer, c) for c in range(3)]
+        for th, box in ws:
+            th.join(180)
+            ok(not th.is_alive(), "쓰기가 끝나지 않음")
+            if "error" in box:
+                raise box["error"]
+        done.set()
+        rt.join(180)
+        ok(not rt.is_alive(), "순회가 끝나지 않음")
+        if "error" in rbox:
+            raise rbox["error"]
+        for w in rbox["value"]:
+            ok(all(a < b for a, b in zip(w, w[1:])), "엄격하게 증가")
+            got = [x for x in w if x in stable]
+            eq(got, sorted(stable), "고정 집합은 정확히 한 번")
+
+
+# ---------- Phase 6: age 보조 인덱스 경로 (P6-05) ----------
+
+AGE_QUERIES = ["?age=30&limit=3", "?age=30&after_id=6&limit=3", "?limit=3&after_id=16&age=30",
+               "?age=40&after_id=13&limit=3", "?age=30&after_id=14&limit=2", "?age=30&after_id=5&limit=2",
+               "?age=99", "?age=30&after_id=20", "?age=30&after_id=9223372036854775807", "?age=30", "?age=40&limit=1000",
+               "?age=30&after_id=19&limit=1", "?age=0"]
+
+
+def bodies(port, qs_list):
+    out = []
+    for qs in qs_list:
+        st, r, h, body = users_h(port, qs)
+        eq(st, 200, qs)
+        out.append((body, metrics(h), r))
+    return out
+
+
+@test
+def users_age_index_path_same_body():
+    # F10 기반: 같은 데이터·같은 요청에서 --age-path scan과 index(기본)의 응답 본문이 바이트 단위로 같다.
+    # 인덱스 경로의 계측: E = R, T = 0, K = R + has_more, 경로 age-index
+    d = fresh("p6_paths")
+    write_rows(d, EVEN30)
+    with Server(d, *AGE_SCAN) as s:
+        ok(any("age 경로 scan" in ln for ln in s.log), "시작 줄: " + "".join(s.log))
+        scan = bodies(s.port, AGE_QUERIES)
+    for args in ([], ["--age-path", "index"]):
+        with Server(d, *args) as s:
+            ok(any("age 경로 index" in ln for ln in s.log), "시작 줄: " + "".join(s.log))
+            idx = bodies(s.port, AGE_QUERIES)
+            for qs, (b1, m1, r1), (b2, m2, r2) in zip(AGE_QUERIES, scan, idx):
+                eq(b2, b1, "본문이 같음: " + qs)
+                n = len(r2["rows"])
+                eq(m2, (n, 0, n + (1 if r2["has_more"] else 0), "age-index"), "인덱스 계측: " + qs)
+                eq(m1[3], "scan")
+            st, r, h, _ = users_h(s.port, "?age=30&limit=3")
+            eq((page_ids(r), metrics(h)), ([2, 4, 6], (3, 0, 4, "age-index")), "손으로 계산한 값")
+            st, r, h, _ = users_h(s.port, "?limit=3")
+            eq(metrics(h), (3, 0, 0, "id"), "조건 없는 요청은 경로 옵션과 상관없음")
+            ok(any("GET /users → 200, age-index R=3 E=3 T=0 K=4" in ln for ln in s.log), "로그: " + "".join(s.log[-3:]))
+
+
+@test
+def users_age_paths_agree_after_writes_and_restart():
+    # F8·F9(서버): INSERT·UPDATE(age 변경·name만)·DELETE 뒤, 재시작 뒤에도 두 경로의 본문이 같다
+    d = fresh("p6_paths_writes")
+    write_rows(d, [(i, "u%d" % i, (i * 7) % 5 * 10) for i in range(1, 201)])
+    qs_list = ["?age=%d&after_id=%d&limit=%d" % (a, c, l) for a in (0, 10, 20, 40, 77) for c in (0, 37, 150, 199)
+               for l in (1, 7, 100)]
+    with Server(d) as s:
+        steps = ["UPDATE users SET age = 77 WHERE id BETWEEN 20 AND 40;", "UPDATE users SET name = 'x' WHERE id = 21;",
+                 "DELETE FROM users WHERE age = 10;", "DELETE FROM users WHERE id = 200;",
+                 ins("new1", 77) + ins("new2", 20) + ins("new3", 77)]
+        for sql in steps:
+            st, r = query(s.port, sql)
+            eq(st, 200, sql)
+        idx_live = bodies(s.port, qs_list)
+    with Server(d, *AGE_SCAN) as s:
+        scan = bodies(s.port, qs_list)
+    with Server(d) as s:
+        idx_restart = bodies(s.port, qs_list)
+    for qs, a, b, c in zip(qs_list, scan, idx_live, idx_restart):
+        eq(b[0], a[0], "쓰기 직후 인덱스 = 선형: " + qs)
+        eq(c[0], a[0], "재시작 뒤 인덱스 = 선형: " + qs)
+
+
+@test
+def users_age_index_forward_walk_matches_file():
+    # F4(인덱스 경로)
+    d = fresh("p6_age_walk_index")
+    want = [[i, "n%d" % i, i % 7] for i in range(1, 3001)]
+    write_rows(d, want)
+    with Server(d) as s:
+        for age, limit in ((3, 100), (3, 7), (0, 1000), (6, 428)):
+            rows, pages, ms = walk_age(s.port, age, limit)
+            exp = [x for x in want if x[2] == age]
+            eq(rows == exp, True, "age %d limit %d 결과" % (age, limit))
+            eq(sum(m[0] for m in ms), len(exp), "인덱스 경로는 반환할 행만 읽는다 (E 합계 = 받은 행)")
+            ok(all(m[3] == "age-index" for m in ms), "경로")
+        rows, pages, ms = walk_age(s.port, 99, 100)
+        eq((rows, pages, ms), ([], 1, [(0, 0, 0, "age-index")]), "일치 없음: 파일을 읽지 않음")
+
+
+@test
+def users_age_index_forward_walk_during_writes():
+    # F5(인덱스 경로)
+    run_age_walk_during_writes("p6_age_concurrent_index", ["--age-path", "index"])
 
 
 def main():

@@ -82,6 +82,7 @@ typedef struct {
     size_t max_response;
     int64_t page_max;     /* GET /users의 limit 상한 (시작 때 계산, DB-P5-D08) */
     int64_t page_default; /* limit을 생략했을 때 = min(100, page_max) */
+    PagePath age_path;    /* age 조건 페이지의 탐색 경로 (--age-path, DB-P6-D17) */
     int threads;
     size_t queue_cap;
     long grace_ms;
@@ -560,16 +561,20 @@ static int parse_param_num(const char *s, size_t n, int64_t *out) {
 }
 
 /*
- * 쿼리 문자열 → after_id, limit (spec "입력 검증", DB-P5-D06). 0 성공, -1이면 msg에 이유.
- * 항목은 '&'로 나눈다. 이름은 after_id·limit만, 같은 이름 두 번·'=' 없음·빈 항목·%XX(숫자가 아님)는 거부.
+ * 쿼리 문자열 → after_id, limit, age (Phase 5 spec "입력 검증" DB-P5-D06, Phase 6 DB-P6-D03·D04).
+ * 0 성공, -1이면 msg에 이유. 항목은 '&'로 나눈다. 이름은 after_id·limit·age만,
+ * 같은 이름 두 번·'=' 없음·빈 항목·%XX(숫자가 아님)는 거부. age는 0~150(범위 밖은 맞는 행이 있을 수 없어 거부).
  */
-static int parse_users_query(const Server *s, const HttpRequest *req, int64_t *after, int64_t *limit, char *msg,
-                             size_t cap) {
+static int parse_users_query(const Server *s, const HttpRequest *req, int64_t *after, int64_t *limit,
+                             PageFilter *filter, char *msg, size_t cap) {
     const char *p = req->query;
-    int seen_after = 0, seen_limit = 0;
+    int seen_after = 0, seen_limit = 0, seen_age = 0;
 
     *after = 0;
     *limit = s->page_default;
+    filter->has_age = 0;
+    filter->age = 0;
+    filter->path = s->age_path;
     if (req->query_over) {
         snprintf(msg, cap, "쿼리 문자열이 너무 깁니다 (최대 %d바이트)", HTTP_MAX_QUERY);
         return -1;
@@ -615,9 +620,21 @@ static int parse_users_query(const Server *s, const HttpRequest *req, int64_t *a
                 return -1;
             }
             *limit = num;
+        } else if (klen == 3 && memcmp(p, "age", 3) == 0) {
+            if (seen_age++) {
+                snprintf(msg, cap, "age가 두 번 있습니다");
+                return -1;
+            }
+            if (parse_param_num(v, vlen, &num) != 0 || num < AGE_MIN || num > AGE_MAX) {
+                snprintf(msg, cap, "age는 %d 이상 %d 이하의 10진 정수여야 합니다 (앞자리 0·부호 불가, 현재: '%.*s')", AGE_MIN,
+                         AGE_MAX, (int)(vlen > 40 ? 40 : vlen), v);
+                return -1;
+            }
+            filter->has_age = 1;
+            filter->age = (int)num;
         } else {
-            snprintf(msg, cap, "모르는 파라미터입니다: '%.*s' (after_id, limit만 받습니다)", (int)(klen > 40 ? 40 : klen),
-                     p);
+            snprintf(msg, cap, "모르는 파라미터입니다: '%.*s' (after_id, limit, age만 받습니다)",
+                     (int)(klen > 40 ? 40 : klen), p);
             return -1;
         }
         p += ilen;
@@ -649,27 +666,48 @@ static int users_on_row(const Row *row, void *vctx) {
     return 0;
 }
 
-static int handle_users(Server *s, int fd, const HttpRequest *req, const char **logcode) {
-    char msg[200];
-    int64_t after, limit;
+static const char *access_path_name(PageUsed u) {
+    switch (u) {
+    case PAGE_USED_SCAN: return "scan";
+    case PAGE_USED_AGE_INDEX: return "age-index";
+    default: return "id";
+    }
+}
+
+/* note: 요청 로그에 붙일 계측 요약 (200일 때만 채움) */
+static int handle_users(Server *s, int fd, const HttpRequest *req, const char **logcode, char *note,
+                        size_t note_cap) {
+    char msg[200], hdr[256];
+    int64_t after, limit, engine_us = 0;
+    PageFilter filter;
     JsonBuf res;
     UsersCtx u;
     DbError err = {{0}, DBE_NONE};
-    int more = 0;
+    PageStats ps;
+    double t0;
+    int rc;
 
     /* 1) 입력 검증: 틀리면 엔진을 부르지 않는다 */
-    if (parse_users_query(s, req, &after, &limit, msg, sizeof msg) != 0) {
+    if (parse_users_query(s, req, &after, &limit, &filter, msg, sizeof msg) != 0) {
         *logcode = "INVALID_PARAM";
         send_simple_error(fd, 400, "INVALID_PARAM", msg, 0, NULL);
         return 400;
     }
-    /* 2) 페이지 읽기 (공유 잠금, 콜백은 메모리 버퍼에만 쓴다). 응답 상한은 page_max로 미리 보장했다(D08) */
+    /* 2) 페이지 읽기 (공유 잠금, 콜백은 메모리 버퍼에만 쓴다). 응답 상한은 page_max로 미리 보장했다(D08).
+       엔진 시간(DB-P6-D10) = db_page 호출 앞뒤: 잠금 대기 + 탐색 + 맞는 행의 JSON 추가 */
+    memset(&ps, 0, sizeof ps);
     jb_init(&res, s->max_response);
     u.res = &res;
     u.n = 0;
     u.last_id = 0;
-    if (jb_lit(&res, USERS_HEAD) != 0 || db_page(s->db, after, limit, users_on_row, &u, &more, &err) != 0 ||
-        jb_lit(&res, more ? "],\"has_more\":true,\"next_cursor\":" : "],\"has_more\":false,\"next_cursor\":") != 0 ||
+    rc = jb_lit(&res, USERS_HEAD);
+    if (rc == 0) {
+        t0 = now_ms();
+        rc = db_page(s->db, after, limit, filter.has_age ? &filter : NULL, users_on_row, &u, &ps, &err);
+        engine_us = (int64_t)((now_ms() - t0) * 1000.0);
+    }
+    if (rc != 0 ||
+        jb_lit(&res, ps.has_more ? "],\"has_more\":true,\"next_cursor\":" : "],\"has_more\":false,\"next_cursor\":") != 0 ||
         (u.n > 0 ? jb_i64(&res, u.last_id) : jb_lit(&res, "null")) != 0 || jb_lit(&res, "}") != 0) {
         jb_free(&res);
         if (err.kind == DBE_HALTED) {
@@ -688,7 +726,15 @@ static int handle_users(Server *s, int fd, const HttpRequest *req, const char **
         send_internal(fd);
         return 500;
     }
-    send_body(fd, 200, NULL, res.data, res.len, "", 0, "", 0);
+    /* 3) 계측 헤더 (DB-P6-D09·D16). 본문은 Phase 5와 같다 */
+    snprintf(hdr, sizeof hdr,
+             "X-Rows-Examined: %" PRId64 "\r\nX-Rows-Examined-After-Last: %" PRId64 "\r\nX-Age-Index-Keys: %" PRId64
+             "\r\nX-Access-Path: %s\r\nX-Engine-Us: %" PRId64 "\r\n",
+             ps.rows_examined, ps.examined_after_last, ps.index_keys, access_path_name(ps.used), engine_us);
+    snprintf(note, note_cap, ", %s R=%" PRId64 " E=%" PRId64 " T=%" PRId64 " K=%" PRId64 " 엔진 %" PRId64 " us",
+             access_path_name(ps.used), ps.rows_returned, ps.rows_examined, ps.examined_after_last, ps.index_keys,
+             engine_us);
+    send_body(fd, 200, hdr, res.data, res.len, "", 0, "", 0);
     jb_free(&res);
     return 200;
 }
@@ -713,6 +759,7 @@ static void handle_connection(Server *s, int fd) {
     int status;
     size_t nstmt = 0;
     const char *code = "";
+    char note[200] = "";
 
     if (r < 0) {
         fprintf(stderr, "[요청] (응답 없음: 연결이 닫히거나 읽기 실패)\n");
@@ -741,7 +788,7 @@ static void handle_connection(Server *s, int fd) {
         }
     } else if (strcmp(req.path, "/users") == 0) {
         if (strcmp(req.method, "GET") == 0) {
-            status = handle_users(s, fd, &req, &code);
+            status = handle_users(s, fd, &req, &code, note, sizeof note);
         } else {
             status = 405;
             code = "METHOD";
@@ -756,8 +803,8 @@ static void handle_connection(Server *s, int fd) {
         fprintf(stderr, "[요청] %s %s → %d%s%s, 문장 %zu개, %.2f ms\n", req.method, req.path, status,
                 code[0] ? " " : "", code, nstmt, now_ms() - t0);
     } else {
-        fprintf(stderr, "[요청] %s %s → %d%s%s, %.2f ms\n", req.method, req.path, status, code[0] ? " " : "",
-                code, now_ms() - t0);
+        fprintf(stderr, "[요청] %s %s → %d%s%s%s, %.2f ms\n", req.method, req.path, status, code[0] ? " " : "",
+                code, note, now_ms() - t0);
     }
     http_request_free(&req);
 }
@@ -826,7 +873,7 @@ static void print_usage(FILE *out) {
     fprintf(out,
             "사용법: minidb-server [--data-dir 디렉터리] [--host 주소] [--port 번호]\n"
             "                      [--threads 개수] [--queue 개수]\n"
-            "                      [--max-rows 행수] [--max-response 바이트]\n"
+            "                      [--max-rows 행수] [--max-response 바이트] [--age-path scan|index]\n"
             "  --data-dir      데이터 파일(users.tsv) 위치. 기본값: data\n"
             "  --host          받을 IPv4 주소. 기본값: 127.0.0.1 (이 컴퓨터에서만)\n"
             "  --port          포트. 기본값: 8080. 0이면 빈 포트를 골라 시작 줄에 알려 준다\n"
@@ -834,6 +881,8 @@ static void print_usage(FILE *out) {
             "  --queue         처리를 기다리는 연결 수 상한(1~%d). 넘치면 503 BUSY. 기본값: %d\n"
             "  --max-rows      요청 하나의 SELECT 결과 행 합계 상한. 기본값: %d\n"
             "  --max-response  요청 하나의 JSON 응답 본문 상한(바이트, %d 이상). 기본값: %d\n"
+            "  --age-path      GET /users?age=의 탐색 경로. index(기본): age 보조 인덱스, scan: 선형 탐색(비교용).\n"
+            "                  응답 본문은 같고 계측 헤더(X-Access-Path 등)만 다르다. age 인덱스는 어느 쪽이든 유지한다\n"
             "  GET /users의 limit 상한은 min(1000, --max-rows, --max-response에 최악의 행이 들어가는 수)이다\n",
             MAX_THREADS, DEFAULT_THREADS, MAX_QUEUE, DEFAULT_QUEUE, DEFAULT_MAX_ROWS, MIN_MAX_RESPONSE,
             DEFAULT_MAX_RESPONSE);
@@ -909,6 +958,7 @@ int main(int argc, char **argv) {
     s.threads = DEFAULT_THREADS;
     s.queue_cap = DEFAULT_QUEUE;
     s.grace_ms = SHUTDOWN_GRACE_MS;
+    s.age_path = PAGE_PATH_INDEX; /* DB-P6-D17 */
     for (i = 1; i < argc; i++) {
         const char *a = argv[i];
         const char *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -942,6 +992,14 @@ int main(int argc, char **argv) {
                 return usage_error("--max-response는 4096 ~ 1073741824 사이 정수여야 합니다: ", v);
             }
             s.max_response = (size_t)n;
+        } else if (strcmp(a, "--age-path") == 0) {
+            if (v != NULL && strcmp(v, "scan") == 0) {
+                s.age_path = PAGE_PATH_SCAN;
+            } else if (v != NULL && strcmp(v, "index") == 0) {
+                s.age_path = PAGE_PATH_INDEX;
+            } else {
+                return usage_error("--age-path는 scan 또는 index여야 합니다: ", v != NULL ? v : "(없음)");
+            }
         } else if (strcmp(a, "--threads") == 0) {
             long long n = parse_num(v, 1, MAX_THREADS);
             if (n < 0) {
@@ -1059,9 +1117,9 @@ int main(int argc, char **argv) {
     } else {
         fprintf(stderr,
                 "[서버] 시작: %.1f ms (%" PRId64 "행), %s:%d, 워커 %d개, 큐 %zu, 응답 상한 %zu바이트·%" PRId64
-                "행, 페이지 상한 %" PRId64 "행(기본 %" PRId64 ")\n",
+                "행, 페이지 상한 %" PRId64 "행(기본 %" PRId64 "), age 경로 %s\n",
                 now_ms() - t0, ix.keys, host, ntohs(addr.sin_port), s.threads, s.queue_cap, s.max_response,
-                s.max_rows, s.page_max, s.page_default);
+                s.max_rows, s.page_max, s.page_default, s.age_path == PAGE_PATH_SCAN ? "scan" : "index");
     }
 
     /* accept 스레드: 연결을 큐에 넣기만 한다. 큐에서 기다리거나 요청을 읽지 않는다. */

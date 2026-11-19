@@ -82,16 +82,54 @@ int table_find_by_id(Table *t, int64_t id, RowFn fn, void *ctx, DbError *err);
  * 읽은 줄의 id가 인덱스와 다르면 -1(인덱스 불일치). fn이 0이 아니면 멈추고 -1. */
 int table_find_id_range(Table *t, int64_t lo, int64_t hi, RowFn fn, void *ctx, DbError *err);
 
+/* ---------- 커서 페이지 조회 (Phase 5, Phase 6) ---------- */
+
+/* age 조건이 있을 때 쓸 탐색 경로 (DB-P6-D17) */
+typedef enum {
+    PAGE_PATH_AUTO = 0, /* age 인덱스(있으면). 서버 기본값 */
+    PAGE_PATH_SCAN,     /* 선형 탐색: 커서 뒤 줄을 차례로 읽어 age 비교 (기준 구현) */
+    PAGE_PATH_INDEX     /* age 보조 인덱스 */
+} PagePath;
+
+/* 실제로 실행된 경로 */
+typedef enum {
+    PAGE_USED_ID = 0,   /* 조건 없음: id 인덱스만 (Phase 5) */
+    PAGE_USED_SCAN,
+    PAGE_USED_AGE_INDEX
+} PageUsed;
+
+typedef struct {
+    int has_age; /* 0이면 조건 없음 */
+    int age;     /* AGE_MIN~AGE_MAX */
+    PagePath path;
+} PageFilter;
+
+/* 한 번의 페이지 조회 계측 (DB-P6-D08·D16). 같은 데이터·같은 요청이면 항상 같은 값이다 */
+typedef struct {
+    int has_more;
+    int64_t rows_returned;       /* R: fn에 넘긴 행 */
+    int64_t rows_examined;       /* E: 파일에서 읽어 확인한 줄 (N+1 확인용으로 읽은 줄 포함) */
+    int64_t examined_after_last; /* T: E 중 마지막 반환 행보다 뒤의 줄. R = 0이면 E */
+    int64_t index_keys;          /* K: age 인덱스에서 차례로 본 항목 (N+1 항목 포함). 시작 위치 이진 탐색은 세지 않음 */
+    PageUsed used;
+} PageStats;
+
 /*
- * 커서 페이지 조회 (Phase 5, DB-P5-D02·D07). id > after_id인 레코드를 id 오름차순으로 최대 limit개 찾아
- * 하나씩 fn을 호출한다. limit+1번째 키가 인덱스에 있으면 *has_more = 1, 없으면 0.
- * limit+1번째 키를 확인하면 그 줄은 읽지 않고 멈춘다. 이 멈춤은 오류가 아니다(정상 조기 종료).
- * 파일에서 읽는 줄은 min(limit, 남은 행)개다.
- * after_id가 INT64_MAX면 키를 보지 않고 행 없이 0(*has_more = 0).
- * 0 성공, -1 실패: limit < 1이거나 after_id < 0이면 DBE_SQL. 읽기 오류·인덱스 불일치는 DBE_STORAGE,
- * fn이 0이 아닌 값을 돌려주면 DBE_SINK(table_find_id_range와 같다).
+ * id > after_id이고 조건(filter)에 맞는 레코드를 id 오름차순으로 최대 limit개 찾아 하나씩 fn을 호출한다.
+ * 조건에 맞는 limit+1번째 레코드가 있으면 has_more = 1. 그 레코드는 fn에 넘기지 않는다. 이 멈춤은 오류가 아니다.
+ *   조건 없음(filter NULL 또는 has_age 0): Phase 5 그대로. limit+1번째는 id 인덱스 키로만 확인하고 줄은 읽지 않는다
+ *                                         (E = R, T = 0, K = 0)
+ *   선형 탐색: id 인덱스로 after_id+1을 찾고 그 뒤 줄을 차례로 읽어 age를 비교한다. limit+1번째로 맞는 줄을
+ *             찾거나 끝에 이를 때까지 읽는다
+ *   age 인덱스: age별 id 목록에서 after_id보다 큰 항목부터 최대 limit+1개를 본다(K). 앞의 limit개만 id 인덱스로
+ *             위치를 찾아 줄을 읽는다(E = R). 읽은 줄의 id·age가 다르면 DBE_STORAGE(인덱스 불일치)
+ * after_id가 INT64_MAX면 아무것도 보지 않고 행 없이 0.
+ * st는 NULL이어도 된다. 실패해도 st에는 거기까지의 값이 들어 있다.
+ * 0 성공, -1 실패: limit < 1, after_id < 0, age가 범위 밖이면 DBE_SQL. 읽기 오류·인덱스 불일치는 DBE_STORAGE,
+ * fn이 0이 아닌 값을 돌려주면 DBE_SINK.
  */
-int table_page(Table *t, int64_t after_id, int64_t limit, RowFn fn, void *ctx, int *has_more, DbError *err);
+int table_page(Table *t, int64_t after_id, int64_t limit, const PageFilter *filter, RowFn fn, void *ctx,
+               PageStats *st, DbError *err);
 
 /*
  * 인덱스 통계 (실행 계획용). 메모리의 B+ 트리에서 바로 읽는다.
@@ -128,6 +166,12 @@ void table_test_fail_rewrite(int stage);
 int64_t table_test_page_lines_read(void);
 /* 같은 호출에서 인덱스 리프에서 받은 키 수 = min(limit + 1, 남은 행). 키를 끝까지 훑지 않는지 확인용 */
 int64_t table_test_page_keys_seen(void);
+/* 테스트 전용: age 보조 인덱스가 파일 전체를 읽어 만든 "age별 id 목록(오름차순)"과 같은지. 0이면 같음 */
+int table_test_validate_age_index(Table *t, char *why, size_t cap);
+/* 테스트 전용: 1이면 다음 age 인덱스 추가(INSERT·다시 쓰기·열기)가 메모리 부족처럼 실패한다(한 번) */
+void table_test_fail_age_push(int on);
+/* 테스트 전용: age 인덱스의 age 목록 끝에 id를 그대로 붙인다(불일치 감지 확인용) */
+int table_test_age_index_inject(Table *t, int age, int64_t id);
 /* 테스트 전용: 메모리 인덱스의 불변식 검사(bpt_validate). 0이면 정상 */
 int table_test_validate_index(const Table *t, char *why, size_t cap);
 #endif
