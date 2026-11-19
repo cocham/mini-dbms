@@ -1,10 +1,28 @@
 # 미니 DBMS
 
-C로 SQL 파일을 실행하고 데이터를 파일에 저장하는 CLI(Phase 1)에, id B+ 트리 인덱스(Phase 2), API 서버(Phase 3), UPDATE·DELETE(Phase 4)를 붙였다.
+C로 SQL 파일을 실행하고 데이터를 파일에 저장하는 CLI(Phase 1)에, id B+ 트리 인덱스(Phase 2), API 서버(Phase 3), UPDATE·DELETE(Phase 4), 커서 페이지 조회(Phase 5)를 붙였다.
 
-## Phase 4 — UPDATE·DELETE (구현 완료, 검증 대기)
+## Phase 5 — 커서 페이지 조회 `GET /users` (구현 완료, 검증 대기)
 
-현재 상태: **P4-01~P4-04 구현.** CLI와 서버 모두에서 `UPDATE users SET name/age = .. WHERE ..;`, `DELETE FROM users WHERE ..;`를 쓸 수 있다. 결과는 조건에 맞은 행 수(`UPDATE 2`, `{"type":"update","count":2}`)다. 바뀐 내용 전체를 임시 파일에 쓰고 바꿔치기(rename)하므로 문장 하나는 전부 반영되거나 하나도 반영되지 않는다. 가장 큰 id를 지워도 그 id는 다시 쓰지 않는다(`users.next`). WHERE 없는 UPDATE·DELETE는 거부한다. 100만 행 측정은 하지 않았다(사용자 결정).
+현재 상태: **P5-01~P5-03 구현.** 서버의 SELECT 결과가 상한(기본 100,000행·8 MiB)을 넘으면 클라이언트는 목록을 한 행도 받지 못했다. 이제 `GET /users?after_id=<커서>&limit=<행 수>`로 나눠서 끝까지 받는다. 응답은 `{"ok":true,"columns":[..],"rows":[..],"has_more":true,"next_cursor":205}`이고, `next_cursor`를 다음 요청의 `after_id`로 넘긴다. 엔진은 B+ 트리로 시작 위치를 찾고 `limit`줄만 읽는다. `has_more`는 `limit+1`번째 키가 있는지로 정한다. `limit` 최대값(기본 1000)은 최악의 JSON 크기로 계산해서, 페이지 조회는 결과 크기 상한에 걸려 실패하지 않는다.
+
+확인([benchmark.md](docs/phase5/benchmark.md), 변경 없는 100만 행, Docker): `SELECT *`는 400 `RESULT_TOO_LARGE`(146바이트). 1000행씩 순회하면 1000페이지에 100만 행을 받고, 파일과 다른 행은 0이다. 페이지 하나는 0.3~0.6 ms이고, 첫 페이지와 마지막 페이지가 같은 수준이다.
+
+1. [실습](docs/phase5/walkthrough.md): 전체 조회 실패 → 페이지로 끝까지 → id 공백 → 마지막 페이지(N+1) → 입력 검증 → 순회 중 변경. **여기서 시작**
+2. [개발 명세](docs/phase5/spec.md): API 계약, 입력 검증, 경우별 동작, 응답 상한과의 관계, 동시 변경과 보장
+3. [설계와 결정](docs/phase5/design.md): D01~D11, 엔진 인터페이스(`table_page`·`db_page`)
+4. [작업 순서](docs/phase5/tasks.md): P5-01~P5-03, 검증 기록
+
+```bash
+docker run --rm -it -p 127.0.0.1:8080:8080 -v "$PWD:/src" -w /src gcc:13 bash -c "make build/minidb-server && mkdir -p data/p5 && build/minidb-server --host 0.0.0.0 --port 8080 --data-dir data/p5"
+curl.exe -s "http://localhost:8080/users?limit=3"
+curl.exe -s "http://localhost:8080/users?after_id=3&limit=3"
+docker run --rm -v "$PWD:/src:ro" gcc:13 bash -c "cp -r /src /w && cd /w && make page-bench"   # 100만 행 확인 (약 1분)
+```
+
+## Phase 4 — UPDATE·DELETE (완료)
+
+현재 상태: **P4-01~P4-04 구현 완료.** CLI와 서버 모두에서 `UPDATE users SET name/age = .. WHERE ..;`, `DELETE FROM users WHERE ..;`를 쓸 수 있다. 결과는 조건에 맞은 행 수(`UPDATE 2`, `{"type":"update","count":2}`)다. 바뀐 내용 전체를 임시 파일에 쓰고 바꿔치기(rename)하므로 문장 하나는 전부 반영되거나 하나도 반영되지 않는다. 가장 큰 id를 지워도 그 id는 다시 쓰지 않는다(`users.next`). WHERE 없는 UPDATE·DELETE는 거부한다. 100만 행 측정은 하지 않았다(사용자 결정).
 
 1. [실습](docs/phase4/walkthrough.md): CLI로 고치고 지우기 → 파일이 어떻게 바뀌나 → 다음 id → 실패 시 무변경 → 서버 JSON. **여기서 시작**
 2. [개발 명세](docs/phase4/spec.md): 문법, 결과, 다음 id, 실패와 재시도
@@ -108,7 +126,7 @@ docker run --rm -v "%cd%:/src" -w /src gcc:13 make sanitize
 | src/main.c | CLI: 인자·SQL 파일 읽기, 문장 순차 실행, 결과·오류 출력, 종료 코드 |
 | src/parser.c | Lexer + 재귀 하강 파서: SQL 텍스트 → Statement |
 | src/executor.c | 값 검증 후 Storage에 저장·조회 요청. WHERE는 조회 콜백 앞의 필터로 검사, 결과는 콜백으로 전달 |
-| src/storage.c | users.tsv 열기·검증·순차 읽기·추가, 다음 ID 복원. Phase 2: id 인덱스 구축·등록·`table_find_by_id`. Phase 4: `table_rewrite`(임시 파일 + 바꿔치기), `users.next` |
+| src/storage.c | users.tsv 열기·검증·순차 읽기·추가, 다음 ID 복원. Phase 2: id 인덱스 구축·등록·`table_find_by_id`. Phase 4: `table_rewrite`(임시 파일 + 바꿔치기), `users.next`. Phase 5: `table_page`(커서 뒤 limit줄만 읽기) |
 | src/bptree.c | (Phase 2) 메모리 B+ 트리: id → 레코드 바이트 위치 |
 | tools/bpt_demo.c | (Phase 2) 트리 모양·탐색 경로를 보는 학습 도구 |
 | tests/test_unit.c | Parser·Storage·Executor 단위 테스트 |

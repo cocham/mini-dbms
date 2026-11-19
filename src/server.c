@@ -58,6 +58,17 @@
 #define INSERT_RESULT_MAX 48 /* {"type":"insert","id":-9223372036854775808} + 쉼표 */
 #define CHANGE_RESULT_MAX 48 /* {"type":"update","count":-9223372036854775808} + 쉼표 = 47 */
 
+/* GET /users 커서 페이지 조회 (Phase 5, DB-P5-D05·D08) */
+#define USERS_LIMIT_MAX 1000
+#define USERS_LIMIT_DEFAULT 100
+/* 한 행의 최대 JSON: "[" + id 19자리 + "," + 이름(따옴표 2 + 255바이트 × \u00XX 6바이트 = 1532)
+   + "," + age 3자리 + "]" = 1558, 행 사이 쉼표 1을 모든 행에 붙여 셈 */
+#define USERS_ROW_JSON_MAX 1559
+/* 고정 부분 최대: {"ok":true,"columns":["id","name","age"],"rows":[ (49)
+   + ],"has_more":false,"next_cursor":9223372036854775807} (53) */
+#define USERS_HEAD "{\"ok\":true,\"columns\":[\"id\",\"name\",\"age\"],\"rows\":["
+#define USERS_FIXED_JSON_MAX 102
+
 /* 스레드 풀 (P3-03, DB-P3-D06) */
 #define DEFAULT_THREADS 4
 #define MAX_THREADS 256
@@ -69,6 +80,8 @@ typedef struct {
     Db *db;
     int64_t max_rows;
     size_t max_response;
+    int64_t page_max;     /* GET /users의 limit 상한 (시작 때 계산, DB-P5-D08) */
+    int64_t page_default; /* limit을 생략했을 때 = min(100, page_max) */
     int threads;
     size_t queue_cap;
     long grace_ms;
@@ -203,6 +216,15 @@ static int json_on_change(StmtKind kind, int64_t count, void *vctx) {
     return (jb_lit(q->res, head) != 0 || jb_i64(q->res, count) != 0 || jb_lit(q->res, "}") != 0) ? 1 : 0;
 }
 
+/* 행 하나 [id,"name",age] (첫 행이 아니면 앞에 쉼표). /query의 select와 /users가 같이 쓴다. 0 성공 */
+static int json_row(JsonBuf *b, const Row *row, int first) {
+    return ((!first && jb_lit(b, ",") != 0) || jb_lit(b, "[") != 0 || jb_i64(b, row->id) != 0 ||
+            jb_lit(b, ",") != 0 || jb_str(b, row->name) != 0 || jb_lit(b, ",") != 0 ||
+            jb_i64(b, row->age) != 0 || jb_lit(b, "]") != 0)
+               ? -1
+               : 0;
+}
+
 static int json_on_row(const Row *row, void *vctx) {
     QueryCtx *q = vctx;
 
@@ -210,9 +232,7 @@ static int json_on_row(const Row *row, void *vctx) {
         q->over_rows = 1;
         return 1;
     }
-    if ((!q->first_row && jb_lit(q->res, ",") != 0) || jb_lit(q->res, "[") != 0 ||
-        jb_i64(q->res, row->id) != 0 || jb_lit(q->res, ",") != 0 || jb_str(q->res, row->name) != 0 ||
-        jb_lit(q->res, ",") != 0 || jb_i64(q->res, row->age) != 0 || jb_lit(q->res, "]") != 0) {
+    if (json_row(q->res, row, q->first_row) != 0) {
         return 1;
     }
     q->first_row = 0;
@@ -514,6 +534,165 @@ static int handle_health(Server *s, int fd) {
     }
 }
 
+/* ---------- GET /users (Phase 5) ---------- */
+
+/* 정규형 10진수(앞자리 0 없음, "0"은 허용, 최대 19자리, INT64_MAX 이하)면 0 */
+static int parse_param_num(const char *s, size_t n, int64_t *out) {
+    int64_t v = 0;
+    size_t i;
+
+    if (n == 0 || n > 19 || (s[0] == '0' && n > 1)) {
+        return -1;
+    }
+    for (i = 0; i < n; i++) {
+        int d;
+        if (s[i] < '0' || s[i] > '9') {
+            return -1;
+        }
+        d = s[i] - '0';
+        if (v > (INT64_MAX - d) / 10) {
+            return -1;
+        }
+        v = v * 10 + d;
+    }
+    *out = v;
+    return 0;
+}
+
+/*
+ * 쿼리 문자열 → after_id, limit (spec "입력 검증", DB-P5-D06). 0 성공, -1이면 msg에 이유.
+ * 항목은 '&'로 나눈다. 이름은 after_id·limit만, 같은 이름 두 번·'=' 없음·빈 항목·%XX(숫자가 아님)는 거부.
+ */
+static int parse_users_query(const Server *s, const HttpRequest *req, int64_t *after, int64_t *limit, char *msg,
+                             size_t cap) {
+    const char *p = req->query;
+    int seen_after = 0, seen_limit = 0;
+
+    *after = 0;
+    *limit = s->page_default;
+    if (req->query_over) {
+        snprintf(msg, cap, "쿼리 문자열이 너무 깁니다 (최대 %d바이트)", HTTP_MAX_QUERY);
+        return -1;
+    }
+    while (*p != '\0') {
+        const char *amp = strchr(p, '&');
+        size_t ilen = amp != NULL ? (size_t)(amp - p) : strlen(p);
+        const char *eq = memchr(p, '=', ilen);
+        size_t klen, vlen;
+        const char *v;
+        int64_t num;
+
+        if (ilen == 0) {
+            snprintf(msg, cap, "쿼리 문자열에 빈 항목이 있습니다 ('&'가 연속되거나 끝에 있음)");
+            return -1;
+        }
+        if (eq == NULL) {
+            snprintf(msg, cap, "파라미터 '%.*s'에 값이 없습니다 (이름=값)", (int)(ilen > 40 ? 40 : ilen), p);
+            return -1;
+        }
+        klen = (size_t)(eq - p);
+        v = eq + 1;
+        vlen = ilen - klen - 1;
+        if (klen == 8 && memcmp(p, "after_id", 8) == 0) {
+            if (seen_after++) {
+                snprintf(msg, cap, "after_id가 두 번 있습니다");
+                return -1;
+            }
+            if (parse_param_num(v, vlen, &num) != 0) {
+                snprintf(msg, cap, "after_id는 0 이상 %" PRId64 " 이하의 10진 정수여야 합니다 (앞자리 0·부호 불가, 현재: '%.*s')",
+                         (int64_t)INT64_MAX, (int)(vlen > 40 ? 40 : vlen), v);
+                return -1;
+            }
+            *after = num;
+        } else if (klen == 5 && memcmp(p, "limit", 5) == 0) {
+            if (seen_limit++) {
+                snprintf(msg, cap, "limit이 두 번 있습니다");
+                return -1;
+            }
+            if (parse_param_num(v, vlen, &num) != 0 || num < 1 || num > s->page_max) {
+                snprintf(msg, cap, "limit은 1 이상 %" PRId64 " 이하의 10진 정수여야 합니다 (앞자리 0·부호 불가, 현재: '%.*s')",
+                         s->page_max, (int)(vlen > 40 ? 40 : vlen), v);
+                return -1;
+            }
+            *limit = num;
+        } else {
+            snprintf(msg, cap, "모르는 파라미터입니다: '%.*s' (after_id, limit만 받습니다)", (int)(klen > 40 ? 40 : klen),
+                     p);
+            return -1;
+        }
+        p += ilen;
+        if (*p == '&') {
+            p++;
+            if (*p == '\0') {
+                snprintf(msg, cap, "쿼리 문자열에 빈 항목이 있습니다 ('&'가 연속되거나 끝에 있음)");
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+typedef struct {
+    JsonBuf *res;
+    int64_t n;
+    int64_t last_id;
+} UsersCtx;
+
+static int users_on_row(const Row *row, void *vctx) {
+    UsersCtx *u = vctx;
+
+    if (json_row(u->res, row, u->n == 0) != 0) {
+        return 1;
+    }
+    u->n++;
+    u->last_id = row->id;
+    return 0;
+}
+
+static int handle_users(Server *s, int fd, const HttpRequest *req, const char **logcode) {
+    char msg[200];
+    int64_t after, limit;
+    JsonBuf res;
+    UsersCtx u;
+    DbError err = {{0}, DBE_NONE};
+    int more = 0;
+
+    /* 1) 입력 검증: 틀리면 엔진을 부르지 않는다 */
+    if (parse_users_query(s, req, &after, &limit, msg, sizeof msg) != 0) {
+        *logcode = "INVALID_PARAM";
+        send_simple_error(fd, 400, "INVALID_PARAM", msg, 0, NULL);
+        return 400;
+    }
+    /* 2) 페이지 읽기 (공유 잠금, 콜백은 메모리 버퍼에만 쓴다). 응답 상한은 page_max로 미리 보장했다(D08) */
+    jb_init(&res, s->max_response);
+    u.res = &res;
+    u.n = 0;
+    u.last_id = 0;
+    if (jb_lit(&res, USERS_HEAD) != 0 || db_page(s->db, after, limit, users_on_row, &u, &more, &err) != 0 ||
+        jb_lit(&res, more ? "],\"has_more\":true,\"next_cursor\":" : "],\"has_more\":false,\"next_cursor\":") != 0 ||
+        (u.n > 0 ? jb_i64(&res, u.last_id) : jb_lit(&res, "null")) != 0 || jb_lit(&res, "}") != 0) {
+        jb_free(&res);
+        if (err.kind == DBE_HALTED) {
+            snprintf(msg, sizeof msg, "엔진이 중단 상태입니다 (%s). 서버를 재시작해야 합니다",
+                     halt_reason_code(db_state(s->db)));
+            *logcode = "HALTED";
+            send_simple_error(fd, 503, "HALTED", msg, 0, NULL);
+            return 503;
+        }
+        if (err.kind == DBE_STORAGE) {
+            *logcode = "STORAGE";
+            send_simple_error(fd, 500, "STORAGE", err.msg, 0, NULL);
+            return 500;
+        }
+        *logcode = "INTERNAL"; /* 버퍼 메모리 부족 (상한 초과는 page_max 계산으로 생기지 않는다) */
+        send_internal(fd);
+        return 500;
+    }
+    send_body(fd, 200, NULL, res.data, res.len, "", 0, "", 0);
+    jb_free(&res);
+    return 200;
+}
+
 /* ---------- 연결 하나 ---------- */
 
 static const char *code_for_status(int status) {
@@ -560,10 +739,18 @@ static void handle_connection(Server *s, int fd) {
             code = "METHOD";
             send_simple_error(fd, 405, "METHOD", "/health는 GET만 받습니다", 0, "Allow: GET\r\n");
         }
+    } else if (strcmp(req.path, "/users") == 0) {
+        if (strcmp(req.method, "GET") == 0) {
+            status = handle_users(s, fd, &req, &code);
+        } else {
+            status = 405;
+            code = "METHOD";
+            send_simple_error(fd, 405, "METHOD", "/users는 GET만 받습니다", 0, "Allow: GET\r\n");
+        }
     } else {
         status = 404;
         code = "NOT_FOUND";
-        send_simple_error(fd, 404, "NOT_FOUND", "없는 경로입니다 (POST /query, GET /health)", 0, NULL);
+        send_simple_error(fd, 404, "NOT_FOUND", "없는 경로입니다 (POST /query, GET /health, GET /users)", 0, NULL);
     }
     if (strcmp(req.path, "/query") == 0 && strcmp(req.method, "POST") == 0) {
         fprintf(stderr, "[요청] %s %s → %d%s%s, 문장 %zu개, %.2f ms\n", req.method, req.path, status,
@@ -646,7 +833,8 @@ static void print_usage(FILE *out) {
             "  --threads       워커 스레드 수(1~%d). 기본값: %d\n"
             "  --queue         처리를 기다리는 연결 수 상한(1~%d). 넘치면 503 BUSY. 기본값: %d\n"
             "  --max-rows      요청 하나의 SELECT 결과 행 합계 상한. 기본값: %d\n"
-            "  --max-response  요청 하나의 JSON 응답 본문 상한(바이트, %d 이상). 기본값: %d\n",
+            "  --max-response  요청 하나의 JSON 응답 본문 상한(바이트, %d 이상). 기본값: %d\n"
+            "  GET /users의 limit 상한은 min(1000, --max-rows, --max-response에 최악의 행이 들어가는 수)이다\n",
             MAX_THREADS, DEFAULT_THREADS, MAX_QUEUE, DEFAULT_QUEUE, DEFAULT_MAX_ROWS, MIN_MAX_RESPONSE,
             DEFAULT_MAX_RESPONSE);
 }
@@ -771,6 +959,19 @@ int main(int argc, char **argv) {
         }
         i++;
     }
+    /* GET /users의 페이지 상한 (DB-P5-D08): 최악의 행으로 채워도 --max-response·--max-rows 안에 든다.
+       --max-response ≥ 4096이므로 바이트로 들어가는 행은 2 이상이다 */
+    {
+        int64_t by_bytes = (int64_t)((s.max_response - USERS_FIXED_JSON_MAX) / USERS_ROW_JSON_MAX);
+        s.page_max = USERS_LIMIT_MAX;
+        if (s.max_rows < s.page_max) {
+            s.page_max = s.max_rows;
+        }
+        if (by_bytes < s.page_max) {
+            s.page_max = by_bytes;
+        }
+        s.page_default = s.page_max < USERS_LIMIT_DEFAULT ? s.page_max : USERS_LIMIT_DEFAULT;
+    }
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
     addr.sin_port = htons((unsigned short)port);
@@ -857,9 +1058,10 @@ int main(int argc, char **argv) {
         rc = EXIT_FAIL;
     } else {
         fprintf(stderr,
-                "[서버] 시작: %.1f ms (%" PRId64 "행), %s:%d, 워커 %d개, 큐 %zu, 응답 상한 %zu바이트·%" PRId64 "행\n",
+                "[서버] 시작: %.1f ms (%" PRId64 "행), %s:%d, 워커 %d개, 큐 %zu, 응답 상한 %zu바이트·%" PRId64
+                "행, 페이지 상한 %" PRId64 "행(기본 %" PRId64 ")\n",
                 now_ms() - t0, ix.keys, host, ntohs(addr.sin_port), s.threads, s.queue_cap, s.max_response,
-                s.max_rows);
+                s.max_rows, s.page_max, s.page_default);
     }
 
     /* accept 스레드: 연결을 큐에 넣기만 한다. 큐에서 기다리거나 요청을 읽지 않는다. */

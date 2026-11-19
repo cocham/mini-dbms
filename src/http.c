@@ -227,6 +227,14 @@ int http_read_request(int fd, HttpRequest *req, char *why, size_t why_cap) {
             return 400;
         }
         memcpy(req->path, line + sp1 + 1, tlen);
+        if (q != NULL) {
+            size_t qlen = (size_t)((line + sp2) - (q + 1));
+            if (qlen > HTTP_MAX_QUERY) {
+                req->query_over = 1; /* 거절할지는 쓰는 쪽이 정한다(/users는 400, 다른 경로는 쿼리를 쓰지 않음) */
+            } else {
+                memcpy(req->query, q + 1, qlen);
+            }
+        }
     }
 
     /* 3) 헤더 */

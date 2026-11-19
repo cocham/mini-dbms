@@ -17,9 +17,15 @@
 #define HTTP_RECV_DEADLINE_MS 10000
 #define HTTP_SEND_DEADLINE_MS 10000
 
+#define HTTP_MAX_QUERY 256 /* 보관하는 쿼리 문자열의 최대 바이트 (P5-02, GET /users) */
+
 typedef struct {
     char method[16];
     char path[256]; /* 쿼리 문자열(?...) 제외 */
+    /* '?' 뒤의 쿼리 문자열. '?'가 없거나 비었으면 "". HTTP_MAX_QUERY를 넘으면 ""로 두고 query_over = 1.
+       보이는 ASCII만 들어 있다(요청 대상 검사). 디코딩(%XX)은 하지 않는다. 쓰는 쪽(/users)이 해석한다 */
+    char query[HTTP_MAX_QUERY + 1];
+    int query_over;
     char *body;     /* malloc, 끝에 NUL을 붙여 둔다. 본문 안의 NUL은 그대로 남는다 */
     size_t body_len;
 } HttpRequest;

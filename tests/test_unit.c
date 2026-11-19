@@ -3478,6 +3478,401 @@ static void test_p4_concurrent_mixed(void) {
     CHECK(db_close(db, &err) == 0);
 }
 
+/* ---------- Phase 5: 커서 페이지 조회 ---------- */
+
+#define PG_CAP 1100
+
+typedef struct {
+    int64_t ids[PG_CAP];
+    char names[PG_CAP][16];
+    int n;
+    int fail_at; /* 0보다 크면 그 번째 행에서 콜백이 실패를 돌려준다 */
+} PageGot;
+
+static int page_row(const Row *row, void *ctx) {
+    PageGot *g = ctx;
+
+    if (g->fail_at > 0 && g->n + 1 == g->fail_at) {
+        return 1;
+    }
+    if (g->n < PG_CAP) {
+        g->ids[g->n] = row->id;
+        snprintf(g->names[g->n], sizeof g->names[0], "%s", row->name);
+    }
+    g->n++;
+    return 0;
+}
+
+/* table_page(t) 또는 db_page(db)를 부르고 결과를 g에. 반환값은 그 함수의 반환값 */
+static int run_page(Table *t, Db *db, int64_t after, int64_t limit, PageGot *g, int *more, DbError *err) {
+    g->n = 0;
+    *more = -1;
+    return t != NULL ? table_page(t, after, limit, page_row, g, more, err)
+                     : db_page(db, after, limit, page_row, g, more, err);
+}
+
+/* 결과가 ids[0..n)과 같고 has_more가 more인지 */
+static int page_is(const PageGot *g, int got_more, const int64_t *ids, int n, int more) {
+    int i;
+
+    if (g->n != n || got_more != more) {
+        return 0;
+    }
+    for (i = 0; i < n; i++) {
+        if (g->ids[i] != ids[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void append_rows(Table *t, int n) {
+    DbError err = {{0}, DBE_NONE};
+    char name[16];
+    int64_t id;
+    int i;
+
+    for (i = 1; i <= n; i++) {
+        snprintf(name, sizeof name, "u%d", i);
+        CHECK(table_append(t, name, i % 151, &id, &err) == 0);
+    }
+}
+
+/* E1: 첫·중간·마지막 페이지, 정확히 limit행 남음, 빈 페이지, INT64_MAX, 잘못된 값, 콜백 실패 */
+static void test_p5_page_basic(void) {
+    const char *dir = fresh_dir("p5_basic");
+    static PageGot g;
+    Table *t = NULL;
+    DbError err = {{0}, DBE_NONE};
+    int more;
+
+    CHECK(table_open(dir, &t, &err) == 0);
+    if (t == NULL) {
+        return;
+    }
+    /* 빈 테이블 */
+    CHECK(run_page(t, NULL, 0, 3, &g, &more, &err) == 0 && page_is(&g, more, NULL, 0, 0));
+    CHECK(table_test_page_lines_read() == 0 && table_test_page_keys_seen() == 0);
+
+    append_rows(t, 10);
+    {
+        static const int64_t first[] = {1, 2, 3}, mid[] = {4, 5, 6}, exact[] = {8, 9, 10}, last[] = {10};
+        static const int64_t all[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+
+        CHECK(run_page(t, NULL, 0, 3, &g, &more, &err) == 0 && page_is(&g, more, first, 3, 1));
+        CHECK(table_test_page_lines_read() == 3); /* 4번째 키는 확인만 하고 읽지 않는다 */
+        CHECK(table_test_page_keys_seen() == 4);
+        CHECK(strcmp(g.names[0], "u1") == 0 && strcmp(g.names[2], "u3") == 0);
+        CHECK(run_page(t, NULL, 3, 3, &g, &more, &err) == 0 && page_is(&g, more, mid, 3, 1));
+        /* 정확히 limit행이 남으면 N+1번째가 없으므로 has_more 0: 빈 페이지를 한 번 더 받을 필요가 없다 */
+        CHECK(run_page(t, NULL, 7, 3, &g, &more, &err) == 0 && page_is(&g, more, exact, 3, 0));
+        CHECK(table_test_page_lines_read() == 3 && table_test_page_keys_seen() == 3);
+        CHECK(run_page(t, NULL, 9, 3, &g, &more, &err) == 0 && page_is(&g, more, last, 1, 0));
+        CHECK(table_test_page_lines_read() == 1);
+        CHECK(run_page(t, NULL, 0, 1000, &g, &more, &err) == 0 && page_is(&g, more, all, 10, 0));
+        CHECK(run_page(t, NULL, 0, 10, &g, &more, &err) == 0 && page_is(&g, more, all, 10, 0));
+        CHECK(run_page(t, NULL, 0, 9, &g, &more, &err) == 0 && page_is(&g, more, all, 9, 1));
+        CHECK(run_page(t, NULL, 0, 1, &g, &more, &err) == 0 && page_is(&g, more, first, 1, 1));
+    }
+    /* after_id ≥ 최대 id, INT64_MAX: 빈 페이지, 오류 없음 */
+    CHECK(run_page(t, NULL, 10, 3, &g, &more, &err) == 0 && page_is(&g, more, NULL, 0, 0));
+    CHECK(run_page(t, NULL, 1000, 3, &g, &more, &err) == 0 && page_is(&g, more, NULL, 0, 0));
+    CHECK(run_page(t, NULL, INT64_MAX, 3, &g, &more, &err) == 0 && page_is(&g, more, NULL, 0, 0));
+    CHECK(run_page(t, NULL, INT64_MAX - 1, 3, &g, &more, &err) == 0 && page_is(&g, more, NULL, 0, 0));
+    CHECK(table_test_page_lines_read() == 0);
+
+    /* 잘못된 값: DBE_SQL, 콜백 없음 */
+    CHECK(run_page(t, NULL, 0, 0, &g, &more, &err) == -1 && err.kind == DBE_SQL && g.n == 0 && more == 0);
+    CHECK(run_page(t, NULL, -1, 3, &g, &more, &err) == -1 && err.kind == DBE_SQL && g.n == 0);
+    CHECK(run_page(t, NULL, 0, -5, &g, &more, &err) == -1 && err.kind == DBE_SQL);
+
+    /* 콜백 실패는 정상 멈춤이 아니라 DBE_SINK (기존 범위 조회와 같음) */
+    g.fail_at = 2;
+    err.kind = DBE_NONE;
+    CHECK(run_page(t, NULL, 0, 5, &g, &more, &err) == -1 && err.kind == DBE_SINK && more == 0);
+    g.fail_at = 0;
+    CHECK(table_close(t, &err) == 0);
+}
+
+/* E1: 삭제로 생긴 id 공백, 지워진 after_id, 다시 쓰기 뒤와 재시작 뒤에도 같은 결과 */
+static void test_p5_page_gaps_and_rewrite(void) {
+    const char *dir = fresh_dir("p5_gaps");
+    static PageGot g;
+    static const int64_t p1[] = {1, 2, 6}, p2[] = {7, 8, 9}, p3[] = {10}, from4[] = {6, 7, 8};
+    Table *t = NULL;
+    DbError err = {{0}, DBE_NONE};
+    int more, pass;
+
+    CHECK(table_open(dir, &t, &err) == 0);
+    if (t == NULL) {
+        return;
+    }
+    append_rows(t, 10);
+    CHECK(t_change(t, "DELETE FROM users WHERE id BETWEEN 3 AND 5;", &err) == 3);
+    for (pass = 0; pass < 3; pass++) {
+        /* limit은 행 수: 공백 때문에 페이지가 덜 차지 않는다 */
+        CHECK(run_page(t, NULL, 0, 3, &g, &more, &err) == 0 && page_is(&g, more, p1, 3, 1));
+        CHECK(run_page(t, NULL, 6, 3, &g, &more, &err) == 0 && page_is(&g, more, p2, 3, 1));
+        CHECK(run_page(t, NULL, 9, 3, &g, &more, &err) == 0 && page_is(&g, more, p3, 1, 0));
+        /* 지워진 id를 커서로 줘도 실패하지 않고 그보다 큰 첫 행부터 */
+        CHECK(run_page(t, NULL, 4, 3, &g, &more, &err) == 0 && page_is(&g, more, from4, 3, 1));
+        CHECK(run_page(t, NULL, 2, 3, &g, &more, &err) == 0 && page_is(&g, more, from4, 3, 1));
+        if (pass == 0) {
+            /* 다시 쓰기로 파일 위치가 모두 바뀌어도 id 커서는 그대로 */
+            CHECK(t_change(t, "UPDATE users SET name = 'renamed' WHERE id = 7;", &err) == 1);
+        } else if (pass == 1) {
+            CHECK(table_close(t, &err) == 0);
+            t = NULL;
+            CHECK(table_open(dir, &t, &err) == 0);
+            if (t == NULL) {
+                return;
+            }
+        }
+    }
+    CHECK(run_page(t, NULL, 6, 1, &g, &more, &err) == 0 && g.n == 1 && strcmp(g.names[0], "renamed") == 0);
+    /* 마지막 행을 지운 뒤: after_id가 남은 최대 id면 빈 페이지 */
+    CHECK(t_change(t, "DELETE FROM users WHERE id = 10;", &err) == 1);
+    CHECK(run_page(t, NULL, 9, 3, &g, &more, &err) == 0 && page_is(&g, more, NULL, 0, 0));
+    CHECK(run_page(t, NULL, 8, 3, &g, &more, &err) == 0 && g.n == 1 && g.ids[0] == 9 && more == 0);
+    CHECK(table_close(t, &err) == 0);
+}
+
+/* E1: 조기 종료. 큰 테이블에서 페이지 하나는 limit줄만 읽는다. 전체 순회는 모든 행을 한 번씩 */
+static void test_p5_page_early_stop_and_full_walk(void) {
+    const char *dir = fresh_dir("p5_walk");
+    static PageGot g;
+    Table *t = NULL;
+    DbError err = {{0}, DBE_NONE};
+    int64_t after = 0, expect = 1;
+    int more = 1, pages = 0, bad = 0, i;
+
+    CHECK(table_open(dir, &t, &err) == 0);
+    if (t == NULL) {
+        return;
+    }
+    append_rows(t, 10000);
+    CHECK(run_page(t, NULL, 0, 3, &g, &more, &err) == 0 && g.n == 3 && more == 1);
+    CHECK(table_test_page_lines_read() == 3 && table_test_page_keys_seen() == 4);
+    CHECK(run_page(t, NULL, 5000, 100, &g, &more, &err) == 0 && g.n == 100 && g.ids[0] == 5001 && more == 1);
+    CHECK(table_test_page_lines_read() == 100 && table_test_page_keys_seen() == 101);
+    CHECK(run_page(t, NULL, 9990, 100, &g, &more, &err) == 0 && g.n == 10 && more == 0);
+    CHECK(table_test_page_lines_read() == 10 && table_test_page_keys_seen() == 10);
+
+    /* 커서 0부터 next_cursor(마지막 id)를 따라가면 1..10000이 순서대로 한 번씩, 정확히 10페이지 */
+    more = 1;
+    while (more && pages < 100) {
+        CHECK(run_page(t, NULL, after, 1000, &g, &more, &err) == 0);
+        for (i = 0; i < g.n; i++) {
+            if (g.ids[i] != expect++) {
+                bad++;
+            }
+        }
+        if (g.n > 0) {
+            after = g.ids[g.n - 1];
+        }
+        pages++;
+    }
+    CHECK(bad == 0 && expect == 10001 && pages == 10 && more == 0);
+    CHECK(table_close(t, &err) == 0);
+}
+
+/* db_page: 공유 잠금 경로, 중단 상태면 DBE_HALTED */
+static void test_p5_db_page_halted(void) {
+    const char *dir = fresh_dir("p5_halt");
+    static PageGot g;
+    DbError err = {{0}, DBE_NONE};
+    Db *db = NULL;
+    int64_t id = 0, stored = 0;
+    char name[16];
+    int i, more;
+
+    CHECK(db_open(dir, &db, &err) == 0);
+    if (db == NULL) {
+        return;
+    }
+    for (i = 1; i <= 63; i++) {
+        snprintf(name, sizeof name, "u%d", i);
+        CHECK(db_insert(db, name, i % 151, &id, &stored, &err) == 0);
+    }
+    CHECK(run_page(NULL, db, 60, 10, &g, &more, &err) == 0 && g.n == 3 && g.ids[0] == 61 && more == 0);
+    bpt_test_fail_alloc_after(0); /* 64번째 삽입의 리프 분할 실패 → DB_HALTED_INDEX */
+    CHECK(db_insert(db, "lost-index", 30, &id, &stored, &err) == -1);
+    bpt_test_fail_alloc_after(-1);
+    CHECK(db_state(db) == DB_HALTED_INDEX);
+    err.kind = DBE_NONE;
+    CHECK(run_page(NULL, db, 0, 10, &g, &more, &err) == -1 && err.kind == DBE_HALTED && g.n == 0 && more == 0);
+    CHECK(db_close(db, &err) == 0);
+}
+
+/* E5: 순방향 조회 도중 INSERT·UPDATE·DELETE가 섞여도
+ *  (가) 순회로 받은 id가 엄격하게 증가, (나) 시작과 끝 모두에 있던 행은 모두 나옴, (다) 나온 id는 부여된 적 있는 id */
+#define PW_ROWS 300
+#define PW_WRITERS 3
+#define PW_OPS 120
+#define PW_WALKS 12
+
+typedef struct {
+    Db *db;
+    uint32_t seed;
+    int errors;
+    char first_error[256];
+} PwWriter;
+
+typedef struct {
+    Db *db;
+    int errors;
+    char first_error[256];
+    int not_increasing;
+    int walks;
+    int64_t got[PW_WALKS][PW_ROWS + PW_WRITERS * PW_OPS + 1];
+    int ngot[PW_WALKS];
+} PwReader;
+
+static void *pw_writer(void *arg) {
+    PwWriter *w = arg;
+    int op;
+
+    for (op = 0; op < PW_OPS; op++) {
+        DbError err = {{0}, DBE_NONE};
+        uint32_t k = ct_rand(&w->seed) % 100;
+        int64_t target = 1 + (int64_t)(ct_rand(&w->seed) % (PW_ROWS + PW_WRITERS * PW_OPS));
+        char sql[128];
+        int rc = 0;
+
+        if (k < 40) {
+            int64_t id = 0;
+            rc = db_insert(w->db, "ins", (int)(ct_rand(&w->seed) % 151), &id, NULL, &err);
+        } else if (k < 70) {
+            snprintf(sql, sizeof sql, "UPDATE users SET name = 'up%d' WHERE id = %" PRId64 ";", op, target);
+            rc = d_change(w->db, sql, &err) < 0 ? -1 : 0;
+        } else {
+            snprintf(sql, sizeof sql, "DELETE FROM users WHERE id = %" PRId64 ";", target);
+            rc = d_change(w->db, sql, &err) < 0 ? -1 : 0;
+        }
+        if (rc != 0 && w->errors++ == 0) {
+            snprintf(w->first_error, sizeof w->first_error, "%s", err.msg);
+        }
+    }
+    return NULL;
+}
+
+static void *pw_reader(void *arg) {
+    PwReader *r = arg;
+    static PageGot g; /* 읽는 스레드는 하나뿐 */
+    int w;
+
+    for (w = 0; w < PW_WALKS; w++) {
+        int64_t after = 0, prev = 0;
+        int more = 1, i;
+
+        r->ngot[w] = 0;
+        while (more) {
+            DbError err = {{0}, DBE_NONE};
+            if (run_page(NULL, r->db, after, 7, &g, &more, &err) != 0) {
+                if (r->errors++ == 0) {
+                    snprintf(r->first_error, sizeof r->first_error, "%s", err.msg);
+                }
+                break;
+            }
+            for (i = 0; i < g.n; i++) {
+                if (g.ids[i] <= prev) {
+                    r->not_increasing++;
+                }
+                prev = g.ids[i];
+                if (r->ngot[w] < (int)(sizeof r->got[0] / sizeof r->got[0][0])) {
+                    r->got[w][r->ngot[w]++] = g.ids[i];
+                }
+            }
+            if (g.n > 0) {
+                after = g.ids[g.n - 1]; /* next_cursor = 마지막 행 id */
+            }
+        }
+        r->walks++;
+    }
+    return NULL;
+}
+
+static void test_p5_concurrent_forward_walk(void) {
+    const char *dir = fresh_dir("p5_concurrent");
+    static PwWriter ws[PW_WRITERS];
+    static PwReader rd;
+    static PageGot snap;
+    static unsigned char at_start[PW_ROWS + PW_WRITERS * PW_OPS + 2], at_end[PW_ROWS + PW_WRITERS * PW_OPS + 2];
+    pthread_t th[PW_WRITERS + 1];
+    DbError err = {{0}, DBE_NONE};
+    Db *db = NULL;
+    int64_t id = 0, max_id;
+    char name[16], why[200] = "";
+    int i, w, more, missing = 0, unknown = 0;
+
+    CHECK(db_open(dir, &db, &err) == 0);
+    if (db == NULL) {
+        return;
+    }
+    for (i = 1; i <= PW_ROWS; i++) {
+        snprintf(name, sizeof name, "s%d", i);
+        CHECK(db_insert(db, name, i % 151, &id, NULL, &err) == 0);
+    }
+    /* 시작 상태: 1..PW_ROWS 전부 */
+    memset(at_start, 0, sizeof at_start);
+    for (i = 1; i <= PW_ROWS; i++) {
+        at_start[i] = 1;
+    }
+    memset(&rd, 0, sizeof rd);
+    rd.db = db;
+    CHECK(pthread_create(&th[PW_WRITERS], NULL, pw_reader, &rd) == 0);
+    for (i = 0; i < PW_WRITERS; i++) {
+        memset(&ws[i], 0, sizeof ws[i]);
+        ws[i].db = db;
+        ws[i].seed = 0x9E3779B9u * (uint32_t)(i + 7);
+        CHECK(pthread_create(&th[i], NULL, pw_writer, &ws[i]) == 0);
+    }
+    for (i = 0; i <= PW_WRITERS; i++) {
+        pthread_join(th[i], NULL);
+    }
+    for (i = 0; i < PW_WRITERS; i++) {
+        if (ws[i].errors != 0) {
+            fprintf(stderr, "    쓰기 스레드 %d 첫 오류: %s\n", i, ws[i].first_error);
+        }
+        CHECK(ws[i].errors == 0);
+    }
+    if (rd.errors != 0) {
+        fprintf(stderr, "    읽기 스레드 첫 오류: %s\n", rd.first_error);
+    }
+    CHECK(rd.errors == 0 && rd.walks == PW_WALKS);
+    CHECK(rd.not_increasing == 0);
+
+    /* 끝 상태 */
+    memset(at_end, 0, sizeof at_end);
+    CHECK(run_page(NULL, db, 0, PG_CAP - 1, &snap, &more, &err) == 0 && more == 0);
+    for (i = 0; i < snap.n; i++) {
+        if (snap.ids[i] >= 1 && snap.ids[i] < (int64_t)sizeof at_end) {
+            at_end[snap.ids[i]] = 1;
+        }
+    }
+    CHECK(db_insert(db, "probe", 1, &max_id, NULL, &err) == 0); /* 지금까지 부여된 가장 큰 id + 1 */
+    for (w = 0; w < PW_WALKS; w++) {
+        static unsigned char in_walk[PW_ROWS + PW_WRITERS * PW_OPS + 2];
+        memset(in_walk, 0, sizeof in_walk);
+        for (i = 0; i < rd.ngot[w]; i++) {
+            int64_t x = rd.got[w][i];
+            if (x < 1 || x >= max_id || x >= (int64_t)sizeof in_walk) {
+                unknown++;
+            } else {
+                in_walk[x] = 1;
+            }
+        }
+        for (i = 1; i < (int)sizeof at_start; i++) {
+            if (at_start[i] && at_end[i] && !in_walk[i]) {
+                missing++;
+            }
+        }
+    }
+    CHECK(missing == 0 && unknown == 0);
+    CHECK(db_test_validate(db, why, sizeof why) == 0);
+    CHECK(db_close(db, &err) == 0);
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "사용법: test_unit <임시 디렉터리>\n");
@@ -3568,6 +3963,12 @@ int main(int argc, char **argv) {
     test_p4_startup_removes_tmp();
     test_p4_model_random();
     test_p4_concurrent_mixed();
+
+    test_p5_page_basic();
+    test_p5_page_gaps_and_rewrite();
+    test_p5_page_early_stop_and_full_walk();
+    test_p5_db_page_halted();
+    test_p5_concurrent_forward_walk();
 
     printf("단위 테스트: %d개 검사 중 %d개 실패\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

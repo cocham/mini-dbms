@@ -41,6 +41,14 @@ int db_open(const char *data_dir, Db **out, DbError *err);
  */
 int db_exec(Db *db, const Statement *st, const ResultSink *sink, int64_t *stored_id, DbError *err);
 
+/*
+ * 커서 페이지 조회 (Phase 5, DB-P5-D07). 공유 잠금 안에서 table_page를 부른다(SELECT와 같은 잠금).
+ * id > after_id인 행을 최대 limit개 fn으로 넘기고, 더 있으면 *has_more = 1. 페이지 하나는 한 시점의 상태다.
+ * fn은 잠금 안에서 불린다(db_exec의 sink와 같은 규칙: 메모리 작업만, db_* 호출 금지).
+ * 중단 상태면 실행하지 않고 -1, err->kind = DBE_HALTED. 그 밖의 실패는 table_page와 같다. 상태는 바꾸지 않는다.
+ */
+int db_page(Db *db, int64_t after_id, int64_t limit, RowFn fn, void *ctx, int *has_more, DbError *err);
+
 DbState db_state(Db *db);
 void db_stats(Db *db, IndexStats *out);
 
