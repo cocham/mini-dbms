@@ -6,6 +6,7 @@
 
 #include <pthread.h>
 #include <stdlib.h>
+#include <string.h>
 
 /*
  * 엔진 잠금 (Phase 3, DB-P3-D05). P3-04부터 읽기·쓰기 잠금(rwlock) 하나다.
@@ -136,11 +137,12 @@ int db_exec(Db *db, const Statement *st, const ResultSink *sink, int64_t *stored
     return rc;
 }
 
-int db_page(Db *db, int64_t after_id, int64_t limit, RowFn fn, void *ctx, int *has_more, DbError *err) {
+int db_page(Db *db, int64_t after_id, int64_t limit, const PageFilter *filter, RowFn fn, void *ctx, PageStats *st,
+            DbError *err) {
     int rc;
 
-    if (has_more != NULL) {
-        *has_more = 0;
+    if (st != NULL) {
+        memset(st, 0, sizeof *st);
     }
     RDLOCK(db);
     if (db->state != DB_OK) {
@@ -148,7 +150,7 @@ int db_page(Db *db, int64_t after_id, int64_t limit, RowFn fn, void *ctx, int *h
         UNLOCK(db);
         return -1;
     }
-    rc = table_page(db->table, after_id, limit, fn, ctx, has_more, err);
+    rc = table_page(db->table, after_id, limit, filter, fn, ctx, st, err);
     UNLOCK(db);
     return rc;
 }

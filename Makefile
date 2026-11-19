@@ -38,7 +38,7 @@ SERVER_BIN = build/minidb-server
 SERVER_TEST_BIN = build/minidb-server-test
 LOADGEN_BIN = build/loadgen
 
-.PHONY: all test unit cli server sanitize tsan race-demo read-bench load-bench page-bench bench clean
+.PHONY: all test unit cli server sanitize tsan race-demo read-bench load-bench page-bench age-bench bench clean
 
 ifeq ($(OS),Windows_NT)
 all: $(BIN) $(DEMO_BIN)
@@ -159,6 +159,17 @@ PAGE_ROWS ?= 1000000
 PAGE_REPEAT ?= 30
 page-bench: $(SERVER_BIN)
 	$(PYTHON) tools/page_bench.py --server $(SERVER_BIN) --rows $(PAGE_ROWS) --repeat $(PAGE_REPEAT)
+
+# age 조건 페이지 조회 대표 실험 (Phase 6, DB-P6-D11·D12): 같은 실행 파일·데이터로 --age-path만 바꿔 비교.
+#   결과는 build/age_result.md. AGE_COMMIT으로 빌드한 커밋을 기록한다(컨테이너 복사본에는 .git이 없다)
+AGE_ROWS ?= 1000000
+AGE_WARMUP ?= 5
+AGE_REPEAT ?= 30
+AGE_ORDER ?= scan,index,index,scan
+AGE_COMMIT ?=
+age-bench: $(SERVER_BIN)
+	$(PYTHON) tools/age_bench.py --server $(SERVER_BIN) --rows $(AGE_ROWS) --warmup $(AGE_WARMUP) \
+		--repeat $(AGE_REPEAT) --order $(AGE_ORDER) --commit "$(AGE_COMMIT)"
 
 # 100만 건 생성·삽입 후 인덱스 조회 vs 선형 탐색 측정 (P2-04). 느리므로 test에 넣지 않는다.
 #   make bench BENCH_ROWS=100000 처럼 건수를 줄여 볼 수 있다. 결과는 docs/phase2/benchmark.md로 옮긴다.
